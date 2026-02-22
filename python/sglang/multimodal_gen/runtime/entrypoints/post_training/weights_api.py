@@ -7,7 +7,16 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     UpdateWeightFromDiskReqInput,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
+from sglang.srt.managers.io_struct import (
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+)
 from sglang.srt.utils.json_response import orjson_response
+
+from sglang.srt.managers.io_struct import (
+    ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
+)
 
 router = APIRouter()
 
@@ -60,3 +69,41 @@ async def get_weights_checksum(request: Request):
         return orjson_response({"error": str(e)}, status_code=500)
 
     return orjson_response(response.output, status_code=200)
+
+
+@router.post("/release_memory_occupation")
+async def release_memory_occupation(request: Request):
+    """Release GPU memory occupation (sleep the engine)."""
+    body = await request.json()
+    tags = body.get("tags")
+
+    req = ReleaseMemoryOccupationReqInput(tags=tags)
+
+    try:
+        response = await async_scheduler_client.forward(req)
+    except Exception as e:
+        return orjson_response({"success": False, "message": str(e)}, status_code=500)
+
+    out = response.output
+    if isinstance(out, dict):
+        return orjson_response(out, status_code=200 if out.get("success", True) else 400)
+    return orjson_response({"success": True, "output": out}, status_code=200)
+
+
+@router.post("/resume_memory_occupation")
+async def resume_memory_occupation(request: Request):
+    """Resume GPU memory occupation (wake the engine)."""
+    body = await request.json()
+    tags = body.get("tags")
+
+    req = ResumeMemoryOccupationReqInput(tags=tags)
+
+    try:
+        response = await async_scheduler_client.forward(req)
+    except Exception as e:
+        return orjson_response({"success": False, "message": str(e)}, status_code=500)
+
+    out = response.output
+    if isinstance(out, dict):
+        return orjson_response(out, status_code=200 if out.get("success", True) else 400)
+    return orjson_response({"success": True, "output": out}, status_code=200)
