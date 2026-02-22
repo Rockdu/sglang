@@ -13,11 +13,6 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.utils.json_response import orjson_response
 
-from sglang.srt.managers.io_struct import (
-    ReleaseMemoryOccupationReqInput,
-    ResumeMemoryOccupationReqInput,
-)
-
 router = APIRouter()
 
 
