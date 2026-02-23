@@ -5,12 +5,10 @@ from fastapi import APIRouter, Request
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     UpdateWeightFromDiskReqInput,
-)
-from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
-from sglang.srt.managers.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
 )
+from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.srt.utils.json_response import orjson_response
 
 router = APIRouter()
@@ -70,9 +68,8 @@ async def get_weights_checksum(request: Request):
 async def release_memory_occupation(request: Request):
     """Release GPU memory occupation (sleep the engine)."""
     body = await request.json()
-    tags = body.get("tags")
 
-    req = ReleaseMemoryOccupationReqInput(tags=tags)
+    req = ReleaseMemoryOccupationReqInput()
 
     try:
         response = await async_scheduler_client.forward(req)
@@ -89,9 +86,8 @@ async def release_memory_occupation(request: Request):
 async def resume_memory_occupation(request: Request):
     """Resume GPU memory occupation (wake the engine)."""
     body = await request.json()
-    tags = body.get("tags")
 
-    req = ResumeMemoryOccupationReqInput(tags=tags)
+    req = ResumeMemoryOccupationReqInput()
 
     try:
         response = await async_scheduler_client.forward(req)
