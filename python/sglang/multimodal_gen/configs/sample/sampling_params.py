@@ -344,6 +344,9 @@ class SamplingParams:
         _finite_non_negative_float(
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
+        _finite_non_negative_float(
+            "rollout_noise_level", self.rollout_noise_level, allow_none=False
+        )
 
         if self.cfg_normalization is None:
             self.cfg_normalization = 0.0
@@ -834,6 +837,22 @@ class SamplingParams:
         # Rollout arguments
         RLRolloutArgs.add_cli_args(parser, add_argument=add_argument)
 
+        add_argument(
+            "--rollout",
+            action="store_true",
+            help="Enable rollout mode and return per-step log_prob trajectory",
+        )
+        add_argument(
+            "--rollout-sde-type",
+            type=str,
+            choices=["sde", "cps", "ode"],
+            help="Rollout step objective type used in log-prob computation.",
+        )
+        add_argument(
+            "--rollout-noise-level",
+            type=float,
+            help="Noise level used by rollout SDE/CPS step objective.",
+        )
         add_argument(
             "--return-trajectory-decoded",
             action="store_true",

@@ -216,6 +216,7 @@ class DmdDenoisingStage(DenoisingStage):
             latents=latents,
             trajectory_latents=[],
             trajectory_timesteps=[],
+            trajectory_log_probs=[],
             server_args=server_args,
         )
 

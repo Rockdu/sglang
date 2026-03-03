@@ -52,6 +52,9 @@ class ImageGenerationsRequest(BaseModel):
     enable_upscaling: Optional[bool] = False
     upscaling_model_path: Optional[str] = None
     upscaling_scale: Optional[int] = 4
+    rollout: Optional[bool] = False
+    rollout_sde_type: Optional[str] = "sde"
+    rollout_noise_level: Optional[float] = 0.7
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
@@ -112,6 +115,9 @@ class VideoGenerationsRequest(BaseModel):
     output_quality: Optional[str] = "default"
     output_compression: Optional[int] = None
     output_path: Optional[str] = None
+    rollout: Optional[bool] = False
+    rollout_sde_type: Optional[str] = "sde"
+    rollout_noise_level: Optional[float] = 0.7
     diffusers_kwargs: Optional[Dict[str, Any]] = None  # kwargs for diffusers backend
     # Performance profiling
     perf_dump_path: Optional[str] = None
