@@ -63,10 +63,6 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.transformer_loader i
     TransformerLoader,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
-from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import SchedulerRLMixin
-from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
-    RolloutTrajectoryData,
-)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -609,7 +605,7 @@ class DenoisingStage(PipelineStage):
             server_args.model_loaded["transformer"] = True
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
-        
+
         self._maybe_prepare_rollout(batch)
 
         if batch.rollout:
