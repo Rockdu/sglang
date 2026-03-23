@@ -348,6 +348,13 @@ class SamplingParams:
             "rollout_noise_level", self.rollout_noise_level, allow_none=False
         )
 
+        _VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode")
+        if self.rollout_sde_type not in _VALID_ROLLOUT_SDE_TYPES:
+            raise ValueError(
+                f"rollout_sde_type must be one of {_VALID_ROLLOUT_SDE_TYPES}, "
+                f"got {self.rollout_sde_type!r}"
+            )
+
         if self.cfg_normalization is None:
             self.cfg_normalization = 0.0
         elif isinstance(self.cfg_normalization, bool):
@@ -846,12 +853,25 @@ class SamplingParams:
             "--rollout-sde-type",
             type=str,
             choices=["sde", "cps", "ode"],
+            default=SamplingParams.rollout_sde_type,
             help="Rollout step objective type used in log-prob computation.",
         )
         add_argument(
             "--rollout-noise-level",
             type=float,
             help="Noise level used by rollout SDE/CPS step objective.",
+        )
+        add_argument(
+            "--rollout-log-prob-no-const",
+            action=StoreBoolean,
+            default=SamplingParams.rollout_log_prob_no_const,
+            help="If true, return rollout log-prob without constant terms.",
+        )
+        add_argument(
+            "--rollout-debug-mode",
+            action=StoreBoolean,
+            default=SamplingParams.rollout_debug_mode,
+            help="If true, return rollout debug tensors (variance noise, mean, std, model output).",
         )
         add_argument(
             "--return-trajectory-decoded",
