@@ -21,6 +21,8 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import
     SchedulerRLDebugMixin,
 )
 
+_LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
+
 
 class SchedulerRLMixin(SchedulerRLDebugMixin):
 
@@ -138,6 +140,11 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         log_prob_no_const = batch.rollout_log_prob_no_const
         debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
 
+        if not log_prob_no_const and sde_type != "ode":
+            assert (
+                noise_level > 0
+            ), "True log-probability computation requires a non-zero noise level."
+
         dt = next_sigma - current_sigma
         if sde_type == "sde":
             variance_noise = self._rollout_variance_noise(
@@ -212,9 +219,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             log_prob_local_sum = (
                 log_prob_no_const_val / (2 * (noise_std_dev**2))
                 - torch.log(noise_std_dev)
-                - torch.log(
-                    torch.sqrt(2 * torch.as_tensor(math.pi).to(noise_std_dev.device))
-                )
+                - _LOG_SQRT_2PI
             ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
 
         if debug_mode:
