@@ -344,16 +344,6 @@ class SamplingParams:
         _finite_non_negative_float(
             "guidance_rescale", self.guidance_rescale, allow_none=False
         )
-        _finite_non_negative_float(
-            "rollout_noise_level", self.rollout_noise_level, allow_none=False
-        )
-
-        _VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode")
-        if self.rollout_sde_type not in _VALID_ROLLOUT_SDE_TYPES:
-            raise ValueError(
-                f"rollout_sde_type must be one of {_VALID_ROLLOUT_SDE_TYPES}, "
-                f"got {self.rollout_sde_type!r}"
-            )
 
         if self.cfg_normalization is None:
             self.cfg_normalization = 0.0
@@ -840,36 +830,7 @@ class SamplingParams:
             action="store_true",
             help="Whether to return the trajectory",
         )
-
-        # Rollout arguments
         RLRolloutArgs.add_cli_args(parser, add_argument=add_argument)
-
-        add_argument(
-            "--rollout",
-            action="store_true",
-            help="Enable rollout mode and return per-step log_prob trajectory",
-        )
-        add_argument(
-            "--rollout-sde-type",
-            type=str,
-            choices=["sde", "cps", "ode"],
-            help="Rollout step objective type used in log-prob computation.",
-        )
-        add_argument(
-            "--rollout-noise-level",
-            type=float,
-            help="Noise level used by rollout SDE/CPS step objective.",
-        )
-        add_argument(
-            "--rollout-log-prob-no-const",
-            action=StoreBoolean,
-            help="If true, return rollout log-prob without constant terms.",
-        )
-        add_argument(
-            "--rollout-debug-mode",
-            action=StoreBoolean,
-            help="If true, return rollout debug tensors (variance noise, mean, std, model output).",
-        )
         add_argument(
             "--return-trajectory-decoded",
             action="store_true",
