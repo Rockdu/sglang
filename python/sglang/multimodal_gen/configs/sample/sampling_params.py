@@ -830,7 +830,10 @@ class SamplingParams:
             action="store_true",
             help="Whether to return the trajectory",
         )
+
+        # Rollout arguments
         RLRolloutArgs.add_cli_args(parser, add_argument=add_argument)
+
         add_argument(
             "--return-trajectory-decoded",
             action="store_true",
