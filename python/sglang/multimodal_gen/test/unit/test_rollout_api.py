@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutDenoisingEnv,
     RolloutDebugTensors,
     RolloutTrajectoryData,
 )
@@ -250,24 +251,27 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import 
 
 class TestSerializeRolloutTrajectory(unittest.TestCase):
     def test_none_input(self):
-        log_probs, debug = _serialize_rollout_trajectory(None)
+        log_probs, debug, env = _serialize_rollout_trajectory(None)
         self.assertIsNone(log_probs)
         self.assertIsNone(debug)
+        self.assertIsNone(env)
 
     def test_log_probs_only(self):
         rtd = RolloutTrajectoryData(
             rollout_log_probs=torch.tensor([-1.0, -2.0]),
         )
-        log_probs, debug = _serialize_rollout_trajectory(rtd)
+        log_probs, debug, env = _serialize_rollout_trajectory(rtd)
         self.assertIsNotNone(log_probs)
         self.assertTrue(log_probs["__tensor__"])
         self.assertIsNone(debug)
+        self.assertIsNone(env)
 
     def test_log_probs_none_in_rtd(self):
         rtd = RolloutTrajectoryData(rollout_log_probs=None)
-        log_probs, debug = _serialize_rollout_trajectory(rtd)
+        log_probs, debug, env = _serialize_rollout_trajectory(rtd)
         self.assertIsNone(log_probs)
         self.assertIsNone(debug)
+        self.assertIsNone(env)
 
     def test_with_debug_tensors(self):
         dt = RolloutDebugTensors(
@@ -280,9 +284,10 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             rollout_log_probs=torch.tensor([-0.5, -0.6]),
             rollout_debug_tensors=dt,
         )
-        log_probs, debug = _serialize_rollout_trajectory(rtd)
+        log_probs, debug, env = _serialize_rollout_trajectory(rtd)
         self.assertIsNotNone(log_probs)
         self.assertIsNotNone(debug)
+        self.assertIsNone(env)
         self.assertIn("rollout_variance_noises", debug)
         self.assertIn("rollout_prev_sample_means", debug)
         self.assertIn("rollout_noise_std_devs", debug)
@@ -300,10 +305,30 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             rollout_log_probs=torch.tensor([-0.3]),
             rollout_debug_tensors=dt,
         )
-        log_probs, debug = _serialize_rollout_trajectory(rtd)
+        log_probs, debug, env = _serialize_rollout_trajectory(rtd)
         self.assertIsNotNone(debug)
         self.assertIsNone(debug["rollout_variance_noises"])
         self.assertTrue(debug["rollout_prev_sample_means"]["__tensor__"])
+
+    def test_with_denoising_env(self):
+        rtd = RolloutTrajectoryData(
+            denoising_env=RolloutDenoisingEnv(
+                image_kwargs={"encoder_hidden_states_image": [torch.randn(1, 8)]},
+                pos_cond_kwargs={"encoder_hidden_states": torch.randn(1, 8)},
+                neg_cond_kwargs={"encoder_hidden_states": torch.randn(1, 8)},
+                guidance=torch.tensor([3.5]),
+                trajectory_latent_model_inputs=torch.randn(4, 1, 4, 2, 2, 2),
+                trajectory_timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
+            )
+        )
+        _, _, env = _serialize_rollout_trajectory(rtd)
+        self.assertIsNotNone(env)
+        self.assertIn("static", env)
+        self.assertIn("trajectory", env)
+        self.assertIn("latent_model_inputs", env["trajectory"])
+        self.assertIn("timesteps", env["trajectory"])
+        self.assertNotIn("noise_preds", env["trajectory"])
+        self.assertTrue(env["trajectory"]["latent_model_inputs"]["__tensor__"])
 
 
 class TestBuildResponse(unittest.TestCase):

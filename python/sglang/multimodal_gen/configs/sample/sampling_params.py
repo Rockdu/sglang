@@ -187,6 +187,7 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # returns all latents for each timestep
     return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
+    return_dit_env: bool = False  # capture DiT environment for RL training replay
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)

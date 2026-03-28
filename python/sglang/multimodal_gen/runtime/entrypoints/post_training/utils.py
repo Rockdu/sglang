@@ -46,3 +46,14 @@ def _maybe_serialize(obj: Any) -> Any:
     if isinstance(obj, (list, tuple)):
         return [_maybe_serialize(v) for v in obj]
     return obj
+
+
+def _maybe_deserialize(obj: Any) -> Any:
+    """Inverse of ``_maybe_serialize``: restore tensors from ``__tensor__`` dicts."""
+    if isinstance(obj, dict):
+        if obj.get("__tensor__"):
+            return base64_to_tensor(obj["data"])
+        return {k: _maybe_deserialize(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_maybe_deserialize(v) for v in obj]
+    return obj

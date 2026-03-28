@@ -7,11 +7,7 @@ from typing import Any, Union
 import torch
 
 from sglang.multimodal_gen.runtime.distributed import (
-    get_local_torch_device,
     get_sp_world_size,
-)
-from sglang.multimodal_gen.runtime.distributed.communication_op import (
-    sequence_model_parallel_all_reduce,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
@@ -19,6 +15,10 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 )
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import (
     SchedulerRLDebugMixin,
+)
+from sglang.multimodal_gen.runtime.post_training.sp_utils import (
+    all_reduce_if_sp_sharded,
+    should_do_sp_collective,
 )
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
@@ -257,11 +257,11 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         trajectory_log_prob_sum, trajectory_log_prob_count = (
             self.consume_local_rollout_log_probs(batch)
         )
-        if get_sp_world_size() > 1 and getattr(batch, "did_sp_shard_latents", False):
+        if should_do_sp_collective(batch):
             packed = torch.stack(
                 [trajectory_log_prob_sum, trajectory_log_prob_count], dim=0
-            ).to(get_local_torch_device())
-            sequence_model_parallel_all_reduce(packed)
+            )
+            packed = all_reduce_if_sp_sharded(batch, packed)
             trajectory_log_prob_sum = packed[0]
             trajectory_log_prob_count = packed[1]
 

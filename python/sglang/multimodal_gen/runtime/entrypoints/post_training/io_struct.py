@@ -55,6 +55,7 @@ class RolloutImageRequest(BaseModel):
     # trajectory control
     return_trajectory_latents: bool = True
     return_trajectory_decoded: bool = False
+    return_dit_env: bool = False
 
     # image input (for I2I / TI2I tasks)
     image_path: Optional[list[str]] = None
@@ -83,6 +84,7 @@ class RolloutImageResponse(BaseModel):
     # rollout data
     rollout_log_probs: Optional[dict[str, Any]] = None
     rollout_debug_tensors: Optional[dict[str, Any]] = None
+    denoising_env: Optional[dict[str, Any]] = None
 
     # metrics
     inference_time_s: Optional[float] = None
