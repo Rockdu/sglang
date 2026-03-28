@@ -317,7 +317,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
                 pos_cond_kwargs={"encoder_hidden_states": torch.randn(1, 8)},
                 neg_cond_kwargs={"encoder_hidden_states": torch.randn(1, 8)},
                 guidance=torch.tensor([3.5]),
-                trajectory_latent_model_inputs=torch.randn(4, 1, 4, 2, 2, 2),
+                trajectory_latent_model_inputs=torch.randn(1, 4, 4, 2, 2, 2),
                 trajectory_timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
             )
         )

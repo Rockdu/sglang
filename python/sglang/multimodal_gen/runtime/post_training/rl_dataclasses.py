@@ -53,7 +53,7 @@ class RolloutDenoisingEnv:
     neg_cond_kwargs: dict[str, Any] | None = None
     guidance: torch.Tensor | None = None
 
-    # --- trajectory (per-step, stacked along dim-0 = T) ---
+    # --- trajectory: latent inputs [B, T, ...]; timesteps [T] (shared across batch) ---
     trajectory_latent_model_inputs: torch.Tensor | None = None
     trajectory_timesteps: torch.Tensor | None = None
 

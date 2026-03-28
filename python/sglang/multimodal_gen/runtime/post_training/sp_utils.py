@@ -24,17 +24,17 @@ def gather_stacked_latents_for_sp(
     batch,
     stacked_latents: torch.Tensor,
 ) -> torch.Tensor:
-    """Gather a stacked [T, B, ...] latent tensor via pipeline-config SP rules."""
+    """Gather a stacked ``[B, T, ...]`` latent tensor via pipeline-config SP rules."""
     if not should_do_sp_collective(batch):
         return stacked_latents
 
     if stacked_latents.dim() < 2:
         return stacked_latents
 
-    t_steps, bsz = stacked_latents.shape[0], stacked_latents.shape[1]
+    bsz, t_steps = stacked_latents.shape[0], stacked_latents.shape[1]
     flat_inputs = stacked_latents.flatten(0, 1).contiguous()
     gathered_flat_inputs = pipeline_config.gather_latents_for_sp(flat_inputs)
-    return gathered_flat_inputs.unflatten(0, (t_steps, bsz))
+    return gathered_flat_inputs.unflatten(0, (bsz, t_steps))
 
 
 def all_reduce_if_sp_sharded(batch, tensor: torch.Tensor) -> torch.Tensor:
