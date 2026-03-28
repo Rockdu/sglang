@@ -10,6 +10,12 @@ This script validates two things through ``POST /rollout/images``:
 Usage:
     CUDA_VISIBLE_DEVICES=0 FLASHINFER_DISABLE_VERSION_CHECK=1 \
         python test_rollout_api_perf_compare_qwen_zimage.py
+
+    CUDA_VISIBLE_DEVICES=0,1 ... python test_rollout_api_perf_compare_qwen_zimage.py --num-gpus 2
+    CUDA_VISIBLE_DEVICES=0,1,2 ... python test_rollout_api_perf_compare_qwen_zimage.py --num-gpus 3 \\
+        --tp-size 1 --sp-degree 3
+
+    Optional: --tp-size, --sp-degree, --enable-cfg-parallel / --cfgp (forwarded to launch_server).
 """
 
 from __future__ import annotations
@@ -66,8 +72,17 @@ def _wait_for_server(base_url: str, timeout_s: float = 900.0) -> None:
     raise TimeoutError(f"Server not ready within {timeout_s}s: {base_url}")
 
 
-def _launch_server(model_path: str, port: int) -> subprocess.Popen:
+def _launch_server(
+    model_path: str,
+    port: int,
+    *,
+    num_gpus: int = 1,
+    tp_size: int | None = None,
+    sp_degree: int | None = None,
+    enable_cfg_parallel: bool = False,
+) -> subprocess.Popen:
     env = os.environ.copy()
+    env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     local_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "python")
     py_paths = [local_python]
     # nvidia-cutlass-dsl installs `cutlass` under this nested path, not default sys.path.
@@ -91,8 +106,14 @@ def _launch_server(model_path: str, port: int) -> subprocess.Popen:
         "--port",
         str(port),
         "--num-gpus",
-        "1",
+        str(num_gpus),
     ]
+    if tp_size is not None:
+        cmd.extend(["--tp-size", str(tp_size)])
+    if sp_degree is not None:
+        cmd.extend(["--sp-degree", str(sp_degree)])
+    if enable_cfg_parallel:
+        cmd.append("--enable-cfg-parallel")
     print(f"\n[launch] {' '.join(cmd)}")
     return subprocess.Popen(
         cmd,
@@ -141,7 +162,8 @@ def _validate_tensor_payload(resp_json: dict[str, Any], expect_dit_env: bool) ->
         tsteps = traj.get("timesteps")
         assert isinstance(lmi, torch.Tensor), "latent_model_inputs not tensor after decode"
         assert isinstance(tsteps, torch.Tensor), "timesteps not tensor after decode"
-        assert lmi.shape[0] == tsteps.shape[0], "step count mismatch in denoising_env"
+        # latent_model_inputs [B, T, ...]; timesteps [T] shared across batch
+        assert lmi.shape[1] == tsteps.shape[0], "step count mismatch in denoising_env"
     else:
         assert resp_json.get("denoising_env") is None, (
             "denoising_env should be None when return_dit_env=False"
@@ -230,13 +252,25 @@ def _run_model_suite(
     seed: int,
     warmup_runs: int,
     measured_runs: int,
+    *,
+    num_gpus: int = 1,
+    tp_size: int | None = None,
+    sp_degree: int | None = None,
+    enable_cfg_parallel: bool = False,
 ) -> None:
     base_url = f"http://127.0.0.1:{port}"
     print("\n" + "=" * 90)
     print(f"[model] {model_name}")
     print("=" * 90)
 
-    proc = _launch_server(model_name, port)
+    proc = _launch_server(
+        model_name,
+        port,
+        num_gpus=num_gpus,
+        tp_size=tp_size,
+        sp_degree=sp_degree,
+        enable_cfg_parallel=enable_cfg_parallel,
+    )
     try:
         _wait_for_server(base_url)
         with_rollout = _benchmark_scenario(
@@ -280,11 +314,42 @@ def main() -> None:
     parser.add_argument("--measured-runs", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=int(os.environ.get("TEST_NUM_GPUS", "1")),
+        help="launch_server --num-gpus (set CUDA_VISIBLE_DEVICES accordingly).",
+    )
+    parser.add_argument(
+        "--tp-size",
+        type=int,
+        default=None,
+        help="Tensor parallel size; omit for server default (1).",
+    )
+    parser.add_argument(
+        "--sp-degree",
+        type=int,
+        default=None,
+        help="Sequence parallel degree; omit for server auto from remaining GPUs.",
+    )
+    parser.add_argument(
+        "--enable-cfg-parallel",
+        "--cfgp",
+        action="store_true",
+        help="launch_server --enable-cfg-parallel",
+    )
+    parser.add_argument(
         "--prompt",
         type=str,
         default="a cinematic portrait of an astronaut walking in neon rain, ultra detailed",
     )
     args = parser.parse_args()
+
+    suite_kw = dict(
+        num_gpus=args.num_gpus,
+        tp_size=args.tp_size,
+        sp_degree=args.sp_degree,
+        enable_cfg_parallel=args.enable_cfg_parallel,
+    )
 
     # Run sequentially to avoid multi-model VRAM contention.
     _run_model_suite(
@@ -294,6 +359,7 @@ def main() -> None:
         seed=args.seed,
         warmup_runs=args.warmup_runs,
         measured_runs=args.measured_runs,
+        **suite_kw,
     )
     _run_model_suite(
         model_name=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,  # Tongyi-MAI/Z-Image-Turbo
@@ -302,6 +368,7 @@ def main() -> None:
         seed=args.seed + 10_000,
         warmup_runs=args.warmup_runs,
         measured_runs=args.measured_runs,
+        **suite_kw,
     )
 
 
