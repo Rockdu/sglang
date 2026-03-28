@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start sglang-D with Qwen-Image, call rollout with return_dit_env, print response shape outline.
+"""Start sglang-D with Qwen-Image, call rollout with return_dit_env and rollout_debug_mode, print shape outline.
 
 POST /rollout/images returns JSON where tensors are dicts:
   {"__tensor__": true, "data": "<base64>", "shape": [...], "dtype": "..."}
@@ -195,7 +195,7 @@ def main() -> int:
             "guidance_scale": 4.0,
             "rollout_sde_type": "sde",
             "rollout_noise_level": 0.7,
-            "rollout_debug_mode": False,
+            "rollout_debug_mode": True,
             "return_trajectory_latents": False,
             "return_trajectory_decoded": False,
             "return_dit_env": True,
