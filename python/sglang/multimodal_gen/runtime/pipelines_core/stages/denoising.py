@@ -76,6 +76,9 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutTrajectoryData,
 )
+from sglang.multimodal_gen.runtime.post_training.rollout_denoising_env_mixin import (
+    RolloutDenoisingEnvMixin,
+)
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
     SchedulerRLMixin,
 )
@@ -90,7 +93,7 @@ from sglang.srt.utils.common import get_compiler_backend
 logger = init_logger(__name__)
 
 
-class DenoisingStage(PipelineStage):
+class DenoisingStage(PipelineStage, RolloutDenoisingEnvMixin):
     """
     Stage for running the denoising loop in diffusion pipelines.
 
@@ -171,6 +174,14 @@ class DenoisingStage(PipelineStage):
                     self.scheduler.collect_rollout_debug_tensors(batch)
                 )
             self.scheduler.release_rollout_resources(batch)
+
+    def _postprocess_rollout_outputs(self, batch: Req, server_args: ServerArgs) -> None:
+        """Finalize rollout-only outputs after generic denoising postprocess."""
+        self._maybe_collect_rollout_log_probs(batch)
+        self._maybe_finalize_dit_env_collection(
+            batch=batch,
+            pipeline_config=server_args.pipeline_config,
+        )
 
     def _maybe_enable_torch_compile(self, module: object) -> None:
         """
@@ -763,9 +774,6 @@ class DenoisingStage(PipelineStage):
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
 
-        # Gather log probs for rollout
-        self._maybe_collect_rollout_log_probs(batch)
-
         # Gather results if using sequence parallelism
         latents, trajectory_tensor = self._postprocess_sp_latents(
             batch, latents, trajectory_tensor
@@ -1043,6 +1051,15 @@ class DenoisingStage(PipelineStage):
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
 
+        self._maybe_init_dit_env_collection(
+            batch=batch,
+            pipeline_config=server_args.pipeline_config,
+            image_kwargs=image_kwargs,
+            pos_cond_kwargs=pos_cond_kwargs,
+            neg_cond_kwargs=neg_cond_kwargs,
+            guidance=guidance,
+        )
+
         # Run denoising loop
         denoising_start_time = time.time()
 
@@ -1127,6 +1144,12 @@ class DenoisingStage(PipelineStage):
                         if server_args.comfyui_mode:
                             batch.noise_pred = noise_pred
 
+                        self._maybe_append_dit_env_step(
+                            batch=batch,
+                            latent_model_input=latent_model_input,
+                            timestep_value=t_host,
+                        )
+
                         # Compute the previous noisy sample
                         latents = self.scheduler.step(
                             model_output=noise_pred,
@@ -1172,6 +1195,7 @@ class DenoisingStage(PipelineStage):
             server_args=server_args,
             is_warmup=is_warmup,
         )
+        self._postprocess_rollout_outputs(batch=batch, server_args=server_args)
         return batch
 
     # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare

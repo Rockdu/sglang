@@ -39,8 +39,29 @@ class RolloutDebugTensors:
 
 
 @dataclass
+class RolloutDenoisingEnv:
+    """DiT environment captured during denoising for RL training replay.
+
+    Split into *static* inputs (invariant across diffusion steps) and
+    *trajectory* inputs (one entry per step).  The training engine
+    receives one ``RolloutDenoisingEnv`` per sample.
+    """
+
+    # --- static (per-sample, time-invariant) ---
+    image_kwargs: dict[str, Any] | None = None
+    pos_cond_kwargs: dict[str, Any] | None = None
+    neg_cond_kwargs: dict[str, Any] | None = None
+    guidance: torch.Tensor | None = None
+
+    # --- trajectory (per-step, stacked along dim-0 = T) ---
+    trajectory_latent_model_inputs: torch.Tensor | None = None
+    trajectory_timesteps: torch.Tensor | None = None
+
+
+@dataclass
 class RolloutTrajectoryData:
     """Container for rollout-specific trajectory outputs."""
 
     rollout_log_probs: torch.Tensor | None = None
     rollout_debug_tensors: RolloutDebugTensors | None = None
+    denoising_env: RolloutDenoisingEnv | None = None

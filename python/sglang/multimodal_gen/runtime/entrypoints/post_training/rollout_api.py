@@ -35,10 +35,10 @@ router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 def _serialize_rollout_trajectory(
     rtd: RolloutTrajectoryData | None,
-) -> tuple[dict | None, dict | None]:
-    """Extract and serialize rollout log-probs and debug tensors."""
+) -> tuple[dict | None, dict | None, dict | None]:
+    """Extract and serialize rollout log-probs, debug tensors, and denoising env."""
     if rtd is None:
-        return None, None
+        return None, None, None
 
     log_probs = _maybe_serialize(rtd.rollout_log_probs) if rtd.rollout_log_probs is not None else None
 
@@ -52,7 +52,23 @@ def _serialize_rollout_trajectory(
             "rollout_model_outputs": _maybe_serialize(dt.rollout_model_outputs),
         }
 
-    return log_probs, debug_tensors
+    denoising_env = None
+    if rtd.denoising_env is not None:
+        env = rtd.denoising_env
+        denoising_env = {
+            "static": {
+                "image_kwargs": _maybe_serialize(env.image_kwargs) if env.image_kwargs else None,
+                "pos_cond_kwargs": _maybe_serialize(env.pos_cond_kwargs) if env.pos_cond_kwargs else None,
+                "neg_cond_kwargs": _maybe_serialize(env.neg_cond_kwargs) if env.neg_cond_kwargs else None,
+                "guidance": _maybe_serialize(env.guidance) if env.guidance is not None else None,
+            },
+            "trajectory": {
+                "latent_model_inputs": _maybe_serialize(env.trajectory_latent_model_inputs),
+                "timesteps": _maybe_serialize(env.trajectory_timesteps),
+            },
+        }
+
+    return log_probs, debug_tensors, denoising_env
 
 
 def _build_response(
@@ -67,7 +83,7 @@ def _build_response(
     trajectory_latents = _maybe_serialize(result.trajectory_latents) if result.trajectory_latents is not None else None
     trajectory_timesteps = _maybe_serialize(result.trajectory_timesteps) if result.trajectory_timesteps is not None else None
 
-    rollout_log_probs, rollout_debug_tensors = _serialize_rollout_trajectory(
+    rollout_log_probs, rollout_debug_tensors, denoising_env = _serialize_rollout_trajectory(
         result.rollout_trajectory_data
     )
 
@@ -80,6 +96,7 @@ def _build_response(
         trajectory_timesteps=trajectory_timesteps,
         rollout_log_probs=rollout_log_probs,
         rollout_debug_tensors=rollout_debug_tensors,
+        denoising_env=denoising_env,
         inference_time_s=(
             result.metrics.total_duration_s
             if result.metrics and result.metrics.total_duration_s > 0
@@ -114,6 +131,7 @@ async def rollout_images(request: RolloutImageRequest):
         rollout_debug_mode=request.rollout_debug_mode,
         return_trajectory_latents=request.return_trajectory_latents,
         return_trajectory_decoded=request.return_trajectory_decoded,
+        return_dit_env=request.return_dit_env,
         # disable saving to disk — caller wants raw tensor data
         save_output=False,
     )
