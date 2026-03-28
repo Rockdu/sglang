@@ -25,7 +25,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     base64_to_tensor,
 )
 
-MODEL = "Tongyi-MAI/Z-Image-Turbo"
+MODEL = "Qwen/Qwen-Image"
 PORT = int(os.environ.get("TEST_PORT", "39821"))
 BASE_URL = f"http://127.0.0.1:{PORT}"
 SEED = 42

@@ -244,8 +244,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         self, batch
     ) -> tuple[torch.Tensor, torch.Tensor]:
         rollout_session_data = self._get_rollout_session_data(batch)
-        values_sum = torch.stack(rollout_session_data.local_log_prob_sum, dim=-1)
-        values_count = torch.stack(rollout_session_data.local_log_prob_count, dim=-1)
+        # [B, T]: batch dim 0, denoising step dim 1
+        values_sum = torch.stack(rollout_session_data.local_log_prob_sum, dim=1)
+        values_count = torch.stack(rollout_session_data.local_log_prob_count, dim=1)
         rollout_session_data.local_log_prob_sum = []
         rollout_session_data.local_log_prob_count = []
         return values_sum, values_count

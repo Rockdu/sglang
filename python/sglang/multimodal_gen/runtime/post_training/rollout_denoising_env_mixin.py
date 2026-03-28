@@ -99,7 +99,8 @@ class RolloutDenoisingEnvMixin:
         step_timesteps: list[torch.Tensor] = state["trajectory_timesteps"]
 
         if step_inputs:
-            step_inputs_tensor = torch.stack(step_inputs, dim=0)
+            # [B, T, ...] — matches rollout_log_probs / trajectory_latents layout
+            step_inputs_tensor = torch.stack(step_inputs, dim=1)
             step_inputs_tensor = gather_stacked_latents_for_sp(
                 pipeline_config=pipeline_config,
                 batch=batch,
