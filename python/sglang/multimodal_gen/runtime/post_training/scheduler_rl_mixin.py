@@ -25,7 +25,6 @@ _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
 class SchedulerRLMixin(SchedulerRLDebugMixin):
-
     @staticmethod
     def _get_rollout_session_data(batch) -> RolloutSessionData:
         """Return the RolloutSessionData attached to *batch*, or raise if not prepared."""
@@ -93,9 +92,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             assert B == 1, "Generator must be a list if batch size is not 1"
             generator = [generator]
         else:
-            assert (
-                len(generator) == B
-            ), "Generator list must have the same length as batch size"
+            assert len(generator) == B, (
+                "Generator list must have the same length as batch size"
+            )
 
         buffer = self._get_or_create_rollout_noise_buffer(
             rollout_session_data, rollout_session_data.latents_shape, device, dtype
@@ -141,9 +140,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
 
         if not log_prob_no_const and sde_type != "ode":
-            assert (
-                noise_level > 0
-            ), "True log-probability computation requires a non-zero noise level."
+            assert noise_level > 0, (
+                "True log-probability computation requires a non-zero noise level."
+            )
 
         dt = next_sigma - current_sigma
         if sde_type == "sde":
@@ -200,9 +199,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 (), device=model_output.device, dtype=model_output.dtype
             )
             log_prob_no_const_val = torch.zeros_like(model_output)
-            assert (
-                log_prob_no_const
-            ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+            assert log_prob_no_const, (
+                "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
+            )
 
         else:
             raise ValueError(f"Unsupported sde_type: {sde_type}")
@@ -230,10 +229,8 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 noise_std_dev=noise_std_dev,
                 model_output=model_output,
             )
-        
-        self.append_local_rollout_log_probs(
-            batch, log_prob_local_sum, local_elem_count
-        )
+
+        self.append_local_rollout_log_probs(batch, log_prob_local_sum, local_elem_count)
 
         return prev_sample
 
