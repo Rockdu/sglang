@@ -211,6 +211,35 @@ def main() -> int:
         body = r.json()
         outline = tensors_to_shapes(body)
         print(json.dumps(outline, indent=2, ensure_ascii=False))
+
+        env = outline.get("denoising_env")
+        if env and isinstance(env, dict):
+            traj = env.get("trajectory") or {}
+            lat = traj.get("latent_model_inputs") or {}
+            lat_shape = lat.get("__tensor_shape__")
+            static = env.get("static") or {}
+            pos = static.get("pos_cond_kwargs") or {}
+            fc = pos.get("freqs_cis")
+            if (
+                isinstance(lat_shape, list)
+                and len(lat_shape) >= 3
+                and isinstance(fc, list)
+                and len(fc) >= 1
+                and isinstance(fc[0], dict)
+            ):
+                seq_lat = lat_shape[2]
+                img_freq_shape = fc[0].get("__tensor_shape__")
+                if (
+                    isinstance(img_freq_shape, list)
+                    and len(img_freq_shape) >= 1
+                    and img_freq_shape[0] != seq_lat
+                ):
+                    print(
+                        f"Shape check failed: pos freqs_cis image seq {img_freq_shape[0]} "
+                        f"!= trajectory latent_model_inputs seq {seq_lat}",
+                        file=sys.stderr,
+                    )
+                    return 1
         return 0
     finally:
         if not skip_launch:

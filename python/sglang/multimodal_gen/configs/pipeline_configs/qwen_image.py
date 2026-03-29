@@ -19,6 +19,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
+from sglang.multimodal_gen.runtime.post_training.models import (
+    QwenImageEditRolloutPipelineMixin,
+    QwenImageRolloutPipelineMixin,
+)
 from sglang.multimodal_gen.utils import calculate_dimensions
 
 
@@ -127,7 +131,7 @@ def _pack_latents(latents, batch_size, num_channels_latents, height, width):
 
 
 @dataclass
-class QwenImagePipelineConfig(ImagePipelineConfig):
+class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig):
     """Configuration for the QwenImage pipeline."""
 
     should_use_guidance: bool = False
@@ -314,7 +318,9 @@ class QwenImagePipelineConfig(ImagePipelineConfig):
 
 
 @dataclass
-class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
+class QwenImageEditPipelineConfig(
+    QwenImageEditRolloutPipelineMixin, QwenImagePipelineConfig
+):
     """Configuration for the QwenImageEdit pipeline."""
 
     task_type: ModelTaskType = ModelTaskType.I2I
