@@ -26,7 +26,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     preprocess_text,
     shard_rotary_emb_for_sp,
 )
-from sglang.multimodal_gen.runtime.post_training.models import FluxRolloutPipelineMixin
+from sglang.multimodal_gen.runtime.post_training.pipeline_configs import (
+    FluxRolloutPipelineMixin,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import (
     clip_postprocess_text,
     clip_preprocess_text,
