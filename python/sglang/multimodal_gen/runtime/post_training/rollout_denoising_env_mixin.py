@@ -44,6 +44,18 @@ class RolloutDenoisingEnvMixin:
     def _should_collect_dit_env(batch) -> bool:
         return bool(getattr(batch, "return_dit_env", False))
 
+    @staticmethod
+    def _call_gather_dit_env_static_for_sp_if_defined(
+        pipeline_config: Any,
+        batch: Any,
+        cond_kwargs: dict | None,
+    ) -> dict | None:
+        """If ``pipeline_config`` defines ``gather_dit_env_static_for_sp``, call it; else no-op."""
+        fn = getattr(pipeline_config, "gather_dit_env_static_for_sp", None)
+        if fn is not None and callable(fn):
+            return fn(batch, cond_kwargs)
+        return cond_kwargs
+
     def _maybe_init_dit_env_collection(
         self,
         batch,
@@ -73,7 +85,7 @@ class RolloutDenoisingEnvMixin:
             "env": env,
             "trajectory_latent_model_inputs": [],
             "trajectory_timesteps": [],
-            # Device-side kwargs for ``gather_dit_env_static_for_sp`` at finalize (do not mutate).
+            # Device-side cond kwargs for optional SP gather at finalize (do not mutate).
             "pos_cond_kwargs_src": pos_cond_kwargs,
             "neg_cond_kwargs_src": neg_cond_kwargs,
         }
@@ -116,12 +128,16 @@ class RolloutDenoisingEnvMixin:
 
         pos_src = state.get("pos_cond_kwargs_src")
         if pos_src is not None and env.pos_cond_kwargs is not None:
-            gathered_pos = pipeline_config.gather_dit_env_static_for_sp(batch, pos_src)
+            gathered_pos = self._call_gather_dit_env_static_for_sp_if_defined(
+                pipeline_config, batch, pos_src
+            )
             env.pos_cond_kwargs = self._kwargs_to_cpu(sanitize(gathered_pos))
 
         neg_src = state.get("neg_cond_kwargs_src")
         if neg_src is not None and env.neg_cond_kwargs is not None:
-            gathered_neg = pipeline_config.gather_dit_env_static_for_sp(batch, neg_src)
+            gathered_neg = self._call_gather_dit_env_static_for_sp_if_defined(
+                pipeline_config, batch, neg_src
+            )
             env.neg_cond_kwargs = self._kwargs_to_cpu(sanitize(gathered_neg))
 
         if batch.rollout_trajectory_data is None:
