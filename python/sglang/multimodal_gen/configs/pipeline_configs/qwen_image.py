@@ -19,7 +19,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     shard_rotary_emb_for_sp,
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
-from sglang.multimodal_gen.runtime.post_training.models import (
+from sglang.multimodal_gen.runtime.post_training.pipeline_configs import (
     QwenImageEditRolloutPipelineMixin,
     QwenImageRolloutPipelineMixin,
 )
