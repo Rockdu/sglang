@@ -10,6 +10,7 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.distributed.communication_op import (
+    sequence_model_parallel_all_gather,
     sequence_model_parallel_all_reduce,
 )
 
@@ -44,3 +45,28 @@ def all_reduce_if_sp_sharded(batch, tensor: torch.Tensor) -> torch.Tensor:
     tensor = tensor.to(get_local_torch_device())
     sequence_model_parallel_all_reduce(tensor)
     return tensor
+
+
+def maybe_sp_all_gather(
+    batch, x: torch.Tensor, dim: int = 0
+) -> torch.Tensor:
+    """All-gather ``x`` along ``dim`` on the SP group when this batch uses sharded-latent collectives.
+
+    No-op (returns ``x``) when ``should_do_sp_collective(batch)`` is false. Used e.g. for sharded
+    RoPE rows in ``gather_dit_env_static_for_sp`` (typically ``dim=0``).
+    """
+    if not should_do_sp_collective(batch):
+        return x
+    x = x.to(get_local_torch_device()).contiguous()
+    return sequence_model_parallel_all_gather(x, dim=dim)
+
+
+def maybe_trim_sp_rope_seq_for_batch(batch, rope: torch.Tensor) -> torch.Tensor:
+    """Drop SP padding rows from RoPE so length matches ``batch.raw_latent_shape`` token count."""
+    raw = getattr(batch, "raw_latent_shape", None)
+    if raw is None or len(raw) < 2:
+        return rope
+    target = int(raw[1])
+    if rope.shape[0] > target:
+        return rope[:target]
+    return rope

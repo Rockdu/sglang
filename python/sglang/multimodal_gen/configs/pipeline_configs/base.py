@@ -424,6 +424,14 @@ class PipelineConfig:
     def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {}
 
+    def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
+        """SP all_gather for one static cond-kwargs dict (``pos`` / ``neg``) in rollout ``denoising_env``.
+
+        Not used for ``image_kwargs``, trajectory tensors, or guidance; extend in subclasses when
+        new sequence-sharded fields appear (e.g. ``freqs_cis`` image branch).
+        """
+        return cond_kwargs
+
     @staticmethod
     def add_cli_args(
         parser: FlexibleArgumentParser, prefix: str = ""

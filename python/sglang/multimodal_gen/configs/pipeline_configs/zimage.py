@@ -21,6 +21,9 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_parallel_rank,
     get_sp_world_size,
 )
+from sglang.multimodal_gen.runtime.post_training.models import (
+    ZImageRolloutPipelineMixin,
+)
 
 
 def zimage_preprocess_text(prompt: str):
@@ -41,7 +44,7 @@ class TransformersModelConfig(EncoderConfig):
 
 
 @dataclass
-class ZImagePipelineConfig(ImagePipelineConfig):
+class ZImagePipelineConfig(ZImageRolloutPipelineMixin, ImagePipelineConfig):
     should_use_guidance: bool = False
     task_type: ModelTaskType = ModelTaskType.T2I
     dit_config: DiTConfig = field(default_factory=ZImageDitConfig)
