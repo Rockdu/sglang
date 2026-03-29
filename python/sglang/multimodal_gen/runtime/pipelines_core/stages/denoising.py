@@ -600,7 +600,8 @@ class DenoisingStage(PipelineStage):
         else:
             self._maybe_enable_cache_dit(cache_dit_num_inference_steps, batch)
 
-        self._maybe_prepare_rollout(batch)
+        if batch.rollout:
+            self._maybe_prepare_rollout(batch)
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
@@ -764,7 +765,8 @@ class DenoisingStage(PipelineStage):
             trajectory_timesteps_tensor = None
 
         # Gather log probs for rollout
-        self._maybe_collect_rollout_log_probs(batch)
+        if batch.rollout:
+            self._maybe_collect_rollout_log_probs(batch)
 
         # Gather results if using sequence parallelism
         latents, trajectory_tensor = self._postprocess_sp_latents(

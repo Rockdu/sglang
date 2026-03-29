@@ -230,8 +230,12 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 noise_std_dev=noise_std_dev,
                 model_output=model_output,
             )
+        
+        self.append_local_rollout_log_probs(
+            batch, log_prob_local_sum, local_elem_count
+        )
 
-        return prev_sample, log_prob_local_sum, local_elem_count
+        return prev_sample
 
     def append_local_rollout_log_probs(
         self, batch, log_prob_sum: torch.Tensor, log_prob_count: torch.Tensor
