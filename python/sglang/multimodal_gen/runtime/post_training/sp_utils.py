@@ -53,7 +53,7 @@ def maybe_sp_all_gather(
     """All-gather ``x`` along ``dim`` on the SP group when this batch uses sharded-latent collectives.
 
     No-op (returns ``x``) when ``should_do_sp_collective(batch)`` is false. Used e.g. for sharded
-    RoPE rows in ``gather_dit_env_static_for_sp`` (typically ``dim=0``).
+    Optional ``PipelineConfig.gather_dit_env_static_for_sp`` hooks (typically ``dim=0``).
     """
     if not should_do_sp_collective(batch):
         return x
