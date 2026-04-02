@@ -213,10 +213,10 @@ def main() -> int:
         print(json.dumps(outline, indent=2, ensure_ascii=False))
 
         env = outline.get("denoising_env")
+        dt = outline.get("dit_trajectory") or {}
+        lat = (dt.get("latent_model_inputs") or {}) if isinstance(dt, dict) else {}
+        lat_shape = lat.get("__tensor_shape__") if isinstance(lat, dict) else None
         if env and isinstance(env, dict):
-            traj = env.get("trajectory") or {}
-            lat = traj.get("latent_model_inputs") or {}
-            lat_shape = lat.get("__tensor_shape__")
             static = env.get("static") or {}
             pos = static.get("pos_cond_kwargs") or {}
             fc = pos.get("freqs_cis")
@@ -236,7 +236,7 @@ def main() -> int:
                 ):
                     print(
                         f"Shape check failed: pos freqs_cis image seq {img_freq_shape[0]} "
-                        f"!= trajectory latent_model_inputs seq {seq_lat}",
+                        f"!= dit_trajectory.latent_model_inputs seq {seq_lat}",
                         file=sys.stderr,
                     )
                     return 1

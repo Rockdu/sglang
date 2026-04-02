@@ -1,8 +1,7 @@
 """Mixin for collecting DiT denoising environment during rollout.
 
-The collection follows a ``static + trajectory`` split:
-- static: per-sample conditioning kwargs and guidance
-- trajectory: per-step DiT inputs along the sampling path
+Static conditioning is stored in ``RolloutDenoisingEnv``; per-step DiT inputs
+are stored in ``RolloutDitTrajectory`` on ``RolloutTrajectoryData``.
 """
 
 from __future__ import annotations
@@ -16,6 +15,7 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 )
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDenoisingEnv,
+    RolloutDitTrajectory,
     RolloutTrajectoryData,
 )
 
@@ -113,6 +113,9 @@ class RolloutDenoisingEnvMixin:
         step_inputs: list[torch.Tensor] = state["trajectory_latent_model_inputs"]
         step_timesteps: list[torch.Tensor] = state["trajectory_timesteps"]
 
+        if batch.rollout_trajectory_data is None:
+            batch.rollout_trajectory_data = RolloutTrajectoryData()
+
         if step_inputs:
             # [B, T, ...] — matches rollout_log_probs / trajectory_latents layout
             step_inputs_tensor = torch.stack(step_inputs, dim=1)
@@ -121,8 +124,10 @@ class RolloutDenoisingEnvMixin:
                 batch=batch,
                 stacked_latents=step_inputs_tensor,
             )
-            env.trajectory_latent_model_inputs = step_inputs_tensor.cpu()
-            env.trajectory_timesteps = torch.stack(step_timesteps, dim=0).cpu()
+            batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
+                latent_model_inputs=step_inputs_tensor.cpu(),
+                timesteps=torch.stack(step_timesteps, dim=0).cpu(),
+            )
 
         sanitize = getattr(pipeline_config, "sanitize_dit_env_kwargs", lambda x: x)
 
@@ -140,7 +145,5 @@ class RolloutDenoisingEnvMixin:
             )
             env.neg_cond_kwargs = self._kwargs_to_cpu(sanitize(gathered_neg))
 
-        if batch.rollout_trajectory_data is None:
-            batch.rollout_trajectory_data = RolloutTrajectoryData()
         batch.rollout_trajectory_data.denoising_env = env
         batch._rollout_dit_env_state = None

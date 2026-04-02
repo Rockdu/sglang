@@ -40,22 +40,28 @@ class RolloutDebugTensors:
 
 @dataclass
 class RolloutDenoisingEnv:
-    """DiT environment captured during denoising for RL training replay.
+    """Static DiT conditioning captured during denoising for RL training replay.
 
-    Split into *static* inputs (invariant across diffusion steps) and
-    *trajectory* inputs (one entry per step).  The training engine
-    receives one ``RolloutDenoisingEnv`` per sample.
+    Per-step latent inputs and timesteps are grouped in ``RolloutDitTrajectory``
+    on ``RolloutTrajectoryData``. The training engine receives one
+    ``RolloutDenoisingEnv`` per sample (static slice only).
     """
 
-    # --- static (per-sample, time-invariant) ---
     image_kwargs: dict[str, Any] | None = None
     pos_cond_kwargs: dict[str, Any] | None = None
     neg_cond_kwargs: dict[str, Any] | None = None
     guidance: torch.Tensor | None = None
 
-    # --- trajectory: latent inputs [B, T, ...]; timesteps [T] (shared across batch) ---
-    trajectory_latent_model_inputs: torch.Tensor | None = None
-    trajectory_timesteps: torch.Tensor | None = None
+
+@dataclass
+class RolloutDitTrajectory:
+    """DiT inputs along the denoising path (one entry per diffusion step).
+
+    ``latent_model_inputs`` is ``[B, T, ...]``; ``timesteps`` is ``[T]`` (shared across batch).
+    """
+
+    latent_model_inputs: torch.Tensor | None = None
+    timesteps: torch.Tensor | None = None
 
 
 @dataclass
@@ -65,3 +71,4 @@ class RolloutTrajectoryData:
     rollout_log_probs: torch.Tensor | None = None
     rollout_debug_tensors: RolloutDebugTensors | None = None
     denoising_env: RolloutDenoisingEnv | None = None
+    dit_trajectory: RolloutDitTrajectory | None = None

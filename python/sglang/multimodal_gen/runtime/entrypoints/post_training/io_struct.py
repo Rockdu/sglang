@@ -85,6 +85,8 @@ class RolloutImageResponse(BaseModel):
     rollout_log_probs: Optional[dict[str, Any]] = None
     rollout_debug_tensors: Optional[dict[str, Any]] = None
     denoising_env: Optional[dict[str, Any]] = None
+    # DiT per-step trajectory when return_dit_env=True: latent_model_inputs, timesteps
+    dit_trajectory: Optional[dict[str, Any]] = None
 
     # metrics
     inference_time_s: Optional[float] = None
