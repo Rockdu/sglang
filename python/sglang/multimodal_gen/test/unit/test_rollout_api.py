@@ -163,8 +163,9 @@ class TestRolloutImageRequest(unittest.TestCase):
         req = RolloutImageRequest(prompt="a cat")
         self.assertEqual(req.prompt, "a cat")
         self.assertEqual(req.seed, 1024)
-        self.assertTrue(req.return_trajectory_latents)
         self.assertFalse(req.rollout_debug_mode)
+        self.assertFalse(req.rollout_return_dit_env)
+        self.assertFalse(req.rollout_return_dit_trajectory)
         self.assertEqual(req.rollout_sde_type, "sde")
         self.assertAlmostEqual(req.rollout_noise_level, 0.7)
 
@@ -182,8 +183,8 @@ class TestRolloutImageRequest(unittest.TestCase):
             rollout_noise_level=0.5,
             rollout_log_prob_no_const=True,
             rollout_debug_mode=True,
-            return_trajectory_latents=True,
-            return_trajectory_decoded=True,
+            rollout_return_dit_env=True,
+            rollout_return_dit_trajectory=True,
             image_path=["/path/to/img.png"],
             extra_sampling_params={"boundary_ratio": 0.5},
         )
@@ -212,7 +213,6 @@ class TestRolloutImageResponse(unittest.TestCase):
         )
         self.assertEqual(resp.request_id, "test-id")
         self.assertIsNone(resp.generated_output)
-        self.assertIsNone(resp.trajectory_latents)
         self.assertIsNone(resp.rollout_log_probs)
 
     def test_response_with_data(self):
@@ -332,7 +332,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         )
         _, _, env, dit_traj = _serialize_rollout_trajectory(rtd)
         self.assertIsNotNone(env)
-        self.assertIn("static", env)
+        self.assertIn("pos_cond_kwargs", env)
         self.assertNotIn("trajectory", env)
         self.assertIsNotNone(dit_traj)
         self.assertIn("latent_model_inputs", dit_traj)
@@ -354,15 +354,12 @@ class TestBuildResponse(unittest.TestCase):
         self.assertEqual(resp.prompt, "prompt")
         self.assertEqual(resp.seed, 42)
         self.assertIsNotNone(resp.generated_output)
-        self.assertIsNone(resp.trajectory_latents)
         self.assertIsNone(resp.rollout_log_probs)
         self.assertAlmostEqual(resp.inference_time_s, 2.5)
 
     def test_full_response(self):
         batch = OutputBatch(
             output=[torch.randn(3, 1, 64, 64)],
-            trajectory_latents=torch.randn(1, 10, 4, 1, 8, 8),
-            trajectory_timesteps=torch.linspace(1.0, 0.0, 10),
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.tensor([-0.5]),
             ),
@@ -370,8 +367,6 @@ class TestBuildResponse(unittest.TestCase):
         )
         batch.metrics = self._make_metrics(5.0)
         resp = _build_response("r2", "test", 99, batch)
-        self.assertIsNotNone(resp.trajectory_latents)
-        self.assertIsNotNone(resp.trajectory_timesteps)
         self.assertIsNotNone(resp.rollout_log_probs)
         self.assertIsNone(resp.rollout_debug_tensors)
         self.assertAlmostEqual(resp.peak_memory_mb, 8192.0)
@@ -412,8 +407,6 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
     def _make_output_batch(self, **overrides):
         defaults = dict(
             output=[torch.randn(3, 1, 64, 64)],
-            trajectory_latents=torch.randn(1, 5, 4, 1, 8, 8),
-            trajectory_timesteps=torch.linspace(1.0, 0.0, 5),
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.tensor([-1.0]),
             ),
@@ -542,6 +535,56 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("width", call_kwargs)
         self.assertNotIn("guidance_scale", call_kwargs)
         self.assertIn("rollout", call_kwargs)
+        self.assertIs(call_kwargs.get("return_trajectory_latents"), False)
+        self.assertIs(call_kwargs.get("return_trajectory_decoded"), False)
+
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.async_scheduler_client")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.get_global_server_args")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.build_sampling_params")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
+    async def test_return_trajectory_latents_forced_false_after_extra(
+        self, mock_prepare, mock_build_sp, mock_get_args, mock_client
+    ):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            rollout_images,
+        )
+
+        mock_get_args.return_value = MagicMock()
+        mock_build_sp.return_value = MagicMock()
+        mock_prepare.return_value = MagicMock()
+        mock_client.forward = AsyncMock(return_value=self._make_output_batch())
+
+        request = RolloutImageRequest(
+            prompt="test",
+            extra_sampling_params={"return_trajectory_latents": True},
+        )
+        await rollout_images(request)
+        call_kwargs = mock_build_sp.call_args[1]
+        self.assertIs(call_kwargs.get("return_trajectory_latents"), False)
+
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.async_scheduler_client")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.get_global_server_args")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.build_sampling_params")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
+    async def test_return_trajectory_decoded_forced_false_after_extra(
+        self, mock_prepare, mock_build_sp, mock_get_args, mock_client
+    ):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            rollout_images,
+        )
+
+        mock_get_args.return_value = MagicMock()
+        mock_build_sp.return_value = MagicMock()
+        mock_prepare.return_value = MagicMock()
+        mock_client.forward = AsyncMock(return_value=self._make_output_batch())
+
+        request = RolloutImageRequest(
+            prompt="test",
+            extra_sampling_params={"return_trajectory_decoded": True},
+        )
+        await rollout_images(request)
+        call_kwargs = mock_build_sp.call_args[1]
+        self.assertIs(call_kwargs.get("return_trajectory_decoded"), False)
 
 
 if __name__ == "__main__":
