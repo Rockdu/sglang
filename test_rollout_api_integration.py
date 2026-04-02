@@ -1,9 +1,9 @@
 """Integration test: Rollout Image API vs standard generation.
 
 Launches a real sglang-D server with Z-Image-Turbo on a single GPU, then:
-1. Calls POST /rollout/images to get rollout trajectory data
+1. Calls POST /rollout/images for rollout log-probs (and optional ``dit_trajectory``)
 2. Calls POST /v1/images/generations for the same prompt/seed
-3. Verifies the rollout API returns all expected tensor fields
+3. Verifies the rollout API returns expected tensor fields
 4. Verifies roundtrip tensor serialization is lossless
 
 Usage:
@@ -103,8 +103,6 @@ def test_rollout_api():
         rollout_noise_level=0.7,
         rollout_log_prob_no_const=False,
         rollout_debug_mode=True,
-        return_trajectory_latents=True,
-        return_trajectory_decoded=False,
     )
 
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
@@ -126,18 +124,9 @@ def test_rollout_api():
     else:
         print(f"  generated_output: shape={gen_deserialized.shape}, dtype={gen_deserialized.dtype}")
 
-    # Check trajectory_latents
-    traj_lat = resp.get("trajectory_latents")
-    assert traj_lat is not None, "Missing trajectory_latents"
-    traj_lat_tensor = deserialize_tensor_field(traj_lat)
-    print(f"  trajectory_latents: shape={traj_lat_tensor.shape}, dtype={traj_lat_tensor.dtype}")
-    assert traj_lat_tensor.ndim >= 3, f"trajectory_latents unexpected ndim={traj_lat_tensor.ndim}"
-
-    # Check trajectory_timesteps
-    traj_ts = resp.get("trajectory_timesteps")
-    assert traj_ts is not None, "Missing trajectory_timesteps"
-    traj_ts_tensor = deserialize_tensor_field(traj_ts)
-    print(f"  trajectory_timesteps: shape={traj_ts_tensor.shape}, values={traj_ts_tensor}")
+    assert "trajectory_latents" not in resp and "trajectory_timesteps" not in resp, (
+        "Legacy ODE trajectory fields should not appear on rollout responses"
+    )
 
     # Check rollout_log_probs
     log_probs = resp.get("rollout_log_probs")
@@ -174,7 +163,6 @@ def test_rollout_api_without_debug():
         rollout_sde_type="sde",
         rollout_noise_level=0.7,
         rollout_debug_mode=False,
-        return_trajectory_latents=True,
     )
 
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
@@ -189,25 +177,30 @@ def test_rollout_api_without_debug():
     return resp
 
 
-def test_rollout_api_without_trajectory():
-    """Call rollout API with trajectory disabled."""
-    print("\n--- Test 3: POST /rollout/images (no trajectory) ---")
+def test_rollout_api_dit_trajectory_when_requested():
+    """``dit_trajectory`` is gated by ``rollout_return_dit_trajectory`` (not ``rollout_return_dit_env``)."""
+    print("\n--- Test 3: POST /rollout/images (rollout_return_dit_trajectory only) ---")
     payload = dict(
         prompt=PROMPT,
         seed=SEED,
         rollout_sde_type="sde",
         rollout_noise_level=0.7,
-        return_trajectory_latents=False,
+        rollout_debug_mode=False,
+        rollout_return_dit_env=False,
+        rollout_return_dit_trajectory=True,
     )
 
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
 
-    assert resp.get("trajectory_latents") is None, "Should not have trajectory_latents"
-    assert resp.get("trajectory_timesteps") is None, "Should not have trajectory_timesteps"
-    assert resp.get("rollout_log_probs") is not None, "Should still have rollout_log_probs"
-    print("  PASSED (no trajectory as expected)")
+    dit = resp.get("dit_trajectory")
+    assert dit is not None, "dit_trajectory expected when rollout_return_dit_trajectory=True"
+    assert dit.get("latent_model_inputs") is not None
+    assert dit.get("timesteps") is not None
+    assert resp.get("denoising_env") is None, "denoising_env should be absent when rollout_return_dit_env=False"
+    assert resp.get("rollout_log_probs") is not None
+    print("  PASSED (dit_trajectory without static env)")
 
 
 def test_deterministic_with_same_seed():
@@ -218,7 +211,6 @@ def test_deterministic_with_same_seed():
         seed=SEED,
         rollout_sde_type="sde",
         rollout_noise_level=0.7,
-        return_trajectory_latents=False,
     )
 
     r1 = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
@@ -242,7 +234,6 @@ def test_cps_sde_type():
         seed=SEED,
         rollout_sde_type="cps",
         rollout_noise_level=0.5,
-        return_trajectory_latents=False,
     )
 
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
@@ -266,7 +257,6 @@ def test_ode_sde_type():
         rollout_sde_type="ode",
         rollout_noise_level=0.5,
         rollout_log_prob_no_const=True,
-        return_trajectory_latents=False,
     )
 
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
@@ -299,7 +289,7 @@ def main():
         for test_fn in [
             test_rollout_api,
             test_rollout_api_without_debug,
-            test_rollout_api_without_trajectory,
+            test_rollout_api_dit_trajectory_when_requested,
             test_deterministic_with_same_seed,
             test_cps_sde_type,
             test_ode_sde_type,

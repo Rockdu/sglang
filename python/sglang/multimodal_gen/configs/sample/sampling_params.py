@@ -180,9 +180,10 @@ class SamplingParams:
     rollout_debug_mode: bool = (
         False  # return rollout debug tensors (intermediate states)
     )
-    return_trajectory_latents: bool = False  # returns all latents for each timestep
-    return_trajectory_decoded: bool = False  # returns decoded latents for each timestep
-    return_dit_env: bool = False  # capture DiT environment for RL training replay
+    return_trajectory_latents: bool = False  # ODE latent trajectory (ComfyUI / VAE decode path; not rollout HTTP)
+    return_trajectory_decoded: bool = False  # VAE-decode each ODE step (ComfyUI; not rollout HTTP)
+    rollout_return_dit_env: bool = False  # static DiT conditioning (image/pos/neg kwargs, guidance) for RL replay
+    rollout_return_dit_trajectory: bool = False  # per-step latent_model_inputs + timesteps (RolloutDitTrajectory)
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False
     # whether to adjust num_frames for multi-GPU friendly splitting (default: True)

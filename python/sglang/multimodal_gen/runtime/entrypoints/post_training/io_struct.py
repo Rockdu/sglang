@@ -52,10 +52,9 @@ class RolloutImageRequest(BaseModel):
     rollout_log_prob_no_const: bool = False
     rollout_debug_mode: bool = False
 
-    # trajectory control
-    return_trajectory_latents: bool = True
-    return_trajectory_decoded: bool = False
-    return_dit_env: bool = False
+    # optional DiT capture (ODE/VAE per-step decode is not exposed on this endpoint)
+    rollout_return_dit_env: bool = False  # conditioning fields in ``denoising_env``
+    rollout_return_dit_trajectory: bool = False  # per-step inputs in ``dit_trajectory``
 
     # image input (for I2I / TI2I tasks)
     image_path: Optional[list[str]] = None
@@ -77,15 +76,11 @@ class RolloutImageResponse(BaseModel):
     # generated output (serialized tensor or list of serialized tensors)
     generated_output: Any = None
 
-    # trajectory (each value is a serialized tensor dict with __tensor__ marker)
-    trajectory_latents: Optional[dict[str, Any]] = None
-    trajectory_timesteps: Optional[dict[str, Any]] = None
-
     # rollout data
     rollout_log_probs: Optional[dict[str, Any]] = None
     rollout_debug_tensors: Optional[dict[str, Any]] = None
     denoising_env: Optional[dict[str, Any]] = None
-    # DiT per-step trajectory when return_dit_env=True: latent_model_inputs, timesteps
+    # DiT per-step trajectory when rollout_return_dit_trajectory=True: latent_model_inputs, timesteps
     dit_trajectory: Optional[dict[str, Any]] = None
 
     # metrics

@@ -1,8 +1,9 @@
-"""Rollout Image API — returns all denoising inputs, trajectory data, and rollout log-probs.
+"""Rollout Image API — rollout log-probs, optional debug tensors, optional DiT capture.
 
-This endpoint is designed for RL post-training workflows. It reuses the
-existing generation pipeline by constructing a standard ``Req`` with rollout
-flags enabled, so zero changes are needed in the scheduler or denoising stages.
+DiT conditioning (``image_kwargs`` / cond kwargs / ``guidance``) is returned as
+``denoising_env`` when ``rollout_return_dit_env`` is True. Per-step model inputs are returned as
+``dit_trajectory`` when ``rollout_return_dit_trajectory`` is True. The two flags
+are independent.
 """
 
 from __future__ import annotations
@@ -36,7 +37,7 @@ router = APIRouter(prefix="/rollout", tags=["rollout"])
 def _serialize_rollout_trajectory(
     rtd: RolloutTrajectoryData | None,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None]:
-    """Serialize rollout log-probs, debug tensors, static denoising env, and DiT trajectory."""
+    """Serialize rollout log-probs, debug tensors, denoising env, and DiT trajectory."""
     if rtd is None:
         return None, None, None, None
 
@@ -56,12 +57,10 @@ def _serialize_rollout_trajectory(
     if rtd.denoising_env is not None:
         env = rtd.denoising_env
         denoising_env = {
-            "static": {
-                "image_kwargs": _maybe_serialize(env.image_kwargs) if env.image_kwargs else None,
-                "pos_cond_kwargs": _maybe_serialize(env.pos_cond_kwargs) if env.pos_cond_kwargs else None,
-                "neg_cond_kwargs": _maybe_serialize(env.neg_cond_kwargs) if env.neg_cond_kwargs else None,
-                "guidance": _maybe_serialize(env.guidance) if env.guidance is not None else None,
-            },
+            "image_kwargs": _maybe_serialize(env.image_kwargs) if env.image_kwargs else None,
+            "pos_cond_kwargs": _maybe_serialize(env.pos_cond_kwargs) if env.pos_cond_kwargs else None,
+            "neg_cond_kwargs": _maybe_serialize(env.neg_cond_kwargs) if env.neg_cond_kwargs else None,
+            "guidance": _maybe_serialize(env.guidance) if env.guidance is not None else None,
         }
 
     dit_trajectory = None
@@ -90,9 +89,6 @@ def _build_response(
     """Assemble the rollout response from an OutputBatch."""
     generated_output = _maybe_serialize(result.output) if result.output is not None else None
 
-    trajectory_latents = _maybe_serialize(result.trajectory_latents) if result.trajectory_latents is not None else None
-    trajectory_timesteps = _maybe_serialize(result.trajectory_timesteps) if result.trajectory_timesteps is not None else None
-
     rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory = (
         _serialize_rollout_trajectory(result.rollout_trajectory_data)
     )
@@ -102,8 +98,6 @@ def _build_response(
         prompt=prompt,
         seed=seed,
         generated_output=generated_output,
-        trajectory_latents=trajectory_latents,
-        trajectory_timesteps=trajectory_timesteps,
         rollout_log_probs=rollout_log_probs,
         rollout_debug_tensors=rollout_debug_tensors,
         denoising_env=denoising_env,
@@ -140,9 +134,8 @@ async def rollout_images(request: RolloutImageRequest):
         rollout_noise_level=request.rollout_noise_level,
         rollout_log_prob_no_const=request.rollout_log_prob_no_const,
         rollout_debug_mode=request.rollout_debug_mode,
-        return_trajectory_latents=request.return_trajectory_latents,
-        return_trajectory_decoded=request.return_trajectory_decoded,
-        return_dit_env=request.return_dit_env,
+        rollout_return_dit_env=request.rollout_return_dit_env,
+        rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
         # disable saving to disk — caller wants raw tensor data
         save_output=False,
     )
@@ -152,6 +145,9 @@ async def rollout_images(request: RolloutImageRequest):
 
     # filter None values so SamplingParams defaults are used
     sampling_kwargs = {k: v for k, v in sampling_kwargs.items() if v is not None}
+    # ODE latent trajectory + per-step VAE decode are not part of this API.
+    sampling_kwargs["return_trajectory_latents"] = False
+    sampling_kwargs["return_trajectory_decoded"] = False
 
     try:
         sp = build_sampling_params(request_id, **sampling_kwargs)

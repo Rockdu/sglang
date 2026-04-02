@@ -155,18 +155,33 @@ def _count_tensors(obj: Any) -> int:
     return 0
 
 
-def _validate_tensor_payload(resp_json: dict[str, Any], expect_dit_env: bool) -> None:
+def _validate_tensor_payload(
+    resp_json: dict[str, Any],
+    *,
+    expect_denoising_env: bool,
+    expect_dit_trajectory: bool,
+) -> None:
     generated = resp_json.get("generated_output")
     assert generated is not None, "generated_output missing"
     generated_obj = _maybe_deserialize(generated)
     assert _count_tensors(generated_obj) > 0, "generated_output has no tensor payload"
 
-    if expect_dit_env:
+    if expect_denoising_env:
         denv = resp_json.get("denoising_env")
-        assert denv is not None, "denoising_env should exist when return_dit_env=True"
+        assert denv is not None, "denoising_env should exist when rollout_return_dit_env=True"
         denv_obj = _maybe_deserialize(denv)
-        assert denv_obj.get("static") is not None, "denoising_env.static missing"
+        assert isinstance(denv_obj, dict), "denoising_env should deserialize to a dict"
+        assert any(
+            denv_obj.get(k) is not None
+            for k in ("image_kwargs", "pos_cond_kwargs", "neg_cond_kwargs", "guidance")
+        ), "denoising_env should contain at least one conditioning field"
         assert "trajectory" not in denv_obj, "trajectory should not be nested under denoising_env"
+    else:
+        assert resp_json.get("denoising_env") is None, (
+            "denoising_env should be None when rollout_return_dit_env=False"
+        )
+
+    if expect_dit_trajectory:
         dt_raw = resp_json.get("dit_trajectory")
         assert dt_raw is not None, "dit_trajectory missing"
         lmi_raw = dt_raw.get("latent_model_inputs")
@@ -177,14 +192,10 @@ def _validate_tensor_payload(resp_json: dict[str, Any], expect_dit_env: bool) ->
         tsteps = _maybe_deserialize(tsteps_raw)
         assert isinstance(lmi, torch.Tensor), "dit_trajectory.latent_model_inputs not tensor after decode"
         assert isinstance(tsteps, torch.Tensor), "dit_trajectory.timesteps not tensor after decode"
-        # latent_model_inputs [B, T, ...]; timesteps [T] shared across batch
         assert lmi.shape[1] == tsteps.shape[0], "step count mismatch (DiT trajectory)"
     else:
-        assert resp_json.get("denoising_env") is None, (
-            "denoising_env should be None when return_dit_env=False"
-        )
         assert resp_json.get("dit_trajectory") is None, (
-            "dit_trajectory should be None when return_dit_env=False"
+            "dit_trajectory should be None when rollout_return_dit_trajectory=False"
         )
 
 
@@ -193,7 +204,8 @@ def _run_rollout_request(
     prompt: str,
     seed: int,
     rollout: bool,
-    return_dit_env: bool,
+    rollout_return_dit_env: bool,
+    rollout_return_dit_trajectory: bool,
 ) -> tuple[float, float, dict[str, Any]]:
     payload = {
         "prompt": prompt,
@@ -203,9 +215,8 @@ def _run_rollout_request(
         "rollout_sde_type": "sde",
         "rollout_noise_level": 0.7,
         "rollout_debug_mode": False,
-        "return_trajectory_latents": False,
-        "return_trajectory_decoded": False,
-        "return_dit_env": return_dit_env,
+        "rollout_return_dit_env": rollout_return_dit_env,
+        "rollout_return_dit_trajectory": rollout_return_dit_trajectory,
         # rollout_api internally forces rollout=True, so we override explicitly here.
         "extra_sampling_params": {"rollout": rollout},
     }
@@ -236,9 +247,14 @@ def _warmup_both_scenarios(
             prompt=prompt,
             seed=s,
             rollout=True,
-            return_dit_env=True,
+            rollout_return_dit_env=True,
+            rollout_return_dit_trajectory=True,
         )
-        _validate_tensor_payload(resp_json, expect_dit_env=True)
+        _validate_tensor_payload(
+            resp_json,
+            expect_denoising_env=True,
+            expect_dit_trajectory=True,
+        )
         report_lines.append(
             f"  warmup-{i + 1}a rollout+env: wall={wall_s:.3f}s infer={infer_s:.3f}s"
         )
@@ -247,9 +263,14 @@ def _warmup_both_scenarios(
             prompt=prompt,
             seed=s + 50_000,
             rollout=False,
-            return_dit_env=False,
+            rollout_return_dit_env=False,
+            rollout_return_dit_trajectory=False,
         )
-        _validate_tensor_payload(resp_json, expect_dit_env=False)
+        _validate_tensor_payload(
+            resp_json,
+            expect_denoising_env=False,
+            expect_dit_trajectory=False,
+        )
         report_lines.append(
             f"  warmup-{i + 1}b baseline:    wall={wall_s:.3f}s infer={infer_s:.3f}s"
         )
@@ -277,22 +298,58 @@ def _benchmark_paired(
         roll_first = i % 2 == 0
         if roll_first:
             wr, ir, jr = _run_rollout_request(
-                base_url, prompt, s, rollout=True, return_dit_env=True
+                base_url,
+                prompt,
+                s,
+                rollout=True,
+                rollout_return_dit_env=True,
+                rollout_return_dit_trajectory=True,
             )
-            _validate_tensor_payload(jr, expect_dit_env=True)
+            _validate_tensor_payload(
+                jr,
+                expect_denoising_env=True,
+                expect_dit_trajectory=True,
+            )
             wb, ib, jb = _run_rollout_request(
-                base_url, prompt, s, rollout=False, return_dit_env=False
+                base_url,
+                prompt,
+                s,
+                rollout=False,
+                rollout_return_dit_env=False,
+                rollout_return_dit_trajectory=False,
             )
-            _validate_tensor_payload(jb, expect_dit_env=False)
+            _validate_tensor_payload(
+                jb,
+                expect_denoising_env=False,
+                expect_dit_trajectory=False,
+            )
         else:
             wb, ib, jb = _run_rollout_request(
-                base_url, prompt, s, rollout=False, return_dit_env=False
+                base_url,
+                prompt,
+                s,
+                rollout=False,
+                rollout_return_dit_env=False,
+                rollout_return_dit_trajectory=False,
             )
-            _validate_tensor_payload(jb, expect_dit_env=False)
+            _validate_tensor_payload(
+                jb,
+                expect_denoising_env=False,
+                expect_dit_trajectory=False,
+            )
             wr, ir, jr = _run_rollout_request(
-                base_url, prompt, s, rollout=True, return_dit_env=True
+                base_url,
+                prompt,
+                s,
+                rollout=True,
+                rollout_return_dit_env=True,
+                rollout_return_dit_trajectory=True,
             )
-            _validate_tensor_payload(jr, expect_dit_env=True)
+            _validate_tensor_payload(
+                jr,
+                expect_denoising_env=True,
+                expect_dit_trajectory=True,
+            )
         wall_roll.append(wr)
         infer_roll.append(ir)
         wall_base.append(wb)
@@ -306,12 +363,12 @@ def _benchmark_paired(
 
     return (
         ScenarioResult(
-            name="rollout=on + return_dit_env=on",
+            name="rollout=on + rollout_return_dit_env=on + rollout_return_dit_trajectory=on",
             wall_times_s=wall_roll,
             inference_times_s=infer_roll,
         ),
         ScenarioResult(
-            name="rollout=off + return_dit_env=off",
+            name="rollout=off + dit capture off",
             wall_times_s=wall_base,
             inference_times_s=infer_base,
         ),
@@ -369,7 +426,7 @@ def _run_model_suite(
         lines.append("")
         lines.append("[result]")
         lines.append(
-            "  Note: wall = full HTTP round-trip (larger JSON when return_dit_env); "
+            "  Note: wall = full HTTP round-trip (larger JSON when dit capture flags on); "
             "infer = server pipeline duration only (see rollout_api inference_time_s)."
         )
         bw = f"  baseline wall avg: {without_rollout.wall_avg_s:.3f}s"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Start sglang-D with Qwen-Image, call rollout with return_dit_env and rollout_debug_mode, print shape outline.
+"""Start sglang-D with Qwen-Image, call rollout with dit capture flags and rollout_debug_mode, print shape outline.
 
 POST /rollout/images returns JSON where tensors are dicts:
   {"__tensor__": true, "data": "<base64>", "shape": [...], "dtype": "..."}
@@ -196,9 +196,8 @@ def main() -> int:
             "rollout_sde_type": "sde",
             "rollout_noise_level": 0.7,
             "rollout_debug_mode": True,
-            "return_trajectory_latents": False,
-            "return_trajectory_decoded": False,
-            "return_dit_env": True,
+            "rollout_return_dit_env": True,
+            "rollout_return_dit_trajectory": True,
         }
 
         print("POST /rollout/images", json.dumps(payload, indent=2), sep="\n", file=sys.stderr)
@@ -217,8 +216,7 @@ def main() -> int:
         lat = (dt.get("latent_model_inputs") or {}) if isinstance(dt, dict) else {}
         lat_shape = lat.get("__tensor_shape__") if isinstance(lat, dict) else None
         if env and isinstance(env, dict):
-            static = env.get("static") or {}
-            pos = static.get("pos_cond_kwargs") or {}
+            pos = env.get("pos_cond_kwargs") or {}
             fc = pos.get("freqs_cis")
             if (
                 isinstance(lat_shape, list)
