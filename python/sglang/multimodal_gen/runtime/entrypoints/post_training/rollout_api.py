@@ -1,7 +1,7 @@
 """Rollout Image API — rollout log-probs, optional debug tensors, optional DiT capture.
 
 DiT conditioning (``image_kwargs`` / cond kwargs / ``guidance``) is returned as
-``denoising_env`` when ``rollout_return_dit_env`` is True. Per-step model inputs are returned as
+``denoising_env`` when ``rollout_return_denoising_env`` is True. Per-step model inputs are returned as
 ``dit_trajectory`` when ``rollout_return_dit_trajectory`` is True. The two flags
 are independent.
 """
@@ -134,7 +134,7 @@ async def rollout_images(request: RolloutImageRequest):
         rollout_noise_level=request.rollout_noise_level,
         rollout_log_prob_no_const=request.rollout_log_prob_no_const,
         rollout_debug_mode=request.rollout_debug_mode,
-        rollout_return_dit_env=request.rollout_return_dit_env,
+        rollout_return_denoising_env=request.rollout_return_denoising_env,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
         # disable saving to disk — caller wants raw tensor data
         save_output=False,

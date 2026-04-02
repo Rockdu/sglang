@@ -182,7 +182,7 @@ class SamplingParams:
     )
     return_trajectory_latents: bool = False  # ODE latent trajectory (ComfyUI / VAE decode path; not rollout HTTP)
     return_trajectory_decoded: bool = False  # VAE-decode each ODE step (ComfyUI; not rollout HTTP)
-    rollout_return_dit_env: bool = False  # static DiT conditioning (image/pos/neg kwargs, guidance) for RL replay
+    rollout_return_denoising_env: bool = False  # populate ``denoising_env`` (image/pos/neg kwargs, guidance) for RL replay
     rollout_return_dit_trajectory: bool = False  # per-step latent_model_inputs + timesteps (RolloutDitTrajectory)
     # if True, disallow user params to override subclass-defined protected fields
     no_override_protected_fields: bool = False

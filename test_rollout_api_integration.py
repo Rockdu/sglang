@@ -178,7 +178,7 @@ def test_rollout_api_without_debug():
 
 
 def test_rollout_api_dit_trajectory_when_requested():
-    """``dit_trajectory`` is gated by ``rollout_return_dit_trajectory`` (not ``rollout_return_dit_env``)."""
+    """``dit_trajectory`` is gated by ``rollout_return_dit_trajectory`` (not ``rollout_return_denoising_env``)."""
     print("\n--- Test 3: POST /rollout/images (rollout_return_dit_trajectory only) ---")
     payload = dict(
         prompt=PROMPT,
@@ -186,7 +186,7 @@ def test_rollout_api_dit_trajectory_when_requested():
         rollout_sde_type="sde",
         rollout_noise_level=0.7,
         rollout_debug_mode=False,
-        rollout_return_dit_env=False,
+        rollout_return_denoising_env=False,
         rollout_return_dit_trajectory=True,
     )
 
@@ -198,7 +198,7 @@ def test_rollout_api_dit_trajectory_when_requested():
     assert dit is not None, "dit_trajectory expected when rollout_return_dit_trajectory=True"
     assert dit.get("latent_model_inputs") is not None
     assert dit.get("timesteps") is not None
-    assert resp.get("denoising_env") is None, "denoising_env should be absent when rollout_return_dit_env=False"
+    assert resp.get("denoising_env") is None, "denoising_env should be absent when rollout_return_denoising_env=False"
     assert resp.get("rollout_log_probs") is not None
     print("  PASSED (dit_trajectory without static env)")
 
