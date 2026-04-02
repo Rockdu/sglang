@@ -42,7 +42,7 @@ class RolloutDebugTensors:
 class RolloutDenoisingEnv:
     """Static DiT conditioning captured during denoising for RL training replay.
 
-    Populated when ``rollout_return_dit_env`` is enabled. Per-step inputs live
+    Populated when ``rollout_return_denoising_env`` is enabled. Per-step inputs live
     separately in ``RolloutDitTrajectory`` when ``rollout_return_dit_trajectory``
     is enabled.
     """
@@ -69,7 +69,7 @@ class RolloutDitTrajectory:
 class RolloutTrajectoryData:
     """Container for rollout-specific trajectory outputs.
 
-    ``denoising_env`` is filled when ``rollout_return_dit_env``; ``dit_trajectory``
+    ``denoising_env`` is filled when ``rollout_return_denoising_env``; ``dit_trajectory``
     when ``rollout_return_dit_trajectory`` (independent switches).
     """
 

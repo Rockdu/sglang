@@ -1,7 +1,7 @@
 """Mixin for collecting DiT denoising environment during rollout.
 
 ``RolloutDenoisingEnv`` (dit env: image / cond kwargs / guidance) is filled when
-``batch.rollout_return_dit_env`` is set. Per-step inputs go to
+``batch.rollout_return_denoising_env`` is set. Per-step inputs go to
 ``RolloutDitTrajectory`` when ``batch.rollout_return_dit_trajectory`` is set.
 Either or both may be enabled independently.
 """
@@ -44,7 +44,7 @@ class RolloutDenoisingEnvMixin:
 
     @staticmethod
     def _should_collect_dit_env(batch) -> bool:
-        return bool(getattr(batch, "rollout_return_dit_env", False))
+        return bool(getattr(batch, "rollout_return_denoising_env", False))
 
     @staticmethod
     def _should_collect_dit_trajectory(batch) -> bool:

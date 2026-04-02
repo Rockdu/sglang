@@ -196,7 +196,7 @@ def main() -> int:
             "rollout_sde_type": "sde",
             "rollout_noise_level": 0.7,
             "rollout_debug_mode": True,
-            "rollout_return_dit_env": True,
+            "rollout_return_denoising_env": True,
             "rollout_return_dit_trajectory": True,
         }
 

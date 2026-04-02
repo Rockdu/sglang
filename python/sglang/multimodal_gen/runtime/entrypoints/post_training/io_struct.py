@@ -53,7 +53,7 @@ class RolloutImageRequest(BaseModel):
     rollout_debug_mode: bool = False
 
     # optional DiT capture (ODE/VAE per-step decode is not exposed on this endpoint)
-    rollout_return_dit_env: bool = False  # conditioning fields in ``denoising_env``
+    rollout_return_denoising_env: bool = False  # conditioning fields in ``denoising_env``
     rollout_return_dit_trajectory: bool = False  # per-step inputs in ``dit_trajectory``
 
     # image input (for I2I / TI2I tasks)
@@ -79,8 +79,8 @@ class RolloutImageResponse(BaseModel):
     # rollout data
     rollout_log_probs: Optional[dict[str, Any]] = None
     rollout_debug_tensors: Optional[dict[str, Any]] = None
-    denoising_env: Optional[dict[str, Any]] = None
-    # DiT per-step trajectory when rollout_return_dit_trajectory=True: latent_model_inputs, timesteps
+    denoising_env: Optional[dict[str, Any]] = None  # when ``rollout_return_denoising_env``
+    # per-step trajectory when ``rollout_return_dit_trajectory``
     dit_trajectory: Optional[dict[str, Any]] = None
 
     # metrics

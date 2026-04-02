@@ -164,7 +164,7 @@ class TestRolloutImageRequest(unittest.TestCase):
         self.assertEqual(req.prompt, "a cat")
         self.assertEqual(req.seed, 1024)
         self.assertFalse(req.rollout_debug_mode)
-        self.assertFalse(req.rollout_return_dit_env)
+        self.assertFalse(req.rollout_return_denoising_env)
         self.assertFalse(req.rollout_return_dit_trajectory)
         self.assertEqual(req.rollout_sde_type, "sde")
         self.assertAlmostEqual(req.rollout_noise_level, 0.7)
@@ -183,7 +183,7 @@ class TestRolloutImageRequest(unittest.TestCase):
             rollout_noise_level=0.5,
             rollout_log_prob_no_const=True,
             rollout_debug_mode=True,
-            rollout_return_dit_env=True,
+            rollout_return_denoising_env=True,
             rollout_return_dit_trajectory=True,
             image_path=["/path/to/img.png"],
             extra_sampling_params={"boundary_ratio": 0.5},

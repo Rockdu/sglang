@@ -168,7 +168,7 @@ def _validate_tensor_payload(
 
     if expect_denoising_env:
         denv = resp_json.get("denoising_env")
-        assert denv is not None, "denoising_env should exist when rollout_return_dit_env=True"
+        assert denv is not None, "denoising_env should exist when rollout_return_denoising_env=True"
         denv_obj = _maybe_deserialize(denv)
         assert isinstance(denv_obj, dict), "denoising_env should deserialize to a dict"
         assert any(
@@ -178,7 +178,7 @@ def _validate_tensor_payload(
         assert "trajectory" not in denv_obj, "trajectory should not be nested under denoising_env"
     else:
         assert resp_json.get("denoising_env") is None, (
-            "denoising_env should be None when rollout_return_dit_env=False"
+            "denoising_env should be None when rollout_return_denoising_env=False"
         )
 
     if expect_dit_trajectory:
@@ -204,7 +204,7 @@ def _run_rollout_request(
     prompt: str,
     seed: int,
     rollout: bool,
-    rollout_return_dit_env: bool,
+    rollout_return_denoising_env: bool,
     rollout_return_dit_trajectory: bool,
 ) -> tuple[float, float, dict[str, Any]]:
     payload = {
@@ -215,7 +215,7 @@ def _run_rollout_request(
         "rollout_sde_type": "sde",
         "rollout_noise_level": 0.7,
         "rollout_debug_mode": False,
-        "rollout_return_dit_env": rollout_return_dit_env,
+        "rollout_return_denoising_env": rollout_return_denoising_env,
         "rollout_return_dit_trajectory": rollout_return_dit_trajectory,
         # rollout_api internally forces rollout=True, so we override explicitly here.
         "extra_sampling_params": {"rollout": rollout},
@@ -247,7 +247,7 @@ def _warmup_both_scenarios(
             prompt=prompt,
             seed=s,
             rollout=True,
-            rollout_return_dit_env=True,
+            rollout_return_denoising_env=True,
             rollout_return_dit_trajectory=True,
         )
         _validate_tensor_payload(
@@ -263,7 +263,7 @@ def _warmup_both_scenarios(
             prompt=prompt,
             seed=s + 50_000,
             rollout=False,
-            rollout_return_dit_env=False,
+            rollout_return_denoising_env=False,
             rollout_return_dit_trajectory=False,
         )
         _validate_tensor_payload(
@@ -302,7 +302,7 @@ def _benchmark_paired(
                 prompt,
                 s,
                 rollout=True,
-                rollout_return_dit_env=True,
+                rollout_return_denoising_env=True,
                 rollout_return_dit_trajectory=True,
             )
             _validate_tensor_payload(
@@ -315,7 +315,7 @@ def _benchmark_paired(
                 prompt,
                 s,
                 rollout=False,
-                rollout_return_dit_env=False,
+                rollout_return_denoising_env=False,
                 rollout_return_dit_trajectory=False,
             )
             _validate_tensor_payload(
@@ -329,7 +329,7 @@ def _benchmark_paired(
                 prompt,
                 s,
                 rollout=False,
-                rollout_return_dit_env=False,
+                rollout_return_denoising_env=False,
                 rollout_return_dit_trajectory=False,
             )
             _validate_tensor_payload(
@@ -342,7 +342,7 @@ def _benchmark_paired(
                 prompt,
                 s,
                 rollout=True,
-                rollout_return_dit_env=True,
+                rollout_return_denoising_env=True,
                 rollout_return_dit_trajectory=True,
             )
             _validate_tensor_payload(
@@ -363,7 +363,7 @@ def _benchmark_paired(
 
     return (
         ScenarioResult(
-            name="rollout=on + rollout_return_dit_env=on + rollout_return_dit_trajectory=on",
+            name="rollout=on + rollout_return_denoising_env=on + rollout_return_dit_trajectory=on",
             wall_times_s=wall_roll,
             inference_times_s=infer_roll,
         ),
