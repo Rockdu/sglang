@@ -166,17 +166,25 @@ def _validate_tensor_payload(resp_json: dict[str, Any], expect_dit_env: bool) ->
         assert denv is not None, "denoising_env should exist when return_dit_env=True"
         denv_obj = _maybe_deserialize(denv)
         assert denv_obj.get("static") is not None, "denoising_env.static missing"
-        traj = denv_obj.get("trajectory")
-        assert traj is not None, "denoising_env.trajectory missing"
-        lmi = traj.get("latent_model_inputs")
-        tsteps = traj.get("timesteps")
-        assert isinstance(lmi, torch.Tensor), "latent_model_inputs not tensor after decode"
-        assert isinstance(tsteps, torch.Tensor), "timesteps not tensor after decode"
+        assert "trajectory" not in denv_obj, "trajectory should not be nested under denoising_env"
+        dt_raw = resp_json.get("dit_trajectory")
+        assert dt_raw is not None, "dit_trajectory missing"
+        lmi_raw = dt_raw.get("latent_model_inputs")
+        tsteps_raw = dt_raw.get("timesteps")
+        assert lmi_raw is not None, "dit_trajectory.latent_model_inputs missing"
+        assert tsteps_raw is not None, "dit_trajectory.timesteps missing"
+        lmi = _maybe_deserialize(lmi_raw)
+        tsteps = _maybe_deserialize(tsteps_raw)
+        assert isinstance(lmi, torch.Tensor), "dit_trajectory.latent_model_inputs not tensor after decode"
+        assert isinstance(tsteps, torch.Tensor), "dit_trajectory.timesteps not tensor after decode"
         # latent_model_inputs [B, T, ...]; timesteps [T] shared across batch
-        assert lmi.shape[1] == tsteps.shape[0], "step count mismatch in denoising_env"
+        assert lmi.shape[1] == tsteps.shape[0], "step count mismatch (DiT trajectory)"
     else:
         assert resp_json.get("denoising_env") is None, (
             "denoising_env should be None when return_dit_env=False"
+        )
+        assert resp_json.get("dit_trajectory") is None, (
+            "dit_trajectory should be None when return_dit_env=False"
         )
 
 

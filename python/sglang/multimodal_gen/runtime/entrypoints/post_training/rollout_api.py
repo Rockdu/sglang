@@ -35,10 +35,10 @@ router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 def _serialize_rollout_trajectory(
     rtd: RolloutTrajectoryData | None,
-) -> tuple[dict | None, dict | None, dict | None]:
-    """Extract and serialize rollout log-probs, debug tensors, and denoising env."""
+) -> tuple[dict | None, dict | None, dict | None, dict | None]:
+    """Serialize rollout log-probs, debug tensors, static denoising env, and DiT trajectory."""
     if rtd is None:
-        return None, None, None
+        return None, None, None, None
 
     log_probs = _maybe_serialize(rtd.rollout_log_probs) if rtd.rollout_log_probs is not None else None
 
@@ -62,13 +62,23 @@ def _serialize_rollout_trajectory(
                 "neg_cond_kwargs": _maybe_serialize(env.neg_cond_kwargs) if env.neg_cond_kwargs else None,
                 "guidance": _maybe_serialize(env.guidance) if env.guidance is not None else None,
             },
-            "trajectory": {
-                "latent_model_inputs": _maybe_serialize(env.trajectory_latent_model_inputs),
-                "timesteps": _maybe_serialize(env.trajectory_timesteps),
-            },
         }
 
-    return log_probs, debug_tensors, denoising_env
+    dit_trajectory = None
+    if rtd.dit_trajectory is not None:
+        dtr = rtd.dit_trajectory
+        dit_trajectory = {
+            "latent_model_inputs": (
+                _maybe_serialize(dtr.latent_model_inputs)
+                if dtr.latent_model_inputs is not None
+                else None
+            ),
+            "timesteps": (
+                _maybe_serialize(dtr.timesteps) if dtr.timesteps is not None else None
+            ),
+        }
+
+    return log_probs, debug_tensors, denoising_env, dit_trajectory
 
 
 def _build_response(
@@ -83,8 +93,8 @@ def _build_response(
     trajectory_latents = _maybe_serialize(result.trajectory_latents) if result.trajectory_latents is not None else None
     trajectory_timesteps = _maybe_serialize(result.trajectory_timesteps) if result.trajectory_timesteps is not None else None
 
-    rollout_log_probs, rollout_debug_tensors, denoising_env = _serialize_rollout_trajectory(
-        result.rollout_trajectory_data
+    rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory = (
+        _serialize_rollout_trajectory(result.rollout_trajectory_data)
     )
 
     return RolloutImageResponse(
@@ -97,6 +107,7 @@ def _build_response(
         rollout_log_probs=rollout_log_probs,
         rollout_debug_tensors=rollout_debug_tensors,
         denoising_env=denoising_env,
+        dit_trajectory=dit_trajectory,
         inference_time_s=(
             result.metrics.total_duration_s
             if result.metrics and result.metrics.total_duration_s > 0
