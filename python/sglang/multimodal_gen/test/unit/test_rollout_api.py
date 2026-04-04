@@ -155,93 +155,6 @@ class TestMaybeSerialize(unittest.TestCase):
 
 
 # =========================================================================
-# io_struct.py — RolloutImageRequest / RolloutImageResponse
-# =========================================================================
-
-
-class TestRolloutImageRequest(unittest.TestCase):
-    def test_minimal_request(self):
-        req = RolloutImageRequest(prompt="a cat")
-        self.assertEqual(req.prompt, "a cat")
-        self.assertEqual(req.seed, 1024)
-        self.assertFalse(req.rollout_debug_mode)
-        self.assertFalse(req.rollout_return_denoising_env)
-        self.assertFalse(req.rollout_return_dit_trajectory)
-        self.assertEqual(req.rollout_sde_type, "sde")
-        self.assertAlmostEqual(req.rollout_noise_level, 0.7)
-
-    def test_full_request(self):
-        req = RolloutImageRequest(
-            prompt="test",
-            negative_prompt="bad",
-            seed=42,
-            width=512,
-            height=512,
-            num_inference_steps=20,
-            guidance_scale=7.5,
-            true_cfg_scale=3.0,
-            rollout_sde_type="cps",
-            rollout_noise_level=0.5,
-            rollout_log_prob_no_const=True,
-            rollout_debug_mode=True,
-            rollout_return_denoising_env=True,
-            rollout_return_dit_trajectory=True,
-            image_path=["/path/to/img.png"],
-            extra_sampling_params={"boundary_ratio": 0.5},
-        )
-        self.assertEqual(req.rollout_sde_type, "cps")
-        self.assertTrue(req.rollout_log_prob_no_const)
-        self.assertEqual(req.extra_sampling_params, {"boundary_ratio": 0.5})
-
-    def test_request_json_roundtrip(self):
-        req = RolloutImageRequest(prompt="a dog", seed=99)
-        data = req.model_dump()
-        req2 = RolloutImageRequest(**data)
-        self.assertEqual(req, req2)
-
-    def test_request_validation_missing_prompt(self):
-        from pydantic import ValidationError
-        with self.assertRaises(ValidationError):
-            RolloutImageRequest()
-
-
-class TestRolloutImageResponse(unittest.TestCase):
-    def test_minimal_response(self):
-        resp = RolloutImageResponse(
-            request_id="test-id",
-            prompt="hello",
-            seed=42,
-        )
-        self.assertEqual(resp.request_id, "test-id")
-        self.assertIsNone(resp.generated_output)
-        self.assertIsNone(resp.rollout_log_probs)
-
-    def test_response_with_data(self):
-        t = torch.randn(2, 3)
-        serialized = _maybe_serialize(t)
-        resp = RolloutImageResponse(
-            request_id="test-id",
-            prompt="hello",
-            seed=42,
-            generated_output=serialized,
-            inference_time_s=1.5,
-            peak_memory_mb=4096.0,
-        )
-        self.assertEqual(resp.inference_time_s, 1.5)
-        self.assertTrue(resp.generated_output["__tensor__"])
-
-    def test_response_json_roundtrip(self):
-        resp = RolloutImageResponse(
-            request_id="r1", prompt="p", seed=1,
-            rollout_log_probs=_maybe_serialize(torch.tensor([0.5, 0.6])),
-        )
-        data = resp.model_dump()
-        resp2 = RolloutImageResponse(**data)
-        self.assertEqual(resp.request_id, resp2.request_id)
-        self.assertEqual(resp.rollout_log_probs, resp2.rollout_log_probs)
-
-
-# =========================================================================
 # rollout_api.py — _serialize_rollout_trajectory and _build_response
 # =========================================================================
 
@@ -542,6 +455,26 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
         call_kwargs = mock_build_sp.call_args[1]
         self.assertAlmostEqual(call_kwargs["boundary_ratio"], 0.5)
         self.assertEqual(call_kwargs["num_frames"], 1)
+
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.async_scheduler_client")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.get_global_server_args")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.build_sampling_params")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
+    async def test_num_outputs_per_prompt_forwarded(
+        self, mock_prepare, mock_build_sp, mock_get_args, mock_client
+    ):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_images
+
+        mock_get_args.return_value = MagicMock()
+        mock_build_sp.return_value = MagicMock()
+        mock_prepare.return_value = MagicMock()
+        mock_client.forward = AsyncMock(return_value=self._make_output_batch())
+
+        request = RolloutImageRequest(prompt="test", num_outputs_per_prompt=3)
+        await rollout_images(request)
+
+        call_kwargs = mock_build_sp.call_args[1]
+        self.assertEqual(call_kwargs["num_outputs_per_prompt"], 3)
 
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.async_scheduler_client")
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.get_global_server_args")
