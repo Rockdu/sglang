@@ -1,13 +1,11 @@
-"""Rollout Image API — rollout log-probs, optional debug tensors, optional DiT capture.
-
-DiT conditioning (``image_kwargs`` / cond kwargs / ``guidance``) is returned as
-``denoising_env`` when ``rollout_return_denoising_env`` is True. Per-step model inputs are returned as
-``dit_trajectory`` when ``rollout_return_dit_trajectory`` is True. The two flags
-are independent.
+"""Rollout HTTP API (``POST /rollout/images``).
 """
 
 from __future__ import annotations
 
+from typing import Any
+
+import torch
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import ORJSONResponse
 
@@ -17,12 +15,13 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutImageRequest,
     RolloutImageResponse,
 )
-from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
-    _maybe_serialize,
-)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import _maybe_serialize
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutDebugTensors,
+    RolloutDenoisingEnv,
+    RolloutDitTrajectory,
     RolloutTrajectoryData,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
@@ -30,93 +29,229 @@ from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
-
 router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 
-def _serialize_rollout_trajectory(
-    rtd: RolloutTrajectoryData | None,
-) -> tuple[dict | None, dict | None, dict | None, dict | None]:
-    """Serialize rollout log-probs, debug tensors, denoising env, and DiT trajectory."""
-    if rtd is None:
-        return None, None, None, None
+def _infer_rollout_batch_size(result: OutputBatch) -> int:
+    """Infer batch_size by log_probs
+    """
+    rollout_trajectory_data = result.rollout_trajectory_data
+    return rollout_trajectory_data.rollout_log_probs.shape[0]
 
-    log_probs = _maybe_serialize(rtd.rollout_log_probs) if rtd.rollout_log_probs is not None else None
 
-    debug_tensors = None
-    if rtd.rollout_debug_tensors is not None:
-        dt = rtd.rollout_debug_tensors
-        debug_tensors = {
-            "rollout_variance_noises": _maybe_serialize(dt.rollout_variance_noises),
-            "rollout_prev_sample_means": _maybe_serialize(dt.rollout_prev_sample_means),
-            "rollout_noise_std_devs": _maybe_serialize(dt.rollout_noise_std_devs),
-            "rollout_model_outputs": _maybe_serialize(dt.rollout_model_outputs),
+def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) -> Any:
+    """Pull one sample out of a nested structure of batched tensors.
+    """
+    if isinstance(obj, torch.Tensor):
+        if obj.dim() >= 1 and obj.shape[0] == batch_size:
+            return obj[sample_idx].contiguous()
+        return obj
+    if isinstance(obj, dict):
+        return {
+            k: _extract_single_sample_tensor(v, sample_idx, batch_size) for k, v in obj.items()
         }
+    if isinstance(obj, list):
+        return [_extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(_extract_single_sample_tensor(v, sample_idx, batch_size) for v in obj)
+    return obj
 
+
+def _extract_generated_output_for_sample(output: Any, sample_idx: int, batch_size: int) -> Any:
+    """One row of ``result.output`` when it matches rollout ``batch_size`` (from ``rollout_log_probs``).
+    """
+    if output is None:
+        return None
+    assert isinstance(output, torch.Tensor), f"output must be a tensor, got {type(output)}"
+    assert output.dim() >= 1 and output.shape[0] == batch_size, f"output must have shape [B, ...], got {output.shape}"
+    return output[sample_idx].contiguous()
+
+
+def _slice_rollout_trajectory_for_sample(
+    rollout_trajectory_data: RolloutTrajectoryData | None,
+    sample_idx: int,
+    batch_size: int,
+) -> RolloutTrajectoryData | None:
+    """Extract per-sample ``RolloutTrajectoryData`` from a batch.
+
+    ``dit_trajectory.timesteps`` is usually ``[T]`` and shared across the batch; it is not extracted here and is
+    deduplicated during serialization later.
+    """
+    if rollout_trajectory_data is None:
+        return None
+    log_probs = rollout_trajectory_data.rollout_log_probs
+    if isinstance(log_probs, torch.Tensor) and log_probs.dim() >= 1 and log_probs.shape[0] == batch_size:
+        log_probs = log_probs[sample_idx].contiguous()
+    debug_tensors = None
+    if rollout_trajectory_data.rollout_debug_tensors:
+        rollout_debug = rollout_trajectory_data.rollout_debug_tensors
+        debug_tensors = RolloutDebugTensors(
+            rollout_variance_noises=_extract_single_sample_tensor(
+                rollout_debug.rollout_variance_noises, sample_idx, batch_size
+            ),
+            rollout_prev_sample_means=_extract_single_sample_tensor(
+                rollout_debug.rollout_prev_sample_means, sample_idx, batch_size
+            ),
+            rollout_noise_std_devs=_extract_single_sample_tensor(
+                rollout_debug.rollout_noise_std_devs, sample_idx, batch_size
+            ),
+            rollout_model_outputs=_extract_single_sample_tensor(
+                rollout_debug.rollout_model_outputs, sample_idx, batch_size
+            ),
+        )
     denoising_env = None
-    if rtd.denoising_env is not None:
-        env = rtd.denoising_env
-        denoising_env = {
+    if rollout_trajectory_data.denoising_env:
+        env = rollout_trajectory_data.denoising_env
+        denoising_env = RolloutDenoisingEnv(
+            image_kwargs=_extract_single_sample_tensor(env.image_kwargs, sample_idx, batch_size)
+            if env.image_kwargs
+            else None,
+            pos_cond_kwargs=_extract_single_sample_tensor(env.pos_cond_kwargs, sample_idx, batch_size)
+            if env.pos_cond_kwargs
+            else None,
+            neg_cond_kwargs=_extract_single_sample_tensor(env.neg_cond_kwargs, sample_idx, batch_size)
+            if env.neg_cond_kwargs
+            else None,
+            guidance=_extract_single_sample_tensor(env.guidance, sample_idx, batch_size)
+            if env.guidance is not None
+            else None,
+        )
+    dit_trajectory = None
+    if rollout_trajectory_data.dit_trajectory:
+        dit = rollout_trajectory_data.dit_trajectory
+        dit_trajectory = RolloutDitTrajectory(
+            latent_model_inputs=_extract_single_sample_tensor(
+                dit.latent_model_inputs, sample_idx, batch_size
+            ),
+            timesteps=dit.timesteps,
+        )
+    return RolloutTrajectoryData(
+        rollout_log_probs=log_probs,
+        rollout_debug_tensors=debug_tensors,
+        denoising_env=denoising_env,
+        dit_trajectory=dit_trajectory,
+    )
+
+
+def _serialize_rollout_trajectory(
+    rollout_trajectory_data: RolloutTrajectoryData | None,
+    *,
+    dit_timesteps_wire: dict | None = None,
+) -> tuple[dict | None, dict | None, dict | None, dict | None]:
+    """Convert per-sample ``RolloutTrajectoryData`` to JSON-friendly dicts (tensors via ``_maybe_serialize``).
+
+    ``dit_timesteps_wire``: if set, used as ``dit_trajectory["timesteps"]`` so the caller can run
+    ``_maybe_serialize`` once on the shared ``[T]`` tensor and attach the same dict to every response row.
+    Otherwise ``dit.timesteps`` is serialized here.
+    Return order: ``rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory``.
+    """
+    if rollout_trajectory_data is None:
+        return None, None, None, None
+    serialized_log_probs = (
+        _maybe_serialize(rollout_trajectory_data.rollout_log_probs)
+        if rollout_trajectory_data.rollout_log_probs is not None
+        else None
+    )
+    serialized_debug_tensors = None
+    if rollout_trajectory_data.rollout_debug_tensors:
+        rollout_debug = rollout_trajectory_data.rollout_debug_tensors
+        serialized_debug_tensors = {
+            "rollout_variance_noises": _maybe_serialize(rollout_debug.rollout_variance_noises),
+            "rollout_prev_sample_means": _maybe_serialize(rollout_debug.rollout_prev_sample_means),
+            "rollout_noise_std_devs": _maybe_serialize(rollout_debug.rollout_noise_std_devs),
+            "rollout_model_outputs": _maybe_serialize(rollout_debug.rollout_model_outputs),
+        }
+    serialized_denoising_env = None
+    if rollout_trajectory_data.denoising_env:
+        env = rollout_trajectory_data.denoising_env
+        serialized_denoising_env = {
             "image_kwargs": _maybe_serialize(env.image_kwargs) if env.image_kwargs else None,
             "pos_cond_kwargs": _maybe_serialize(env.pos_cond_kwargs) if env.pos_cond_kwargs else None,
             "neg_cond_kwargs": _maybe_serialize(env.neg_cond_kwargs) if env.neg_cond_kwargs else None,
             "guidance": _maybe_serialize(env.guidance) if env.guidance is not None else None,
         }
-
-    dit_trajectory = None
-    if rtd.dit_trajectory is not None:
-        dtr = rtd.dit_trajectory
-        dit_trajectory = {
+    serialized_dit_trajectory = None
+    if rollout_trajectory_data.dit_trajectory:
+        dit = rollout_trajectory_data.dit_trajectory
+        timesteps_wire = (
+            dit_timesteps_wire
+            if dit_timesteps_wire is not None
+            else (_maybe_serialize(dit.timesteps) if dit.timesteps is not None else None)
+        )
+        serialized_dit_trajectory = {
             "latent_model_inputs": (
-                _maybe_serialize(dtr.latent_model_inputs)
-                if dtr.latent_model_inputs is not None
-                else None
+                _maybe_serialize(dit.latent_model_inputs) if dit.latent_model_inputs is not None else None
             ),
-            "timesteps": (
-                _maybe_serialize(dtr.timesteps) if dtr.timesteps is not None else None
-            ),
+            "timesteps": timesteps_wire,
         }
-
-    return log_probs, debug_tensors, denoising_env, dit_trajectory
+    return serialized_log_probs, serialized_debug_tensors, serialized_denoising_env, serialized_dit_trajectory
 
 
 def _build_response(
-    request_id: str,
-    prompt: str,
-    seed: int,
-    result: OutputBatch,
-) -> RolloutImageResponse:
-    """Assemble the rollout response from an OutputBatch."""
-    generated_output = _maybe_serialize(result.output) if result.output is not None else None
+    request_id: str, prompt: str, seed: int, result: OutputBatch
+) -> list[RolloutImageResponse]:
+    """Build a list of ``RolloutImageResponse`` of length ``B``.
 
-    rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory = (
-        _serialize_rollout_trajectory(result.rollout_trajectory_data)
+    Rollout tensors in ``rollout_trajectory_data`` are split per row using ``B`` from ``rollout_log_probs``.
+
+    ``generated_output`` is sliced per row when ``result.output`` is a tensor with ``shape[0] == B`` or a list
+    of length ``B`` (or length-1 list of such a tensor); otherwise the same payload is repeated on each row.
+    """
+    batch_size = _infer_rollout_batch_size(result)
+    inference_time_s = (
+        result.metrics.total_duration_s
+        if result.metrics and result.metrics.total_duration_s > 0
+        else None
     )
+    peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
+    source_rollout = result.rollout_trajectory_data
+    # DiT timesteps are shared across the batch: serialize the tensor once, reuse the wire dict on every row.
+    shared_dit_timesteps_wire = None
+    if (
+        source_rollout
+        and source_rollout.dit_trajectory
+        and source_rollout.dit_trajectory.timesteps is not None
+    ):
+        shared_dit_timesteps_wire = _maybe_serialize(source_rollout.dit_trajectory.timesteps)
+    responses: list[RolloutImageResponse] = []
+    for sample_idx in range(batch_size):
+        per_sample_trajectory = _slice_rollout_trajectory_for_sample(
+            result.rollout_trajectory_data, sample_idx, batch_size
+        )
+        (
+            serialized_log_probs,
+            serialized_debug_tensors,
+            serialized_denoising_env,
+            serialized_dit_trajectory,
+        ) = _serialize_rollout_trajectory(
+            per_sample_trajectory,
+            dit_timesteps_wire=shared_dit_timesteps_wire,
+        )
+        out_i = _extract_generated_output_for_sample(result.output, sample_idx, batch_size)
+        serialized_generated_output = _maybe_serialize(out_i) if out_i is not None else None
+        responses.append(
+            RolloutImageResponse(
+                request_id=request_id,
+                prompt=prompt,
+                seed=seed,
+                generated_output=serialized_generated_output,
+                rollout_log_probs=serialized_log_probs,
+                rollout_debug_tensors=serialized_debug_tensors,
+                denoising_env=serialized_denoising_env,
+                dit_trajectory=serialized_dit_trajectory,
+                inference_time_s=inference_time_s,
+                peak_memory_mb=peak_memory_mb,
+            )
+        )
+    return responses
 
-    return RolloutImageResponse(
-        request_id=request_id,
-        prompt=prompt,
-        seed=seed,
-        generated_output=generated_output,
-        rollout_log_probs=rollout_log_probs,
-        rollout_debug_tensors=rollout_debug_tensors,
-        denoising_env=denoising_env,
-        dit_trajectory=dit_trajectory,
-        inference_time_s=(
-            result.metrics.total_duration_s
-            if result.metrics and result.metrics.total_duration_s > 0
-            else None
-        ),
-        peak_memory_mb=result.peak_memory_mb if result.peak_memory_mb > 0 else None,
-    )
 
-
-@router.post("/images", response_model=RolloutImageResponse)
+@router.post("/images", response_model=list[RolloutImageResponse])
 async def rollout_images(request: RolloutImageRequest):
-    """Generate an image with full rollout trajectory and log-prob data."""
+    """Run one or a batch of diffusion generations; return a JSON array of length ``B``.
+    """
     request_id = generate_request_id()
     server_args = get_global_server_args()
-
     sampling_kwargs: dict = dict(
         prompt=request.prompt,
         negative_prompt=request.negative_prompt,
@@ -128,7 +263,6 @@ async def rollout_images(request: RolloutImageRequest):
         guidance_scale=request.guidance_scale,
         true_cfg_scale=request.true_cfg_scale,
         image_path=request.image_path,
-        # force rollout flags
         rollout=True,
         rollout_sde_type=request.rollout_sde_type,
         rollout_noise_level=request.rollout_noise_level,
@@ -136,34 +270,25 @@ async def rollout_images(request: RolloutImageRequest):
         rollout_debug_mode=request.rollout_debug_mode,
         rollout_return_denoising_env=request.rollout_return_denoising_env,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
-        # disable saving to disk — caller wants raw tensor data
         save_output=False,
     )
-
     if request.extra_sampling_params:
         sampling_kwargs.update(request.extra_sampling_params)
-
-    # filter None values so SamplingParams defaults are used
     sampling_kwargs = {k: v for k, v in sampling_kwargs.items() if v is not None}
-    # ODE latent trajectory + per-step VAE decode are not part of this API.
+    # This endpoint does not expose ODE latents or per-frame VAE decode; keep off to save bandwidth and memory.
     sampling_kwargs["return_trajectory_latents"] = False
     sampling_kwargs["return_trajectory_decoded"] = False
-
     try:
-        sp = build_sampling_params(request_id, **sampling_kwargs)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid sampling params: {e}") from e
-
-    req = prepare_request(server_args=server_args, sampling_params=sp)
-
+        sampling_params = build_sampling_params(request_id, **sampling_kwargs)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid sampling params: {exc}") from exc
+    pipeline_request = prepare_request(server_args=server_args, sampling_params=sampling_params)
     try:
-        result: OutputBatch = await async_scheduler_client.forward(req)
-    except Exception as e:
-        logger.error("Rollout generation failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Generation failed: {e}") from e
-
-    if result.error:
-        raise HTTPException(status_code=500, detail=result.error)
-
-    response = _build_response(request_id, request.prompt, request.seed, result)
-    return ORJSONResponse(content=response.model_dump())
+        output_batch: OutputBatch = await async_scheduler_client.forward(pipeline_request)
+    except Exception as exc:
+        logger.error("Rollout generation failed: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Generation failed: {exc}") from exc
+    if output_batch.error:
+        raise HTTPException(status_code=500, detail=output_batch.error)
+    rollout_responses = _build_response(request_id, request.prompt, request.seed, output_batch)
+    return ORJSONResponse(content=[r.model_dump() for r in rollout_responses])

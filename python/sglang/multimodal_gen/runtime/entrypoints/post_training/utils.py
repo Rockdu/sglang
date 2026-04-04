@@ -1,7 +1,8 @@
-"""Lossless tensor ↔ base64 serialization for HTTP transport.
+"""Tensor serialization for post-training / rollout HTTP.
 
-Uses safetensors for dtype-preserving, zero-copy-friendly encoding.
-Falls back to torch save/load when safetensors is unavailable.
+Encodes ``torch.Tensor`` into JSON-friendly blobs (base64 + metadata) for httpx / ORJSON. Use
+``_maybe_deserialize`` on the client or in tests to restore tensors. Prefers ``safetensors`` when available
+(dtype-friendly); falls back to ``torch.save`` / ``torch.load`` otherwise.
 """
 
 from __future__ import annotations
@@ -14,10 +15,11 @@ import torch
 
 
 def tensor_to_base64(t: torch.Tensor) -> str:
-    """Serialize a CPU tensor to a base64 string (via safetensors if available)."""
+    """Encode one tensor as an ASCII base64 string (always CPU, contiguous)."""
     t = t.detach().contiguous().cpu()
     try:
         from safetensors.torch import save
+
         raw = save({"t": t})
     except ImportError:
         buf = io.BytesIO()
@@ -27,10 +29,11 @@ def tensor_to_base64(t: torch.Tensor) -> str:
 
 
 def base64_to_tensor(s: str) -> torch.Tensor:
-    """Deserialize a base64 string back to a torch.Tensor."""
+    """Inverse of ``tensor_to_base64``."""
     raw = base64.b64decode(s)
     try:
         from safetensors.torch import load
+
         return load(raw)["t"]
     except ImportError:
         buf = io.BytesIO(raw)
@@ -38,9 +41,14 @@ def base64_to_tensor(s: str) -> torch.Tensor:
 
 
 def _maybe_serialize(obj: Any) -> Any:
-    """Recursively convert tensors to base64 within nested dicts/lists."""
+    """Walk dict/list/tuple recursively; replace each ``Tensor`` with ``{"__tensor__": True, "data": ..., "shape", "dtype"}``."""
     if isinstance(obj, torch.Tensor):
-        return {"__tensor__": True, "data": tensor_to_base64(obj), "shape": list(obj.shape), "dtype": str(obj.dtype)}
+        return {
+            "__tensor__": True,
+            "data": tensor_to_base64(obj),
+            "shape": list(obj.shape),
+            "dtype": str(obj.dtype),
+        }
     if isinstance(obj, dict):
         return {k: _maybe_serialize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple)):
@@ -49,7 +57,7 @@ def _maybe_serialize(obj: Any) -> Any:
 
 
 def _maybe_deserialize(obj: Any) -> Any:
-    """Inverse of ``_maybe_serialize``: restore tensors from ``__tensor__`` dicts."""
+    """Inverse of ``_maybe_serialize``: detect dicts with ``__tensor__`` and run ``base64_to_tensor``; recurse otherwise."""
     if isinstance(obj, dict):
         if obj.get("__tensor__"):
             return base64_to_tensor(obj["data"])

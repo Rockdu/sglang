@@ -73,16 +73,12 @@ class RolloutImageResponse(BaseModel):
     prompt: str
     seed: int
 
-    # generated output (serialized tensor or list of serialized tensors)
-    generated_output: Any = None
+    generated_output: Any = None  # decoded image etc.; same structure as single-request, sliced to this sample
 
-    # rollout data
     rollout_log_probs: Optional[dict[str, Any]] = None
-    rollout_debug_tensors: Optional[dict[str, Any]] = None
-    denoising_env: Optional[dict[str, Any]] = None  # when ``rollout_return_denoising_env``
-    # per-step trajectory when ``rollout_return_dit_trajectory``
-    dit_trajectory: Optional[dict[str, Any]] = None
+    rollout_debug_tensors: Optional[dict[str, Any]] = None  # present when ``rollout_debug_mode=True``
+    denoising_env: Optional[dict[str, Any]] = None  # present when ``rollout_return_denoising_env=True``
+    dit_trajectory: Optional[dict[str, Any]] = None  # present when ``rollout_return_dit_trajectory=True``
 
-    # metrics
-    inference_time_s: Optional[float] = None
+    inference_time_s: Optional[float] = None  # full forward duration; duplicated with the same value per sample
     peak_memory_mb: Optional[float] = None

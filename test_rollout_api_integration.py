@@ -59,6 +59,13 @@ def deserialize_tensor_field(obj):
     return obj
 
 
+def first_rollout_sample(resp_json):
+    """``POST /rollout/images`` returns a JSON array (one object per batch row)."""
+    assert isinstance(resp_json, list), "expected list response from /rollout/images"
+    assert len(resp_json) >= 1, "empty rollout response list"
+    return resp_json[0]
+
+
 def launch_server():
     """Launch the sglang-D HTTP server as a subprocess."""
     env = os.environ.copy()
@@ -108,15 +115,16 @@ def test_rollout_api():
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
+    s = first_rollout_sample(resp)
 
     # Check required scalar fields
-    assert resp["prompt"] == PROMPT, f"Prompt mismatch: {resp['prompt']}"
-    assert resp["seed"] == SEED, f"Seed mismatch: {resp['seed']}"
-    assert resp["request_id"] is not None, "Missing request_id"
-    print(f"  request_id: {resp['request_id']}")
+    assert s["prompt"] == PROMPT, f"Prompt mismatch: {s['prompt']}"
+    assert s["seed"] == SEED, f"Seed mismatch: {s['seed']}"
+    assert s["request_id"] is not None, "Missing request_id"
+    print(f"  request_id: {s['request_id']} (samples in response: {len(resp)})")
 
     # Check generated_output
-    gen_output = resp.get("generated_output")
+    gen_output = s.get("generated_output")
     assert gen_output is not None, "Missing generated_output"
     gen_deserialized = deserialize_tensor_field(gen_output)
     if isinstance(gen_deserialized, list):
@@ -124,19 +132,19 @@ def test_rollout_api():
     else:
         print(f"  generated_output: shape={gen_deserialized.shape}, dtype={gen_deserialized.dtype}")
 
-    assert "trajectory_latents" not in resp and "trajectory_timesteps" not in resp, (
+    assert "trajectory_latents" not in s and "trajectory_timesteps" not in s, (
         "Legacy ODE trajectory fields should not appear on rollout responses"
     )
 
     # Check rollout_log_probs
-    log_probs = resp.get("rollout_log_probs")
+    log_probs = s.get("rollout_log_probs")
     assert log_probs is not None, "Missing rollout_log_probs"
     log_probs_tensor = deserialize_tensor_field(log_probs)
     print(f"  rollout_log_probs: shape={log_probs_tensor.shape}, values={log_probs_tensor}")
     assert log_probs_tensor.numel() > 0, "rollout_log_probs is empty"
 
     # Check debug tensors
-    debug = resp.get("rollout_debug_tensors")
+    debug = s.get("rollout_debug_tensors")
     assert debug is not None, "Missing rollout_debug_tensors (rollout_debug_mode=True)"
     for key in ["rollout_variance_noises", "rollout_prev_sample_means",
                 "rollout_noise_std_devs", "rollout_model_outputs"]:
@@ -145,10 +153,10 @@ def test_rollout_api():
         print(f"  debug.{key}: shape={t.shape}")
 
     # Check metrics
-    if resp.get("inference_time_s") is not None:
-        print(f"  inference_time_s: {resp['inference_time_s']:.2f}")
-    if resp.get("peak_memory_mb") is not None:
-        print(f"  peak_memory_mb: {resp['peak_memory_mb']:.1f}")
+    if s.get("inference_time_s") is not None:
+        print(f"  inference_time_s: {s['inference_time_s']:.2f}")
+    if s.get("peak_memory_mb") is not None:
+        print(f"  peak_memory_mb: {s['peak_memory_mb']:.1f}")
 
     print("  PASSED")
     return resp
@@ -168,9 +176,10 @@ def test_rollout_api_without_debug():
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
+    s = first_rollout_sample(resp)
 
-    assert resp.get("rollout_log_probs") is not None, "rollout_log_probs should still be present"
-    assert resp.get("rollout_debug_tensors") is None, (
+    assert s.get("rollout_log_probs") is not None, "rollout_log_probs should still be present"
+    assert s.get("rollout_debug_tensors") is None, (
         "rollout_debug_tensors should be None when debug_mode=False"
     )
     print("  PASSED (no debug tensors as expected)")
@@ -193,13 +202,14 @@ def test_rollout_api_dit_trajectory_when_requested():
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
+    s = first_rollout_sample(resp)
 
-    dit = resp.get("dit_trajectory")
+    dit = s.get("dit_trajectory")
     assert dit is not None, "dit_trajectory expected when rollout_return_dit_trajectory=True"
     assert dit.get("latent_model_inputs") is not None
     assert dit.get("timesteps") is not None
-    assert resp.get("denoising_env") is None, "denoising_env should be absent when rollout_return_denoising_env=False"
-    assert resp.get("rollout_log_probs") is not None
+    assert s.get("denoising_env") is None, "denoising_env should be absent when rollout_return_denoising_env=False"
+    assert s.get("rollout_log_probs") is not None
     print("  PASSED (dit_trajectory without static env)")
 
 
@@ -217,8 +227,8 @@ def test_deterministic_with_same_seed():
     r2 = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
     assert r1.status_code == 200 and r2.status_code == 200
 
-    lp1 = deserialize_tensor_field(r1.json()["rollout_log_probs"])
-    lp2 = deserialize_tensor_field(r2.json()["rollout_log_probs"])
+    lp1 = deserialize_tensor_field(first_rollout_sample(r1.json())["rollout_log_probs"])
+    lp2 = deserialize_tensor_field(first_rollout_sample(r2.json())["rollout_log_probs"])
     import torch
     max_diff = (lp1.float() - lp2.float()).abs().max().item()
     print(f"  log_probs diff between two identical calls: {max_diff:.8f}")
@@ -239,8 +249,9 @@ def test_cps_sde_type():
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
-    assert resp.get("rollout_log_probs") is not None
-    lp = deserialize_tensor_field(resp["rollout_log_probs"])
+    s = first_rollout_sample(resp)
+    assert s.get("rollout_log_probs") is not None
+    lp = deserialize_tensor_field(s["rollout_log_probs"])
     print(f"  CPS log_probs: {lp}")
     print("  PASSED")
 
@@ -262,8 +273,9 @@ def test_ode_sde_type():
     r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
-    assert resp.get("rollout_log_probs") is not None
-    lp = deserialize_tensor_field(resp["rollout_log_probs"])
+    s = first_rollout_sample(resp)
+    assert s.get("rollout_log_probs") is not None
+    lp = deserialize_tensor_field(s["rollout_log_probs"])
     import torch
     assert torch.all(lp == 0.0), f"ODE log_probs should be 0, got {lp}"
     print(f"  ODE log_probs: {lp} (all zeros as expected)")

@@ -11,14 +11,15 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutImageResponse,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
+    _maybe_deserialize,
     _maybe_serialize,
     base64_to_tensor,
     tensor_to_base64,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
-    RolloutDenoisingEnv,
     RolloutDebugTensors,
+    RolloutDenoisingEnv,
     RolloutDitTrajectory,
     RolloutTrajectoryData,
 )
@@ -347,14 +348,23 @@ class TestBuildResponse(unittest.TestCase):
         return m
 
     def test_minimal_output(self):
-        batch = OutputBatch(output=[torch.randn(3, 1, 64, 64)])
+        batch = OutputBatch(
+            output=[torch.randn(3, 1, 64, 64)],
+            rollout_trajectory_data=RolloutTrajectoryData(
+                rollout_log_probs=torch.tensor([0.0]),
+            ),
+        )
         batch.metrics = self._make_metrics(2.5)
-        resp = _build_response("r1", "prompt", 42, batch)
+        resps = _build_response("r1", "prompt", 42, batch)
+        self.assertEqual(len(resps), 1)
+        resp = resps[0]
         self.assertEqual(resp.request_id, "r1")
         self.assertEqual(resp.prompt, "prompt")
         self.assertEqual(resp.seed, 42)
         self.assertIsNotNone(resp.generated_output)
-        self.assertIsNone(resp.rollout_log_probs)
+        self.assertIsNotNone(resp.rollout_log_probs)
+        lp = base64_to_tensor(resp.rollout_log_probs["data"])
+        self.assertEqual(lp.shape, ())
         self.assertAlmostEqual(resp.inference_time_s, 2.5)
 
     def test_full_response(self):
@@ -366,34 +376,105 @@ class TestBuildResponse(unittest.TestCase):
             peak_memory_mb=8192.0,
         )
         batch.metrics = self._make_metrics(5.0)
-        resp = _build_response("r2", "test", 99, batch)
+        resps = _build_response("r2", "test", 99, batch)
+        self.assertEqual(len(resps), 1)
+        resp = resps[0]
         self.assertIsNotNone(resp.rollout_log_probs)
         self.assertIsNone(resp.rollout_debug_tensors)
         self.assertAlmostEqual(resp.peak_memory_mb, 8192.0)
 
     def test_no_metrics(self):
-        batch = OutputBatch(output=[torch.randn(3, 1, 64, 64)])
+        batch = OutputBatch(
+            output=[torch.randn(3, 1, 64, 64)],
+            rollout_trajectory_data=RolloutTrajectoryData(
+                rollout_log_probs=torch.tensor([0.0]),
+            ),
+        )
         batch.metrics = None
-        resp = _build_response("r3", "p", 1, batch)
+        resp = _build_response("r3", "p", 1, batch)[0]
         self.assertIsNone(resp.inference_time_s)
 
     def test_zero_metrics(self):
-        batch = OutputBatch(output=[torch.randn(3, 1, 64, 64)])
+        batch = OutputBatch(
+            output=[torch.randn(3, 1, 64, 64)],
+            rollout_trajectory_data=RolloutTrajectoryData(
+                rollout_log_probs=torch.tensor([0.0]),
+            ),
+        )
         batch.metrics = self._make_metrics(0.0)
-        resp = _build_response("r4", "p", 1, batch)
+        resp = _build_response("r4", "p", 1, batch)[0]
         self.assertIsNone(resp.inference_time_s)
 
     def test_none_output(self):
-        batch = OutputBatch(output=None)
+        batch = OutputBatch(
+            output=None,
+            rollout_trajectory_data=RolloutTrajectoryData(
+                rollout_log_probs=torch.tensor([0.0]),
+            ),
+        )
         batch.metrics = None
-        resp = _build_response("r5", "p", 1, batch)
+        resp = _build_response("r5", "p", 1, batch)[0]
         self.assertIsNone(resp.generated_output)
 
     def test_zero_peak_memory(self):
-        batch = OutputBatch(output=None, peak_memory_mb=0.0)
+        batch = OutputBatch(
+            output=None,
+            peak_memory_mb=0.0,
+            rollout_trajectory_data=RolloutTrajectoryData(
+                rollout_log_probs=torch.tensor([0.0]),
+            ),
+        )
         batch.metrics = None
-        resp = _build_response("r6", "p", 1, batch)
+        resp = _build_response("r6", "p", 1, batch)[0]
         self.assertIsNone(resp.peak_memory_mb)
+
+    def test_batch_splits_log_probs_and_output(self):
+        B, T = 2, 3
+        batch = OutputBatch(
+            output=torch.randn(B, 1, 8, 8),
+            rollout_trajectory_data=RolloutTrajectoryData(
+                rollout_log_probs=torch.randn(B, T),
+            ),
+        )
+        batch.metrics = self._make_metrics(1.0)
+        resps = _build_response("rb", "p", 0, batch)
+        self.assertEqual(len(resps), B)
+        lp0 = base64_to_tensor(resps[0].rollout_log_probs["data"])
+        lp1 = base64_to_tensor(resps[1].rollout_log_probs["data"])
+        self.assertEqual(lp0.shape, (T,))
+        self.assertEqual(lp1.shape, (T,))
+        g0 = base64_to_tensor(resps[0].generated_output["data"])
+        g1 = base64_to_tensor(resps[1].generated_output["data"])
+        self.assertEqual(g0.shape, (1, 8, 8))
+        self.assertEqual(g1.shape, (1, 8, 8))
+        self.assertFalse(torch.equal(g0, g1))
+
+    def test_batch_dit_timesteps_on_each_row_one_serialize(self):
+        B, T, D = 2, 4, 3
+        batch = OutputBatch(
+            output=torch.randn(B, 1, 8, 8),
+            rollout_trajectory_data=RolloutTrajectoryData(
+                rollout_log_probs=torch.randn(B, T),
+                dit_trajectory=RolloutDitTrajectory(
+                    latent_model_inputs=torch.randn(B, T, D),
+                    timesteps=torch.linspace(1.0, 0.0, T),
+                ),
+            ),
+        )
+        batch.metrics = self._make_metrics(1.0)
+        resps = _build_response("r", "p", 0, batch)
+        self.assertEqual(len(resps), B)
+        self.assertIsNotNone(resps[0].dit_trajectory)
+        self.assertIsNotNone(resps[1].dit_trajectory)
+        self.assertIsNotNone(resps[0].dit_trajectory["timesteps"])
+        self.assertIsNotNone(resps[1].dit_trajectory["timesteps"])
+        ts0 = base64_to_tensor(resps[0].dit_trajectory["timesteps"]["data"])
+        ts1 = base64_to_tensor(resps[1].dit_trajectory["timesteps"]["data"])
+        self.assertEqual(ts0.shape, (T,))
+        self.assertTrue(torch.equal(ts0, ts1))
+        self.assertEqual(
+            _maybe_deserialize(resps[1].dit_trajectory["latent_model_inputs"]).shape, (T, D)
+        )
 
 
 # =========================================================================
