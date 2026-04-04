@@ -1,4 +1,4 @@
-"""Integration: ``POST /rollout/images`` (JSON array per sample) + rollout vs baseline perf.
+"""Integration: ``POST /rollout/generate`` (JSON array per sample) + rollout vs baseline perf.
 
 Paired A/B with same seed per pair and alternating order. See argparse for GPUs / ports.
 """
@@ -185,7 +185,7 @@ def _run_rollout_request(
         "extra_sampling_params": {"rollout": rollout},
     }
     t0 = time.perf_counter()
-    r = httpx.post(f"{base_url}/rollout/images", json=payload, timeout=600)
+    r = httpx.post(f"{base_url}/rollout/generate", json=payload, timeout=600)
     wall_s = time.perf_counter() - t0
     assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:500]}"
     body = r.json()

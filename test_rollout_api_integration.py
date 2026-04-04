@@ -1,7 +1,7 @@
 """Integration test: Rollout Image API vs standard generation.
 
 Launches a real sglang-D server with Z-Image-Turbo on a single GPU, then:
-1. Calls POST /rollout/images for rollout log-probs (and optional ``dit_trajectory``)
+1. Calls POST /rollout/generate for rollout log-probs (and optional ``dit_trajectory``)
 2. Calls POST /v1/images/generations for the same prompt/seed
 3. Verifies the rollout API returns expected tensor fields
 4. Verifies roundtrip tensor serialization is lossless
@@ -60,8 +60,8 @@ def deserialize_tensor_field(obj):
 
 
 def first_rollout_sample(resp_json):
-    """``POST /rollout/images`` returns a JSON array (one object per batch row)."""
-    assert isinstance(resp_json, list), "expected list response from /rollout/images"
+    """``POST /rollout/generate`` returns a JSON array (one object per batch row)."""
+    assert isinstance(resp_json, list), "expected list response from /rollout/generate"
     assert len(resp_json) >= 1, "empty rollout response list"
     return resp_json[0]
 
@@ -101,8 +101,8 @@ def kill_server(proc):
 
 
 def test_rollout_api():
-    """Call POST /rollout/images and validate the response structure."""
-    print("\n--- Test 1: POST /rollout/images ---")
+    """Call POST /rollout/generate and validate the response structure."""
+    print("\n--- Test 1: POST /rollout/generate ---")
     payload = dict(
         prompt=PROMPT,
         seed=SEED,
@@ -112,7 +112,7 @@ def test_rollout_api():
         rollout_debug_mode=True,
     )
 
-    r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
+    r = httpx.post(f"{BASE_URL}/rollout/generate", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
     s = first_rollout_sample(resp)
@@ -164,7 +164,7 @@ def test_rollout_api():
 
 def test_rollout_api_without_debug():
     """Call rollout API with debug_mode=False and verify no debug tensors."""
-    print("\n--- Test 2: POST /rollout/images (no debug) ---")
+    print("\n--- Test 2: POST /rollout/generate (no debug) ---")
     payload = dict(
         prompt=PROMPT,
         seed=SEED,
@@ -173,7 +173,7 @@ def test_rollout_api_without_debug():
         rollout_debug_mode=False,
     )
 
-    r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
+    r = httpx.post(f"{BASE_URL}/rollout/generate", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
     s = first_rollout_sample(resp)
@@ -188,7 +188,7 @@ def test_rollout_api_without_debug():
 
 def test_rollout_api_dit_trajectory_when_requested():
     """``dit_trajectory`` is gated by ``rollout_return_dit_trajectory`` (not ``rollout_return_denoising_env``)."""
-    print("\n--- Test 3: POST /rollout/images (rollout_return_dit_trajectory only) ---")
+    print("\n--- Test 3: POST /rollout/generate (rollout_return_dit_trajectory only) ---")
     payload = dict(
         prompt=PROMPT,
         seed=SEED,
@@ -199,7 +199,7 @@ def test_rollout_api_dit_trajectory_when_requested():
         rollout_return_dit_trajectory=True,
     )
 
-    r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
+    r = httpx.post(f"{BASE_URL}/rollout/generate", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
     s = first_rollout_sample(resp)
@@ -223,8 +223,8 @@ def test_deterministic_with_same_seed():
         rollout_noise_level=0.7,
     )
 
-    r1 = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
-    r2 = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
+    r1 = httpx.post(f"{BASE_URL}/rollout/generate", json=payload, timeout=300)
+    r2 = httpx.post(f"{BASE_URL}/rollout/generate", json=payload, timeout=300)
     assert r1.status_code == 200 and r2.status_code == 200
 
     lp1 = deserialize_tensor_field(first_rollout_sample(r1.json())["rollout_log_probs"])
@@ -246,7 +246,7 @@ def test_cps_sde_type():
         rollout_noise_level=0.5,
     )
 
-    r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
+    r = httpx.post(f"{BASE_URL}/rollout/generate", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
     s = first_rollout_sample(resp)
@@ -270,7 +270,7 @@ def test_ode_sde_type():
         rollout_log_prob_no_const=True,
     )
 
-    r = httpx.post(f"{BASE_URL}/rollout/images", json=payload, timeout=300)
+    r = httpx.post(f"{BASE_URL}/rollout/generate", json=payload, timeout=300)
     assert r.status_code == 200, f"Expected 200, got {r.status_code}: {r.text[:500]}"
     resp = r.json()
     s = first_rollout_sample(resp)
