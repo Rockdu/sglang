@@ -41,6 +41,7 @@ class RolloutImageRequest(BaseModel):
     width: Optional[int] = None
     height: Optional[int] = None
     num_inference_steps: Optional[int] = None
+    num_outputs_per_prompt: Optional[int] = None
 
     # guidance
     guidance_scale: Optional[float] = None

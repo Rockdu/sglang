@@ -58,7 +58,7 @@ def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) ->
 
 
 def _extract_generated_output_for_sample(output: Any, sample_idx: int, batch_size: int) -> Any:
-    """One row of ``result.output`` when it matches rollout ``batch_size`` (from ``rollout_log_probs``).
+    """One row of ``result.output`` when it aligns with rollout ``batch_size`` (from ``rollout_log_probs``).
     """
     if output is None:
         return None
@@ -136,22 +136,18 @@ def _slice_rollout_trajectory_for_sample(
 def _serialize_rollout_trajectory(
     rollout_trajectory_data: RolloutTrajectoryData | None,
     *,
-    dit_timesteps_wire: dict | None = None,
+    serialized_dit_timesteps: dict | None = None,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None]:
     """Convert per-sample ``RolloutTrajectoryData`` to JSON-friendly dicts (tensors via ``_maybe_serialize``).
 
-    ``dit_timesteps_wire``: if set, used as ``dit_trajectory["timesteps"]`` so the caller can run
+    ``serialized_dit_timesteps``: if set, used as ``dit_trajectory["timesteps"]`` so the caller can run
     ``_maybe_serialize`` once on the shared ``[T]`` tensor and attach the same dict to every response row.
     Otherwise ``dit.timesteps`` is serialized here.
     Return order: ``rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory``.
     """
     if rollout_trajectory_data is None:
         return None, None, None, None
-    serialized_log_probs = (
-        _maybe_serialize(rollout_trajectory_data.rollout_log_probs)
-        if rollout_trajectory_data.rollout_log_probs is not None
-        else None
-    )
+    serialized_log_probs = _maybe_serialize(rollout_trajectory_data.rollout_log_probs)
     serialized_debug_tensors = None
     if rollout_trajectory_data.rollout_debug_tensors:
         rollout_debug = rollout_trajectory_data.rollout_debug_tensors
@@ -173,16 +169,11 @@ def _serialize_rollout_trajectory(
     serialized_dit_trajectory = None
     if rollout_trajectory_data.dit_trajectory:
         dit = rollout_trajectory_data.dit_trajectory
-        timesteps_wire = (
-            dit_timesteps_wire
-            if dit_timesteps_wire is not None
-            else (_maybe_serialize(dit.timesteps) if dit.timesteps is not None else None)
-        )
         serialized_dit_trajectory = {
             "latent_model_inputs": (
                 _maybe_serialize(dit.latent_model_inputs) if dit.latent_model_inputs is not None else None
             ),
-            "timesteps": timesteps_wire,
+            "timesteps": serialized_dit_timesteps,
         }
     return serialized_log_probs, serialized_debug_tensors, serialized_denoising_env, serialized_dit_trajectory
 
@@ -204,16 +195,17 @@ def _build_response(
         else None
     )
     peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
-    source_rollout = result.rollout_trajectory_data
-    # DiT timesteps are shared across the batch: serialize the tensor once, reuse the wire dict on every row.
-    shared_dit_timesteps_wire = None
-    if (
-        source_rollout
-        and source_rollout.dit_trajectory
-        and source_rollout.dit_trajectory.timesteps is not None
-    ):
-        shared_dit_timesteps_wire = _maybe_serialize(source_rollout.dit_trajectory.timesteps)
+    rollout_trajectory_data = result.rollout_trajectory_data
+    assert rollout_trajectory_data is not None, "rollout_trajectory_data must be present for rollout"
+
+    # Shared DiT timesteps serialization
+    serialized_dit_timesteps = None
+    if rollout_trajectory_data.dit_trajectory:
+        serialized_dit_timesteps = _maybe_serialize(rollout_trajectory_data.dit_trajectory.timesteps)
+
     responses: list[RolloutImageResponse] = []
+
+    # Extract Samples from Batch
     for sample_idx in range(batch_size):
         per_sample_trajectory = _slice_rollout_trajectory_for_sample(
             result.rollout_trajectory_data, sample_idx, batch_size
@@ -225,7 +217,7 @@ def _build_response(
             serialized_dit_trajectory,
         ) = _serialize_rollout_trajectory(
             per_sample_trajectory,
-            dit_timesteps_wire=shared_dit_timesteps_wire,
+            serialized_dit_timesteps=serialized_dit_timesteps,
         )
         out_i = _extract_generated_output_for_sample(result.output, sample_idx, batch_size)
         serialized_generated_output = _maybe_serialize(out_i) if out_i is not None else None
@@ -260,6 +252,7 @@ async def rollout_images(request: RolloutImageRequest):
         width=request.width,
         height=request.height,
         num_inference_steps=request.num_inference_steps,
+        num_outputs_per_prompt=request.num_outputs_per_prompt,
         guidance_scale=request.guidance_scale,
         true_cfg_scale=request.true_cfg_scale,
         image_path=request.image_path,
