@@ -211,30 +211,35 @@ def main() -> int:
         outline = tensors_to_shapes(body)
         print(json.dumps(outline, indent=2, ensure_ascii=False))
 
-        env = outline.get("denoising_env")
-        dt = outline.get("dit_trajectory") or {}
+        samples = body if isinstance(body, list) else [body]
+        first = tensors_to_shapes(samples[0])
+        env = first.get("denoising_env")
+        dt = first.get("dit_trajectory") or {}
         lat = (dt.get("latent_model_inputs") or {}) if isinstance(dt, dict) else {}
         lat_shape = lat.get("__tensor_shape__") if isinstance(lat, dict) else None
         if env and isinstance(env, dict):
             pos = env.get("pos_cond_kwargs") or {}
             fc = pos.get("freqs_cis")
+            # freqs_cis is shared conditioning (not per diffusion step). dit_trajectory.latent_model_inputs
+            # per API row is batch-stripped: [T, N, ...] where T steps and N spatial tokens per step.
+            # pos freqs_cis[0] is image/latent rope; dim0 should match N (compare to lat_shape[1]).
             if (
                 isinstance(lat_shape, list)
-                and len(lat_shape) >= 3
+                and len(lat_shape) >= 2
                 and isinstance(fc, list)
                 and len(fc) >= 1
                 and isinstance(fc[0], dict)
             ):
-                seq_lat = lat_shape[2]
+                spatial_tokens = lat_shape[1]
                 img_freq_shape = fc[0].get("__tensor_shape__")
                 if (
                     isinstance(img_freq_shape, list)
                     and len(img_freq_shape) >= 1
-                    and img_freq_shape[0] != seq_lat
+                    and img_freq_shape[0] != spatial_tokens
                 ):
                     print(
-                        f"Shape check failed: pos freqs_cis image seq {img_freq_shape[0]} "
-                        f"!= dit_trajectory.latent_model_inputs seq {seq_lat}",
+                        f"Shape check failed: pos freqs_cis[0] dim0 {img_freq_shape[0]} "
+                        f"!= dit_trajectory.latent_model_inputs spatial_tokens (dim1) {spatial_tokens}",
                         file=sys.stderr,
                     )
                     return 1

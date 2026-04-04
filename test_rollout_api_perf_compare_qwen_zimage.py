@@ -1,29 +1,6 @@
-"""Integration test: rollout_api tensor retrieval and perf comparison.
+"""Integration: ``POST /rollout/images`` (JSON array per sample) + rollout vs baseline perf.
 
-This script validates two things through ``POST /rollout/images``:
-1. Returned tensor payloads can be deserialized correctly.
-2. Inference latency difference between:
-   - rollout enabled + DiT env return enabled
-   - rollout disabled + DiT env return disabled
-   on both Qwen-Image and Z-Image-Turbo.
-
-Performance methodology: after warming **both** code paths, each measured **pair** uses the
-**same diffusion seed** for rollout+env vs baseline, and **alternates call order** (AB / BA) so
-neither arm always benefits from running immediately after the other. Older versions compared
-different seeds and always ran rollout first, which could show spurious speedups/slowdowns.
-
-Usage:
-    CUDA_VISIBLE_DEVICES=0 FLASHINFER_DISABLE_VERSION_CHECK=1 \
-        python test_rollout_api_perf_compare_qwen_zimage.py
-
-    CUDA_VISIBLE_DEVICES=0,1 ... python test_rollout_api_perf_compare_qwen_zimage.py --num-gpus 2
-    CUDA_VISIBLE_DEVICES=0,1,2 ... python test_rollout_api_perf_compare_qwen_zimage.py --num-gpus 3 \\
-        --tp-size 1 --sp-degree 3
-
-    Optional: --tp-size, --sp-degree, --enable-cfg-parallel / --cfgp (forwarded to launch_server).
-
-    Benchmark lines (model headers, launch cmd, warmup, pairs, [result]) are buffered and printed
-    once after both models finish. Server process logs still go to stdout/stderr in real time.
+Paired A/B with same seed per pair and alternating order. See argparse for GPUs / ports.
 """
 
 from __future__ import annotations
@@ -43,9 +20,7 @@ import torch
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "python"))
 
-from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
-    _maybe_deserialize,
-)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import _maybe_deserialize
 from sglang.multimodal_gen.test.test_utils import (
     DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
@@ -71,8 +46,8 @@ def _wait_for_server(base_url: str, timeout_s: float = 900.0) -> None:
     start = time.time()
     while time.time() - start < timeout_s:
         try:
-            resp = httpx.get(f"{base_url}/health", timeout=5.0)
-            if resp.status_code == 200:
+            r = httpx.get(f"{base_url}/health", timeout=5.0)
+            if r.status_code == 200:
                 return
         except Exception:
             pass
@@ -94,18 +69,15 @@ def _launch_server(
     env.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
     local_python = os.path.join(os.path.dirname(os.path.abspath(__file__)), "python")
     py_paths = [local_python]
-    # nvidia-cutlass-dsl installs `cutlass` under this nested path, not default sys.path.
     cutlass_pkg_path = (
-        "/usr/local/lib/python3.12/dist-packages/"
-        "nvidia_cutlass_dsl/python_packages"
+        "/usr/local/lib/python3.12/dist-packages/nvidia_cutlass_dsl/python_packages"
     )
     if os.path.isdir(cutlass_pkg_path):
         py_paths.append(cutlass_pkg_path)
-    prev_py_path = env.get("PYTHONPATH", "")
-    if prev_py_path:
-        py_paths.append(prev_py_path)
+    prev = env.get("PYTHONPATH", "")
+    if prev:
+        py_paths.append(prev)
     env["PYTHONPATH"] = ":".join(py_paths)
-
     cmd = [
         sys.executable,
         "-m",
@@ -156,47 +128,40 @@ def _count_tensors(obj: Any) -> int:
 
 
 def _validate_tensor_payload(
-    resp_json: dict[str, Any],
+    resp_json: list[dict[str, Any]],
     *,
     expect_denoising_env: bool,
     expect_dit_trajectory: bool,
 ) -> None:
-    generated = resp_json.get("generated_output")
-    assert generated is not None, "generated_output missing"
-    generated_obj = _maybe_deserialize(generated)
-    assert _count_tensors(generated_obj) > 0, "generated_output has no tensor payload"
-
-    if expect_denoising_env:
-        denv = resp_json.get("denoising_env")
-        assert denv is not None, "denoising_env should exist when rollout_return_denoising_env=True"
-        denv_obj = _maybe_deserialize(denv)
-        assert isinstance(denv_obj, dict), "denoising_env should deserialize to a dict"
-        assert any(
-            denv_obj.get(k) is not None
-            for k in ("image_kwargs", "pos_cond_kwargs", "neg_cond_kwargs", "guidance")
-        ), "denoising_env should contain at least one conditioning field"
-        assert "trajectory" not in denv_obj, "trajectory should not be nested under denoising_env"
-    else:
-        assert resp_json.get("denoising_env") is None, (
-            "denoising_env should be None when rollout_return_denoising_env=False"
-        )
-
-    if expect_dit_trajectory:
-        dt_raw = resp_json.get("dit_trajectory")
-        assert dt_raw is not None, "dit_trajectory missing"
-        lmi_raw = dt_raw.get("latent_model_inputs")
-        tsteps_raw = dt_raw.get("timesteps")
-        assert lmi_raw is not None, "dit_trajectory.latent_model_inputs missing"
-        assert tsteps_raw is not None, "dit_trajectory.timesteps missing"
-        lmi = _maybe_deserialize(lmi_raw)
-        tsteps = _maybe_deserialize(tsteps_raw)
-        assert isinstance(lmi, torch.Tensor), "dit_trajectory.latent_model_inputs not tensor after decode"
-        assert isinstance(tsteps, torch.Tensor), "dit_trajectory.timesteps not tensor after decode"
-        assert lmi.shape[1] == tsteps.shape[0], "step count mismatch (DiT trajectory)"
-    else:
-        assert resp_json.get("dit_trajectory") is None, (
-            "dit_trajectory should be None when rollout_return_dit_trajectory=False"
-        )
+    assert isinstance(resp_json, list) and len(resp_json) >= 1
+    for sample in resp_json:
+        gen = sample.get("generated_output")
+        assert gen is not None
+        assert _count_tensors(_maybe_deserialize(gen)) > 0
+        if expect_denoising_env:
+            denv = sample.get("denoising_env")
+            assert denv is not None
+            d = _maybe_deserialize(denv)
+            assert isinstance(d, dict) and any(
+                d.get(k) is not None
+                for k in ("image_kwargs", "pos_cond_kwargs", "neg_cond_kwargs", "guidance")
+            )
+            assert "trajectory" not in d
+        else:
+            assert sample.get("denoising_env") is None
+        if expect_dit_trajectory:
+            dt = sample.get("dit_trajectory")
+            assert dt is not None
+            lmi = _maybe_deserialize(dt["latent_model_inputs"])
+            ts_raw = dt.get("timesteps")
+            if ts_raw is not None:
+                ts = _maybe_deserialize(ts_raw)
+                assert isinstance(lmi, torch.Tensor) and isinstance(ts, torch.Tensor)
+                assert lmi.shape[0] == ts.shape[0]
+            else:
+                assert isinstance(lmi, torch.Tensor)
+        else:
+            assert sample.get("dit_trajectory") is None
 
 
 def _run_rollout_request(
@@ -206,7 +171,7 @@ def _run_rollout_request(
     rollout: bool,
     rollout_return_denoising_env: bool,
     rollout_return_dit_trajectory: bool,
-) -> tuple[float, float, dict[str, Any]]:
+) -> tuple[float, float, list[dict[str, Any]]]:
     payload = {
         "prompt": prompt,
         "seed": seed,
@@ -217,63 +182,35 @@ def _run_rollout_request(
         "rollout_debug_mode": False,
         "rollout_return_denoising_env": rollout_return_denoising_env,
         "rollout_return_dit_trajectory": rollout_return_dit_trajectory,
-        # rollout_api internally forces rollout=True, so we override explicitly here.
         "extra_sampling_params": {"rollout": rollout},
     }
-
-    start = time.perf_counter()
+    t0 = time.perf_counter()
     r = httpx.post(f"{base_url}/rollout/images", json=payload, timeout=600)
-    wall_s = time.perf_counter() - start
+    wall_s = time.perf_counter() - t0
     assert r.status_code == 200, f"HTTP {r.status_code}: {r.text[:500]}"
-    resp_json = r.json()
-    infer_s = float(resp_json.get("inference_time_s") or wall_s)
-    return wall_s, infer_s, resp_json
+    body = r.json()
+    assert isinstance(body, list), body
+    infer_s = float(body[0].get("inference_time_s") or wall_s)
+    return wall_s, infer_s, body
 
 
 def _warmup_both_scenarios(
-    base_url: str,
-    prompt: str,
-    base_seed: int,
-    warmup_runs: int,
-    report_lines: list[str],
+    base_url: str, prompt: str, base_seed: int, warmup_runs: int, report_lines: list[str]
 ) -> None:
-    """Warm up rollout-on and rollout-off paths; seeds only need to differ between calls."""
     report_lines.append("")
     report_lines.append("[warmup] both code paths")
     for i in range(warmup_runs):
         s = base_seed + i
-        wall_s, infer_s, resp_json = _run_rollout_request(
-            base_url=base_url,
-            prompt=prompt,
-            seed=s,
-            rollout=True,
-            rollout_return_denoising_env=True,
-            rollout_return_dit_trajectory=True,
+        wall_s, infer_s, jr = _run_rollout_request(
+            base_url, prompt, s, True, True, True
         )
-        _validate_tensor_payload(
-            resp_json,
-            expect_denoising_env=True,
-            expect_dit_trajectory=True,
+        _validate_tensor_payload(jr, expect_denoising_env=True, expect_dit_trajectory=True)
+        report_lines.append(f"  warmup-{i + 1}a rollout+env: wall={wall_s:.3f}s infer={infer_s:.3f}s")
+        wall_s, infer_s, jb = _run_rollout_request(
+            base_url, prompt, s + 50_000, False, False, False
         )
-        report_lines.append(
-            f"  warmup-{i + 1}a rollout+env: wall={wall_s:.3f}s infer={infer_s:.3f}s"
-        )
-        wall_s, infer_s, resp_json = _run_rollout_request(
-            base_url=base_url,
-            prompt=prompt,
-            seed=s + 50_000,
-            rollout=False,
-            rollout_return_denoising_env=False,
-            rollout_return_dit_trajectory=False,
-        )
-        _validate_tensor_payload(
-            resp_json,
-            expect_denoising_env=False,
-            expect_dit_trajectory=False,
-        )
-        report_lines.append(
-            f"  warmup-{i + 1}b baseline:    wall={wall_s:.3f}s infer={infer_s:.3f}s"
-        )
+        _validate_tensor_payload(jb, expect_denoising_env=False, expect_dit_trajectory=False)
+        report_lines.append(f"  warmup-{i + 1}b baseline:    wall={wall_s:.3f}s infer={infer_s:.3f}s")
 
 
 def _benchmark_paired(
@@ -283,12 +220,6 @@ def _benchmark_paired(
     measured_runs: int,
     report_lines: list[str],
 ) -> tuple[ScenarioResult, ScenarioResult]:
-    """Fair A/B: same diffusion seed per pair, alternate which scenario runs first (AB/BA).
-
-    Avoids (1) different RNG trajectories per arm and (2) always warming the GPU for the same
-    arm first. Client *wall* still includes JSON/body transfer; server *infer* follows
-    ``OutputBatch.metrics.total_duration_s`` (serialization of huge base64 is not in infer).
-    """
     wall_roll, infer_roll = [], []
     wall_base, infer_base = [], []
     report_lines.append("")
@@ -297,59 +228,15 @@ def _benchmark_paired(
         s = measure_seed_base + i
         roll_first = i % 2 == 0
         if roll_first:
-            wr, ir, jr = _run_rollout_request(
-                base_url,
-                prompt,
-                s,
-                rollout=True,
-                rollout_return_denoising_env=True,
-                rollout_return_dit_trajectory=True,
-            )
-            _validate_tensor_payload(
-                jr,
-                expect_denoising_env=True,
-                expect_dit_trajectory=True,
-            )
-            wb, ib, jb = _run_rollout_request(
-                base_url,
-                prompt,
-                s,
-                rollout=False,
-                rollout_return_denoising_env=False,
-                rollout_return_dit_trajectory=False,
-            )
-            _validate_tensor_payload(
-                jb,
-                expect_denoising_env=False,
-                expect_dit_trajectory=False,
-            )
+            wr, ir, jr = _run_rollout_request(base_url, prompt, s, True, True, True)
+            _validate_tensor_payload(jr, expect_denoising_env=True, expect_dit_trajectory=True)
+            wb, ib, jb = _run_rollout_request(base_url, prompt, s, False, False, False)
+            _validate_tensor_payload(jb, expect_denoising_env=False, expect_dit_trajectory=False)
         else:
-            wb, ib, jb = _run_rollout_request(
-                base_url,
-                prompt,
-                s,
-                rollout=False,
-                rollout_return_denoising_env=False,
-                rollout_return_dit_trajectory=False,
-            )
-            _validate_tensor_payload(
-                jb,
-                expect_denoising_env=False,
-                expect_dit_trajectory=False,
-            )
-            wr, ir, jr = _run_rollout_request(
-                base_url,
-                prompt,
-                s,
-                rollout=True,
-                rollout_return_denoising_env=True,
-                rollout_return_dit_trajectory=True,
-            )
-            _validate_tensor_payload(
-                jr,
-                expect_denoising_env=True,
-                expect_dit_trajectory=True,
-            )
+            wb, ib, jb = _run_rollout_request(base_url, prompt, s, False, False, False)
+            _validate_tensor_payload(jb, expect_denoising_env=False, expect_dit_trajectory=False)
+            wr, ir, jr = _run_rollout_request(base_url, prompt, s, True, True, True)
+            _validate_tensor_payload(jr, expect_denoising_env=True, expect_dit_trajectory=True)
         wall_roll.append(wr)
         infer_roll.append(ir)
         wall_base.append(wb)
@@ -357,18 +244,16 @@ def _benchmark_paired(
         order = "rollout→baseline" if roll_first else "baseline→rollout"
         report_lines.append(
             f"  pair-{i + 1} seed={s} ({order}): "
-            f"rollout wall={wr:.3f}s infer={ir:.3f}s | "
-            f"baseline wall={wb:.3f}s infer={ib:.3f}s"
+            f"rollout wall={wr:.3f}s infer={ir:.3f}s | baseline wall={wb:.3f}s infer={ib:.3f}s"
         )
-
     return (
         ScenarioResult(
-            name="rollout=on + rollout_return_denoising_env=on + rollout_return_dit_trajectory=on",
+            name="rollout+env+dit_trajectory",
             wall_times_s=wall_roll,
             inference_times_s=infer_roll,
         ),
         ScenarioResult(
-            name="rollout=off + dit capture off",
+            name="baseline",
             wall_times_s=wall_base,
             inference_times_s=infer_base,
         ),
@@ -390,11 +275,7 @@ def _run_model_suite(
 ) -> list[str]:
     lines: list[str] = []
     base_url = f"http://127.0.0.1:{port}"
-    lines.append("")
-    lines.append("=" * 90)
-    lines.append(f"[model] {model_name}")
-    lines.append("=" * 90)
-
+    lines += ["", "=" * 90, f"[model] {model_name}", "=" * 90]
     proc = _launch_server(
         model_name,
         port,
@@ -406,127 +287,80 @@ def _run_model_suite(
     )
     try:
         _wait_for_server(base_url)
-        _warmup_both_scenarios(
-            base_url=base_url,
-            prompt=prompt,
-            base_seed=seed,
-            warmup_runs=warmup_runs,
-            report_lines=lines,
+        _warmup_both_scenarios(base_url, prompt, seed, warmup_runs, lines)
+        with_r, without = _benchmark_paired(
+            base_url, prompt, seed + 1000, measured_runs, lines
         )
-        with_rollout, without_rollout = _benchmark_paired(
-            base_url=base_url,
-            prompt=prompt,
-            measure_seed_base=seed + 1000,
-            measured_runs=measured_runs,
-            report_lines=lines,
-        )
-
-        wall_ratio = with_rollout.wall_avg_s / max(without_rollout.wall_avg_s, 1e-6)
-        infer_ratio = with_rollout.infer_avg_s / max(without_rollout.infer_avg_s, 1e-6)
-        lines.append("")
-        lines.append("[result]")
-        lines.append(
-            "  Note: wall = full HTTP round-trip (larger JSON when dit capture flags on); "
-            "infer = server pipeline duration only (see rollout_api inference_time_s)."
-        )
-        bw = f"  baseline wall avg: {without_rollout.wall_avg_s:.3f}s"
-        if measured_runs > 1:
-            bw += f" (pstdev {pstdev(without_rollout.wall_times_s):.3f}s)"
-        lines.append(bw)
-        rw = f"  rollout+env wall avg: {with_rollout.wall_avg_s:.3f}s"
-        if measured_runs > 1:
-            rw += f" (pstdev {pstdev(with_rollout.wall_times_s):.3f}s)"
-        lines.append(rw)
-        lines.append(f"  wall slowdown ratio: {wall_ratio:.3f}x")
-        bi = f"  baseline infer avg: {without_rollout.infer_avg_s:.3f}s"
-        if measured_runs > 1:
-            bi += f" (pstdev {pstdev(without_rollout.inference_times_s):.3f}s)"
-        lines.append(bi)
-        ri = f"  rollout+env infer avg: {with_rollout.infer_avg_s:.3f}s"
-        if measured_runs > 1:
-            ri += f" (pstdev {pstdev(with_rollout.inference_times_s):.3f}s)"
-        lines.append(ri)
-        lines.append(f"  infer slowdown ratio: {infer_ratio:.3f}x")
+        wr = with_r.wall_avg_s / max(without.wall_avg_s, 1e-6)
+        ir = with_r.infer_avg_s / max(without.infer_avg_s, 1e-6)
+        lines += [
+            "",
+            "[result]",
+            "  wall = HTTP round-trip; infer = server pipeline (inference_time_s).",
+            f"  baseline wall avg: {without.wall_avg_s:.3f}s"
+            + (f" (pstdev {pstdev(without.wall_times_s):.3f}s)" if measured_runs > 1 else ""),
+            f"  rollout wall avg: {with_r.wall_avg_s:.3f}s"
+            + (f" (pstdev {pstdev(with_r.wall_times_s):.3f}s)" if measured_runs > 1 else ""),
+            f"  wall ratio: {wr:.3f}x",
+            f"  baseline infer avg: {without.infer_avg_s:.3f}s"
+            + (f" (pstdev {pstdev(without.inference_times_s):.3f}s)" if measured_runs > 1 else ""),
+            f"  rollout infer avg: {with_r.infer_avg_s:.3f}s"
+            + (f" (pstdev {pstdev(with_r.inference_times_s):.3f}s)" if measured_runs > 1 else ""),
+            f"  infer ratio: {ir:.3f}x",
+        ]
         if measured_runs < 5:
-            lines.append(
-                f"  Hint: --measured-runs={measured_runs} is low; "
-                "ratios within ~1–2% are often noise."
-            )
+            lines.append(f"  Hint: --measured-runs={measured_runs} is low; small ratios may be noise.")
         return lines
     finally:
         _kill_server(proc)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--port", type=int, default=39911)
-    parser.add_argument("--warmup-runs", type=int, default=1)
-    parser.add_argument("--measured-runs", type=int, default=10)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--num-gpus",
-        type=int,
-        default=int(os.environ.get("TEST_NUM_GPUS", "1")),
-        help="launch_server --num-gpus (set CUDA_VISIBLE_DEVICES accordingly).",
-    )
-    parser.add_argument(
-        "--tp-size",
-        type=int,
-        default=None,
-        help="Tensor parallel size; omit for server default (1).",
-    )
-    parser.add_argument(
-        "--sp-degree",
-        type=int,
-        default=None,
-        help="Sequence parallel degree; omit for server auto from remaining GPUs.",
-    )
-    parser.add_argument(
-        "--enable-cfg-parallel",
-        "--cfgp",
-        action="store_true",
-        help="launch_server --enable-cfg-parallel",
-    )
-    parser.add_argument(
+    p = argparse.ArgumentParser()
+    p.add_argument("--port", type=int, default=39911)
+    p.add_argument("--warmup-runs", type=int, default=1)
+    p.add_argument("--measured-runs", type=int, default=10)
+    p.add_argument("--seed", type=int, default=42)
+    p.add_argument("--num-gpus", type=int, default=int(os.environ.get("TEST_NUM_GPUS", "1")))
+    p.add_argument("--tp-size", type=int, default=None)
+    p.add_argument("--sp-degree", type=int, default=None)
+    p.add_argument("--enable-cfg-parallel", "--cfgp", action="store_true")
+    p.add_argument(
         "--prompt",
-        type=str,
         default="a cinematic portrait of an astronaut walking in neon rain, ultra detailed",
     )
-    args = parser.parse_args()
-
-    suite_kw = dict(
+    args = p.parse_args()
+    kw = dict(
         num_gpus=args.num_gpus,
         tp_size=args.tp_size,
         sp_degree=args.sp_degree,
         enable_cfg_parallel=args.enable_cfg_parallel,
     )
-
-    # Run sequentially to avoid multi-model VRAM contention; print one report at the end.
-    report: list[str] = [
+    report = [
         "=" * 90,
-        "rollout_api perf comparison — full report (after all model runs complete)",
+        "rollout_api perf — full report",
         "=" * 90,
     ]
     report.extend(
         _run_model_suite(
-            model_name=DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
-            port=args.port,
-            prompt=args.prompt,
-            seed=args.seed,
-            warmup_runs=args.warmup_runs,
-            measured_runs=args.measured_runs,
-            **suite_kw,
+            DEFAULT_QWEN_IMAGE_MODEL_NAME_FOR_TEST,
+            args.port,
+            args.prompt,
+            args.seed,
+            args.warmup_runs,
+            args.measured_runs,
+            **kw,
         )
     )
     report.extend(
         _run_model_suite(
-            model_name=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,  # Tongyi-MAI/Z-Image-Turbo
-            port=args.port + 1,
-            prompt=args.prompt,
-            seed=args.seed + 10_000,
-            warmup_runs=args.warmup_runs,
-            measured_runs=args.measured_runs,
-            **suite_kw,
+            DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+            args.port + 1,
+            args.prompt,
+            args.seed + 10_000,
+            args.warmup_runs,
+            args.measured_runs,
+            **kw,
         )
     )
     print("\n".join(report))
