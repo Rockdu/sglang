@@ -13,31 +13,19 @@ from typing import Any
 
 import torch
 
+from safetensors.torch import load, save
 
 def tensor_to_base64(t: torch.Tensor) -> str:
     """Encode one tensor as an ASCII base64 string (always CPU, contiguous)."""
     t = t.detach().contiguous().cpu()
-    try:
-        from safetensors.torch import save
-
-        raw = save({"t": t})
-    except ImportError:
-        buf = io.BytesIO()
-        torch.save(t, buf)
-        raw = buf.getvalue()
+    raw = save({"t": t})
     return base64.b64encode(raw).decode("ascii")
 
 
 def base64_to_tensor(s: str) -> torch.Tensor:
     """Inverse of ``tensor_to_base64``."""
     raw = base64.b64decode(s)
-    try:
-        from safetensors.torch import load
-
-        return load(raw)["t"]
-    except ImportError:
-        buf = io.BytesIO(raw)
-        return torch.load(buf, weights_only=True)
+    return load(raw)["t"]
 
 
 def _maybe_serialize(obj: Any) -> Any:

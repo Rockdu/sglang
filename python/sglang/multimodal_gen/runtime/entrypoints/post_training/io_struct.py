@@ -25,12 +25,12 @@ class GetWeightsChecksumReqInput:
 
 
 # ---------------------------------------------------------------------------
-# Rollout Image API
+# Rollout generate API
 # ---------------------------------------------------------------------------
 
 
 class RolloutImageRequest(BaseModel):
-    """Request body for ``POST /rollout/images``."""
+    """Request body for ``POST /rollout/generate``."""
 
     prompt: str
     negative_prompt: Optional[str] = None
@@ -67,8 +67,8 @@ class RolloutImageRequest(BaseModel):
     )
 
 
-class RolloutImageResponse(BaseModel):
-    """Response body for ``POST /rollout/images``."""
+class RolloutResponse(BaseModel):
+    """Response body for ``POST /rollout/generate``."""
 
     request_id: str
     prompt: str

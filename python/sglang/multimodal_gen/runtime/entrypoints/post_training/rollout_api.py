@@ -1,4 +1,4 @@
-"""Rollout HTTP API (``POST /rollout/images``).
+"""Rollout HTTP API (``POST /rollout/generate``).
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import generate_reques
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutImageRequest,
-    RolloutImageResponse,
+    RolloutResponse,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import _maybe_serialize
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -62,8 +62,8 @@ def _extract_generated_output_for_sample(output: Any, sample_idx: int, batch_siz
     """
     if output is None:
         return None
-    assert isinstance(output, torch.Tensor), f"output must be a tensor, got {type(output)}"
-    assert output.dim() >= 1 and output.shape[0] == batch_size, f"output must have shape [B, ...], got {output.shape}"
+    assert isinstance(output, torch.Tensor), f"raw output must be a tensor, got {type(output)}"
+    assert output.dim() >= 1 and output.shape[0] == batch_size, f"raw output must have shape [B, ...], got {output.shape}"
     return output[sample_idx].contiguous()
 
 
@@ -180,8 +180,8 @@ def _serialize_rollout_trajectory(
 
 def _build_response(
     request_id: str, prompt: str, seed: int, result: OutputBatch
-) -> list[RolloutImageResponse]:
-    """Build a list of ``RolloutImageResponse`` of length ``B``.
+) -> list[RolloutResponse]:
+    """Build a list of ``RolloutResponse`` of length ``B``.
 
     Rollout tensors in ``rollout_trajectory_data`` are split per row using ``B`` from ``rollout_log_probs``.
 
@@ -203,7 +203,7 @@ def _build_response(
     if rollout_trajectory_data.dit_trajectory:
         serialized_dit_timesteps = _maybe_serialize(rollout_trajectory_data.dit_trajectory.timesteps)
 
-    responses: list[RolloutImageResponse] = []
+    responses: list[RolloutResponse] = []
 
     # Extract Samples from Batch
     for sample_idx in range(batch_size):
@@ -222,7 +222,7 @@ def _build_response(
         out_i = _extract_generated_output_for_sample(result.output, sample_idx, batch_size)
         serialized_generated_output = _maybe_serialize(out_i) if out_i is not None else None
         responses.append(
-            RolloutImageResponse(
+            RolloutResponse(
                 request_id=request_id,
                 prompt=prompt,
                 seed=seed,
@@ -238,8 +238,8 @@ def _build_response(
     return responses
 
 
-@router.post("/images", response_model=list[RolloutImageResponse])
-async def rollout_images(request: RolloutImageRequest):
+@router.post("/generate", response_model=list[RolloutResponse])
+async def rollout_generate(request: RolloutImageRequest):
     """Run one or a batch of diffusion generations; return a JSON array of length ``B``.
     """
     request_id = generate_request_id()

@@ -1,4 +1,4 @@
-"""Unit tests for the Rollout Image API (serialization, io_struct, rollout_api)."""
+"""Unit tests for the rollout generate API (serialization, io_struct, rollout_api)."""
 
 import types
 import unittest
@@ -6,10 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
-    RolloutImageRequest,
-    RolloutImageResponse,
-)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import RolloutImageRequest
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
     _maybe_serialize,
@@ -395,8 +392,8 @@ class TestBuildResponse(unittest.TestCase):
 # =========================================================================
 
 
-class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
-    """Test the rollout_images endpoint with mocked dependencies."""
+class TestRolloutGenerateEndpoint(unittest.IsolatedAsyncioTestCase):
+    """Test the rollout_generate endpoint with mocked dependencies."""
 
     def _make_output_batch(self, **overrides):
         defaults = dict(
@@ -416,7 +413,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.build_sampling_params")
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
     async def test_success_path(self, mock_prepare, mock_build_sp, mock_get_args, mock_client):
-        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_images
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_generate
 
         mock_get_args.return_value = MagicMock()
         mock_build_sp.return_value = MagicMock()
@@ -425,7 +422,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
         mock_client.forward = AsyncMock(return_value=output_batch)
 
         request = RolloutImageRequest(prompt="a cat", seed=42)
-        response = await rollout_images(request)
+        response = await rollout_generate(request)
 
         self.assertEqual(response.status_code, 200)
         mock_client.forward.assert_awaited_once()
@@ -439,7 +436,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.build_sampling_params")
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
     async def test_extra_sampling_params_merged(self, mock_prepare, mock_build_sp, mock_get_args, mock_client):
-        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_images
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_generate
 
         mock_get_args.return_value = MagicMock()
         mock_build_sp.return_value = MagicMock()
@@ -450,7 +447,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
             prompt="test",
             extra_sampling_params={"boundary_ratio": 0.5, "num_frames": 1},
         )
-        await rollout_images(request)
+        await rollout_generate(request)
 
         call_kwargs = mock_build_sp.call_args[1]
         self.assertAlmostEqual(call_kwargs["boundary_ratio"], 0.5)
@@ -463,7 +460,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
     async def test_num_outputs_per_prompt_forwarded(
         self, mock_prepare, mock_build_sp, mock_get_args, mock_client
     ):
-        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_images
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_generate
 
         mock_get_args.return_value = MagicMock()
         mock_build_sp.return_value = MagicMock()
@@ -471,7 +468,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
         mock_client.forward = AsyncMock(return_value=self._make_output_batch())
 
         request = RolloutImageRequest(prompt="test", num_outputs_per_prompt=3)
-        await rollout_images(request)
+        await rollout_generate(request)
 
         call_kwargs = mock_build_sp.call_args[1]
         self.assertEqual(call_kwargs["num_outputs_per_prompt"], 3)
@@ -481,14 +478,14 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.build_sampling_params")
     async def test_invalid_sampling_params_returns_400(self, mock_build_sp, mock_get_args, mock_client):
         from fastapi import HTTPException
-        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_images
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_generate
 
         mock_get_args.return_value = MagicMock()
         mock_build_sp.side_effect = ValueError("bad param")
 
         request = RolloutImageRequest(prompt="test")
         with self.assertRaises(HTTPException) as ctx:
-            await rollout_images(request)
+            await rollout_generate(request)
         self.assertEqual(ctx.exception.status_code, 400)
 
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.async_scheduler_client")
@@ -497,7 +494,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
     async def test_scheduler_error_returns_500(self, mock_prepare, mock_build_sp, mock_get_args, mock_client):
         from fastapi import HTTPException
-        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_images
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_generate
 
         mock_get_args.return_value = MagicMock()
         mock_build_sp.return_value = MagicMock()
@@ -506,7 +503,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
 
         request = RolloutImageRequest(prompt="test")
         with self.assertRaises(HTTPException) as ctx:
-            await rollout_images(request)
+            await rollout_generate(request)
         self.assertEqual(ctx.exception.status_code, 500)
 
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.async_scheduler_client")
@@ -515,7 +512,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
     async def test_result_error_returns_500(self, mock_prepare, mock_build_sp, mock_get_args, mock_client):
         from fastapi import HTTPException
-        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_images
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_generate
 
         mock_get_args.return_value = MagicMock()
         mock_build_sp.return_value = MagicMock()
@@ -526,7 +523,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
 
         request = RolloutImageRequest(prompt="test")
         with self.assertRaises(HTTPException) as ctx:
-            await rollout_images(request)
+            await rollout_generate(request)
         self.assertEqual(ctx.exception.status_code, 500)
         self.assertIn("model exploded", ctx.exception.detail)
 
@@ -535,7 +532,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.build_sampling_params")
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
     async def test_none_values_filtered_from_sampling_kwargs(self, mock_prepare, mock_build_sp, mock_get_args, mock_client):
-        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_images
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_generate
 
         mock_get_args.return_value = MagicMock()
         mock_build_sp.return_value = MagicMock()
@@ -543,7 +540,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
         mock_client.forward = AsyncMock(return_value=self._make_output_batch())
 
         request = RolloutImageRequest(prompt="test", width=None, guidance_scale=None)
-        await rollout_images(request)
+        await rollout_generate(request)
 
         call_kwargs = mock_build_sp.call_args[1]
         self.assertNotIn("width", call_kwargs)
@@ -560,7 +557,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
         self, mock_prepare, mock_build_sp, mock_get_args, mock_client
     ):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
-            rollout_images,
+            rollout_generate,
         )
 
         mock_get_args.return_value = MagicMock()
@@ -572,7 +569,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
             prompt="test",
             extra_sampling_params={"return_trajectory_latents": True},
         )
-        await rollout_images(request)
+        await rollout_generate(request)
         call_kwargs = mock_build_sp.call_args[1]
         self.assertIs(call_kwargs.get("return_trajectory_latents"), False)
 
@@ -584,7 +581,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
         self, mock_prepare, mock_build_sp, mock_get_args, mock_client
     ):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
-            rollout_images,
+            rollout_generate,
         )
 
         mock_get_args.return_value = MagicMock()
@@ -596,7 +593,7 @@ class TestRolloutImagesEndpoint(unittest.IsolatedAsyncioTestCase):
             prompt="test",
             extra_sampling_params={"return_trajectory_decoded": True},
         )
-        await rollout_images(request)
+        await rollout_generate(request)
         call_kwargs = mock_build_sp.call_args[1]
         self.assertIs(call_kwargs.get("return_trajectory_decoded"), False)
 

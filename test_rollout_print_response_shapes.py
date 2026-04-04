@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Start sglang-D with Qwen-Image, call rollout with dit capture flags and rollout_debug_mode, print shape outline.
 
-POST /rollout/images returns JSON where tensors are dicts:
+POST /rollout/generate returns JSON where tensors are dicts:
   {"__tensor__": true, "data": "<base64>", "shape": [...], "dtype": "..."}
 
 This script prints the same structure as a dict/JSON but replaces every tensor with
@@ -129,7 +129,7 @@ def kill_server(proc: subprocess.Popen | None) -> None:
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Print rollout /rollout/images response with tensor shapes tagged."
+        description="Print rollout /rollout/generate response with tensor shapes tagged."
     )
     p.add_argument(
         "--model-path",
@@ -200,8 +200,8 @@ def main() -> int:
             "rollout_return_dit_trajectory": True,
         }
 
-        print("POST /rollout/images", json.dumps(payload, indent=2), sep="\n", file=sys.stderr)
-        r = httpx.post(f"{base}/rollout/images", json=payload, timeout=600)
+        print("POST /rollout/generate", json.dumps(payload, indent=2), sep="\n", file=sys.stderr)
+        r = httpx.post(f"{base}/rollout/generate", json=payload, timeout=600)
         if r.status_code != 200:
             print(r.text[:2000], file=sys.stderr)
             print(f"HTTP {r.status_code}", file=sys.stderr)
