@@ -1037,6 +1037,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         # to avoid device-sync caused by timestep comparison
         is_warmup = batch.is_warmup
         self.scheduler.set_begin_index(0)
+        self.scheduler._step_index = None
         timesteps_cpu = timesteps.cpu()
         num_timesteps = timesteps_cpu.shape[0]
         with torch.autocast(
