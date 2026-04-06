@@ -33,10 +33,10 @@ router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 
 def _infer_rollout_batch_size(result: OutputBatch) -> int:
-    """Infer batch_size by log_probs
-    """
-    rollout_trajectory_data = result.rollout_trajectory_data
-    return rollout_trajectory_data.rollout_log_probs.shape[0]
+    """Infer batch size from ``result.output``."""
+    out = result.output
+    assert type(out) == torch.Tensor, f"output must be a tensor, got {type(out)}"
+    return int(out.shape[0])
 
 
 def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) -> Any:
@@ -58,12 +58,13 @@ def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) ->
 
 
 def _extract_generated_output_for_sample(output: Any, sample_idx: int, batch_size: int) -> Any:
-    """One row of ``result.output`` when it aligns with rollout ``batch_size`` (from ``rollout_log_probs``).
-    """
+    """One batch row of ``result.output`` (``[B, ...]`` tensor)."""
     if output is None:
         return None
-    assert isinstance(output, torch.Tensor), f"raw output must be a tensor, got {type(output)}"
-    assert output.dim() >= 1 and output.shape[0] == batch_size, f"raw output must have shape [B, ...], got {output.shape}"
+    assert isinstance(output, torch.Tensor), f"output must be a torch.Tensor, got {type(output)}"
+    assert output.dim() >= 1 and output.shape[0] == batch_size, (
+        f"output must have shape [B, ...], got {output.shape}"
+    )
     return output[sample_idx].contiguous()
 
 
@@ -169,24 +170,26 @@ def _serialize_rollout_trajectory(
     serialized_dit_trajectory = None
     if rollout_trajectory_data.dit_trajectory:
         dit = rollout_trajectory_data.dit_trajectory
+        dit_ts = serialized_dit_timesteps
+        if dit_ts is None and dit.timesteps is not None:
+            dit_ts = _maybe_serialize(dit.timesteps)
         serialized_dit_trajectory = {
             "latent_model_inputs": (
                 _maybe_serialize(dit.latent_model_inputs) if dit.latent_model_inputs is not None else None
             ),
-            "timesteps": serialized_dit_timesteps,
+            "timesteps": dit_ts,
         }
     return serialized_log_probs, serialized_debug_tensors, serialized_denoising_env, serialized_dit_trajectory
 
 
 def _build_response(
-    request_id: str, prompt: str, seed: int, result: OutputBatch
+    request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
 ) -> list[RolloutResponse]:
     """Build a list of ``RolloutResponse`` of length ``B``.
 
     Rollout tensors in ``rollout_trajectory_data`` are split per row using ``B`` from ``rollout_log_probs``.
 
-    ``generated_output`` is sliced per row when ``result.output`` is a tensor with ``shape[0] == B`` or a list
-    of length ``B`` (or length-1 list of such a tensor); otherwise the same payload is repeated on each row.
+    ``generated_output`` is sliced per row when ``result.output`` is a tensor with ``shape[0] == B``.
     """
     batch_size = _infer_rollout_batch_size(result)
     inference_time_s = (
@@ -196,17 +199,32 @@ def _build_response(
     )
     peak_memory_mb = result.peak_memory_mb if result.peak_memory_mb > 0 else None
     rollout_trajectory_data = result.rollout_trajectory_data
-    assert rollout_trajectory_data is not None, "rollout_trajectory_data must be present for rollout"
+    if rollout:
+        assert rollout_trajectory_data is not None, "rollout_trajectory_data must be present when rollout=True"
 
     # Shared DiT timesteps serialization
     serialized_dit_timesteps = None
-    if rollout_trajectory_data.dit_trajectory:
+    if rollout and rollout_trajectory_data and rollout_trajectory_data.dit_trajectory:
         serialized_dit_timesteps = _maybe_serialize(rollout_trajectory_data.dit_trajectory.timesteps)
 
     responses: list[RolloutResponse] = []
 
     # Extract Samples from Batch
     for sample_idx in range(batch_size):
+        out_i = _extract_generated_output_for_sample(result.output, sample_idx, batch_size)
+        serialized_generated_output = _maybe_serialize(out_i) if out_i is not None else None
+        if not rollout:
+            responses.append(
+                RolloutResponse(
+                    request_id=request_id,
+                    prompt=prompt,
+                    seed=seed,
+                    generated_output=serialized_generated_output,
+                    inference_time_s=inference_time_s,
+                    peak_memory_mb=peak_memory_mb,
+                )
+            )
+            continue
         per_sample_trajectory = _slice_rollout_trajectory_for_sample(
             result.rollout_trajectory_data, sample_idx, batch_size
         )
@@ -219,8 +237,6 @@ def _build_response(
             per_sample_trajectory,
             serialized_dit_timesteps=serialized_dit_timesteps,
         )
-        out_i = _extract_generated_output_for_sample(result.output, sample_idx, batch_size)
-        serialized_generated_output = _maybe_serialize(out_i) if out_i is not None else None
         responses.append(
             RolloutResponse(
                 request_id=request_id,
@@ -256,7 +272,7 @@ async def rollout_generate(request: RolloutImageRequest):
         guidance_scale=request.guidance_scale,
         true_cfg_scale=request.true_cfg_scale,
         image_path=request.image_path,
-        rollout=True,
+        rollout=request.rollout,
         rollout_sde_type=request.rollout_sde_type,
         rollout_noise_level=request.rollout_noise_level,
         rollout_log_prob_no_const=request.rollout_log_prob_no_const,
@@ -267,6 +283,7 @@ async def rollout_generate(request: RolloutImageRequest):
     )
     if request.extra_sampling_params:
         sampling_kwargs.update(request.extra_sampling_params)
+    sampling_kwargs["rollout"] = request.rollout
     sampling_kwargs = {k: v for k, v in sampling_kwargs.items() if v is not None}
     # This endpoint does not expose ODE latents or per-frame VAE decode; keep off to save bandwidth and memory.
     sampling_kwargs["return_trajectory_latents"] = False
@@ -283,5 +300,5 @@ async def rollout_generate(request: RolloutImageRequest):
         raise HTTPException(status_code=500, detail=f"Generation failed: {exc}") from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
-    rollout_responses = _build_response(request_id, request.prompt, request.seed, output_batch)
+    rollout_responses = _build_response(request_id, request.prompt, request.seed, request.rollout, output_batch)
     return ORJSONResponse(content=[r.model_dump() for r in rollout_responses])

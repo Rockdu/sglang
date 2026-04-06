@@ -259,13 +259,13 @@ class TestBuildResponse(unittest.TestCase):
 
     def test_minimal_output(self):
         batch = OutputBatch(
-            output=[torch.randn(3, 1, 64, 64)],
+            output=torch.randn(1, 3, 1, 64, 64),
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.tensor([0.0]),
             ),
         )
         batch.metrics = self._make_metrics(2.5)
-        resps = _build_response("r1", "prompt", 42, batch)
+        resps = _build_response("r1", "prompt", 42, True, batch)
         self.assertEqual(len(resps), 1)
         resp = resps[0]
         self.assertEqual(resp.request_id, "r1")
@@ -279,14 +279,14 @@ class TestBuildResponse(unittest.TestCase):
 
     def test_full_response(self):
         batch = OutputBatch(
-            output=[torch.randn(3, 1, 64, 64)],
+            output=torch.randn(1, 3, 1, 64, 64),
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.tensor([-0.5]),
             ),
             peak_memory_mb=8192.0,
         )
         batch.metrics = self._make_metrics(5.0)
-        resps = _build_response("r2", "test", 99, batch)
+        resps = _build_response("r2", "test", 99, True, batch)
         self.assertEqual(len(resps), 1)
         resp = resps[0]
         self.assertIsNotNone(resp.rollout_log_probs)
@@ -295,24 +295,24 @@ class TestBuildResponse(unittest.TestCase):
 
     def test_no_metrics(self):
         batch = OutputBatch(
-            output=[torch.randn(3, 1, 64, 64)],
+            output=torch.randn(1, 3, 1, 64, 64),
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.tensor([0.0]),
             ),
         )
         batch.metrics = None
-        resp = _build_response("r3", "p", 1, batch)[0]
+        resp = _build_response("r3", "p", 1, True, batch)[0]
         self.assertIsNone(resp.inference_time_s)
 
     def test_zero_metrics(self):
         batch = OutputBatch(
-            output=[torch.randn(3, 1, 64, 64)],
+            output=torch.randn(1, 3, 1, 64, 64),
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.tensor([0.0]),
             ),
         )
         batch.metrics = self._make_metrics(0.0)
-        resp = _build_response("r4", "p", 1, batch)[0]
+        resp = _build_response("r4", "p", 1, True, batch)[0]
         self.assertIsNone(resp.inference_time_s)
 
     def test_none_output(self):
@@ -323,7 +323,7 @@ class TestBuildResponse(unittest.TestCase):
             ),
         )
         batch.metrics = None
-        resp = _build_response("r5", "p", 1, batch)[0]
+        resp = _build_response("r5", "p", 1, True, batch)[0]
         self.assertIsNone(resp.generated_output)
 
     def test_zero_peak_memory(self):
@@ -335,7 +335,7 @@ class TestBuildResponse(unittest.TestCase):
             ),
         )
         batch.metrics = None
-        resp = _build_response("r6", "p", 1, batch)[0]
+        resp = _build_response("r6", "p", 1, True, batch)[0]
         self.assertIsNone(resp.peak_memory_mb)
 
     def test_batch_splits_log_probs_and_output(self):
@@ -347,7 +347,7 @@ class TestBuildResponse(unittest.TestCase):
             ),
         )
         batch.metrics = self._make_metrics(1.0)
-        resps = _build_response("rb", "p", 0, batch)
+        resps = _build_response("rb", "p", 0, True, batch)
         self.assertEqual(len(resps), B)
         lp0 = base64_to_tensor(resps[0].rollout_log_probs["data"])
         lp1 = base64_to_tensor(resps[1].rollout_log_probs["data"])
@@ -372,7 +372,7 @@ class TestBuildResponse(unittest.TestCase):
             ),
         )
         batch.metrics = self._make_metrics(1.0)
-        resps = _build_response("r", "p", 0, batch)
+        resps = _build_response("r", "p", 0, True, batch)
         self.assertEqual(len(resps), B)
         self.assertIsNotNone(resps[0].dit_trajectory)
         self.assertIsNotNone(resps[1].dit_trajectory)
@@ -386,6 +386,18 @@ class TestBuildResponse(unittest.TestCase):
             _maybe_deserialize(resps[1].dit_trajectory["latent_model_inputs"]).shape, (T, D)
         )
 
+    def test_rollout_false_omits_trajectory_without_assert(self):
+        batch = OutputBatch(
+            output=torch.randn(2, 1, 8, 8),
+            rollout_trajectory_data=None,
+        )
+        batch.metrics = self._make_metrics(1.0)
+        resps = _build_response("r0", "p", 0, False, batch)
+        self.assertEqual(len(resps), 2)
+        self.assertIsNone(resps[0].rollout_log_probs)
+        self.assertIsNone(resps[1].rollout_log_probs)
+        self.assertIsNotNone(resps[0].generated_output)
+
 
 # =========================================================================
 # rollout_api.py — endpoint (async, with mocks)
@@ -397,7 +409,7 @@ class TestRolloutGenerateEndpoint(unittest.IsolatedAsyncioTestCase):
 
     def _make_output_batch(self, **overrides):
         defaults = dict(
-            output=[torch.randn(3, 1, 64, 64)],
+            output=torch.randn(1, 3, 1, 64, 64),
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.tensor([-1.0]),
             ),
@@ -452,6 +464,34 @@ class TestRolloutGenerateEndpoint(unittest.IsolatedAsyncioTestCase):
         call_kwargs = mock_build_sp.call_args[1]
         self.assertAlmostEqual(call_kwargs["boundary_ratio"], 0.5)
         self.assertEqual(call_kwargs["num_frames"], 1)
+
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.async_scheduler_client")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.get_global_server_args")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.build_sampling_params")
+    @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.prepare_request")
+    async def test_extra_rollout_does_not_override_request_rollout(
+        self, mock_prepare, mock_build_sp, mock_get_args, mock_client
+    ):
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import rollout_generate
+
+        mock_get_args.return_value = MagicMock()
+        mock_build_sp.return_value = MagicMock()
+        mock_prepare.return_value = MagicMock()
+        mock_client.forward = AsyncMock(
+            return_value=OutputBatch(
+                output=torch.randn(1, 1, 4, 4),
+                rollout_trajectory_data=None,
+                metrics=types.SimpleNamespace(total_duration_s=1.0),
+            )
+        )
+
+        request = RolloutImageRequest(
+            prompt="test",
+            rollout=False,
+            extra_sampling_params={"rollout": True},
+        )
+        await rollout_generate(request)
+        self.assertFalse(mock_build_sp.call_args[1]["rollout"])
 
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.async_scheduler_client")
     @patch("sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api.get_global_server_args")

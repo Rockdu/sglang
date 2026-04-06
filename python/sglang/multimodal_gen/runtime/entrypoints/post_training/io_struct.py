@@ -48,10 +48,11 @@ class RolloutImageRequest(BaseModel):
     true_cfg_scale: Optional[float] = None
 
     # rollout-specific
-    rollout_sde_type: str = "sde"
-    rollout_noise_level: float = 0.7
-    rollout_log_prob_no_const: bool = False
-    rollout_debug_mode: bool = False
+    rollout: bool = True
+    rollout_sde_type: Optional[str] = "sde"
+    rollout_noise_level: Optional[float] = 0.7
+    rollout_log_prob_no_const: Optional[bool] = False
+    rollout_debug_mode: Optional[bool] = True
 
     # optional DiT capture (ODE/VAE per-step decode is not exposed on this endpoint)
     rollout_return_denoising_env: bool = False  # conditioning fields in ``denoising_env``
