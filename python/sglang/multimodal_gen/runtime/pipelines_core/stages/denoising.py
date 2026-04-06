@@ -100,6 +100,10 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
     the initial noise into the final output.
     """
 
+    @property
+    def requires_per_output_execution(self) -> bool:
+        return True
+
     def __init__(
         self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
     ) -> None:
