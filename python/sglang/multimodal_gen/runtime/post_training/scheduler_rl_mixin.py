@@ -124,7 +124,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         current_sigma: torch.FloatTensor,
         next_sigma: torch.FloatTensor,
         generator: torch.Generator,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+    ) -> torch.Tensor:
         """Flow rollout step for log-prob / sampling (see FlowGRPO-style references).
 
         ``rollout_sde_type`` (from batch SamplingParams):
