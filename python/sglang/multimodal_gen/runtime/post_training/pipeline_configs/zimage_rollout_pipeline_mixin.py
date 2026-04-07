@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import torch
 from sglang.multimodal_gen.runtime.post_training.sp_utils import (
-    maybe_sp_all_gather,
+    all_gather_if_sp_sharded,
     maybe_trim_sp_rope_seq_for_batch,
 )
 
@@ -21,7 +21,7 @@ class ZImageRolloutPipelineMixin:
         if freqs is not None:
             cap_freqs, x_freqs = freqs[0], freqs[1]
             if isinstance(x_freqs, torch.Tensor) and x_freqs.dim() >= 2:
-                x_g = maybe_sp_all_gather(batch, x_freqs, dim=0)
+                x_g = all_gather_if_sp_sharded(batch, x_freqs, dim=0)
                 x_g = maybe_trim_sp_rope_seq_for_batch(batch, x_g)
                 out["freqs_cis"] = (cap_freqs, x_g)
         return out

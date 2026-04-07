@@ -107,7 +107,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             )
 
         sharded_noise, _ = rollout_session_data.pipeline_config.shard_latents_for_sp(
-            batch, buffer
+            batch=batch, latents=buffer
         )
         if tuple(sharded_noise.shape) != local_shape:
             raise ValueError(
