@@ -86,13 +86,13 @@ class SchedulerRLDebugMixin:
 
             # Gather on packed tensors first.
             variance_noises_packed = pipeline_config.gather_latents_for_sp(
-                variance_noises_packed
+                variance_noises_packed, batch=batch
             )
             prev_sample_means_packed = pipeline_config.gather_latents_for_sp(
-                prev_sample_means_packed
+                prev_sample_means_packed, batch=batch
             )
             model_outputs_packed = pipeline_config.gather_latents_for_sp(
-                model_outputs_packed
+                model_outputs_packed, batch=batch
             )
 
             # Unpack back to [B, T, ...].
