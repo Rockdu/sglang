@@ -27,15 +27,11 @@ class RLRolloutArgs:
     def validate(self) -> None:
         noise = self.rollout_noise_level
         if isinstance(noise, bool) or not isinstance(noise, (int, float)):
-            raise ValueError(
-                f"rollout_noise_level must be a number, got {noise!r}"
-            )
+            raise ValueError(f"rollout_noise_level must be a number, got {noise!r}")
         if not math.isfinite(float(noise)):
             raise ValueError(f"rollout_noise_level must be finite, got {noise!r}")
         if float(noise) < 0.0:
-            raise ValueError(
-                f"rollout_noise_level must be non-negative, got {noise!r}"
-            )
+            raise ValueError(f"rollout_noise_level must be non-negative, got {noise!r}")
 
         if self.rollout_sde_type not in _VALID_ROLLOUT_SDE_TYPES:
             raise ValueError(
@@ -112,16 +108,12 @@ class RLRolloutArgs:
     def from_dict(cls, kwargs: dict[str, Any]) -> RLRolloutArgs:
         return cls(
             rollout=bool(kwargs.get("rollout", cls.rollout)),
-            rollout_sde_type=str(
-                kwargs.get("rollout_sde_type", cls.rollout_sde_type)
-            ),
+            rollout_sde_type=str(kwargs.get("rollout_sde_type", cls.rollout_sde_type)),
             rollout_noise_level=float(
                 kwargs.get("rollout_noise_level", cls.rollout_noise_level)
             ),
             rollout_log_prob_no_const=bool(
-                kwargs.get(
-                    "rollout_log_prob_no_const", cls.rollout_log_prob_no_const
-                )
+                kwargs.get("rollout_log_prob_no_const", cls.rollout_log_prob_no_const)
             ),
             rollout_debug_mode=bool(
                 kwargs.get("rollout_debug_mode", cls.rollout_debug_mode)

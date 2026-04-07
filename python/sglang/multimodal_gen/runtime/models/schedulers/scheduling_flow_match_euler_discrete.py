@@ -522,14 +522,11 @@ class FlowMatchEulerDiscreteScheduler(
             next_sigma = sigma_next
             dt = sigma_next - sigma
 
-        if batch is not None and self.already_prepared_rollout(batch):
-            prev_sample, log_prob_local_sum, log_prob_local_count = (
-                self.flow_sde_sampling(
-                    batch, model_output, sample, current_sigma, next_sigma, generator
-                )
-            )
-            self.append_local_rollout_log_probs(
-                batch, log_prob_local_sum, log_prob_local_count
+        if batch is not None and batch.rollout:
+            if not self.already_prepared_rollout(batch):
+                raise RuntimeError("Rollout not prepared before step")
+            prev_sample = self.flow_sde_sampling(
+                batch, model_output, sample, current_sigma, next_sigma, generator
             )
         else:
             if self.config.stochastic_sampling:

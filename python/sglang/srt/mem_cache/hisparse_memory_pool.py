@@ -4,7 +4,6 @@ import weakref
 from typing import Optional
 
 import torch
-from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
 
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.allocator import (
@@ -12,6 +11,20 @@ from sglang.srt.mem_cache.allocator import (
     PagedTokenToKVPoolAllocator,
 )
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
+from sglang.srt.utils import is_cuda, is_hip
+
+# sgl_kernel.kvcacheio is only available in CUDA/ROCm sgl-kernel builds (not XPU/MPS/NPU/CPU).
+_is_cuda = is_cuda()
+_is_hip = is_hip()
+if _is_cuda or _is_hip:
+    from sgl_kernel.kvcacheio import transfer_kv_all_layer_mla
+else:
+
+    def transfer_kv_all_layer_mla(*args, **kwargs):
+        raise RuntimeError(
+            "HiSparse device KV transfer requires sgl_kernel.kvcacheio (CUDA/ROCm). "
+            "It is not available on this backend."
+        )
 
 
 class HiSparseNSATokenToKVPool(NSATokenToKVPool):
@@ -180,11 +193,38 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
             "Page size = 1 is not supported in HiSparse allocator"
         )
 
+    def alloc_logical_only(
+        self,
+        prefix_lens: torch.Tensor,
+        prefix_lens_cpu: torch.Tensor,
+        seq_lens: torch.Tensor,
+        seq_lens_cpu: torch.Tensor,
+        last_loc: torch.Tensor,
+        extend_num_tokens: int,
+    ):
+        """Allocate only logical indices without hisparse device indices.
+
+        Used in the direct-to-host transfer path where KV data is written
+        directly to host memory by the prefill node, skipping GPU staging.
+        """
+        return self.logical_attn_allocator.alloc_extend(
+            prefix_lens,
+            prefix_lens_cpu,
+            seq_lens,
+            seq_lens_cpu,
+            last_loc,
+            extend_num_tokens,
+        )
+
     def alloc_device_buffer(self, allocated_indices, need_size: int):
         assert need_size % self.page_size == 0
         # clear original reference and isolate the buffer from outside addressing, allocate new buffer if needed
         hisparse_indices = self.full_to_hisparse_device_index_mapping[allocated_indices]
         self.full_to_hisparse_device_index_mapping[allocated_indices] = 0
+        # Filter valid (non-zero) hisparse indices.
+        # In the direct-to-host path, mapping is all zeros since no hisparse
+        # device indices were pre-allocated.
+        hisparse_indices = hisparse_indices[hisparse_indices > 0]
         if len(hisparse_indices) >= need_size:
             buffer_indices = hisparse_indices[:need_size]
             self.free_hisparse_indices(hisparse_indices[need_size:])

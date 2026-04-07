@@ -48,7 +48,7 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
         current_sigma = torch.tensor(0.6, dtype=torch.float32)
         next_sigma = torch.tensor(0.4, dtype=torch.float32)
 
-        prev_sample, log_prob_local_sum, local_elem_count = scheduler.flow_sde_sampling(
+        prev_sample = scheduler.flow_sde_sampling(
             batch,
             model_output=model_output,
             sample=sample,
@@ -56,6 +56,11 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             next_sigma=next_sigma,
             generator=torch.Generator(device=sample.device).manual_seed(1),
         )
+        log_prob_local_sum, local_elem_count = (
+            scheduler.consume_local_rollout_log_probs(batch)
+        )
+        log_prob_local_sum = log_prob_local_sum.squeeze(-1)
+        local_elem_count = local_elem_count.squeeze(-1)
 
         expected_prev = sample + (next_sigma - current_sigma) * model_output
         self.assertTrue(torch.allclose(prev_sample, expected_prev, atol=1e-6, rtol=0.0))
@@ -214,7 +219,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     lambda _batch, *_args, **_kwargs: variance_noise
                 )
 
-                prev_sgl, log_prob_sum, elem_count = scheduler.flow_sde_sampling(
+                prev_sgl = scheduler.flow_sde_sampling(
                     batch,
                     model_output=model_output,
                     sample=sample,
@@ -222,6 +227,11 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     next_sigma=next_sigma,
                     generator=g,
                 )
+                log_prob_sum, elem_count = scheduler.consume_local_rollout_log_probs(
+                    batch
+                )
+                log_prob_sum = log_prob_sum.squeeze(-1)
+                elem_count = elem_count.squeeze(-1)
                 (
                     _variance_noises,
                     prev_sample_means,

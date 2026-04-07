@@ -25,7 +25,6 @@ _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
 class SchedulerRLMixin(SchedulerRLDebugMixin):
-
     @staticmethod
     def _get_rollout_session_data(batch) -> RolloutSessionData:
         """Return the RolloutSessionData attached to *batch*, or raise if not prepared."""
@@ -125,7 +124,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         current_sigma: torch.FloatTensor,
         next_sigma: torch.FloatTensor,
         generator: torch.Generator,
-    ) -> tuple[torch.FloatTensor, torch.FloatTensor, torch.FloatTensor]:
+    ) -> torch.Tensor:
         """Flow rollout step for log-prob / sampling (see FlowGRPO-style references).
 
         ``rollout_sde_type`` (from batch SamplingParams):
@@ -231,7 +230,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 model_output=model_output,
             )
 
-        return prev_sample, log_prob_local_sum, local_elem_count
+        self.append_local_rollout_log_probs(batch, log_prob_local_sum, local_elem_count)
+
+        return prev_sample
 
     def append_local_rollout_log_probs(
         self, batch, log_prob_sum: torch.Tensor, log_prob_count: torch.Tensor
