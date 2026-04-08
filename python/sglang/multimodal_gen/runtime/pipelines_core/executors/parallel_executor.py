@@ -130,6 +130,7 @@ class ParallelExecutor(PipelineExecutor):
                         trajectory_timesteps=result.trajectory_timesteps,
                         trajectory_latents=result.trajectory_latents,
                         trajectory_decoded=None,
+                        rollout_trajectory_data=result.rollout_trajectory_data,
                         metrics=result.metrics,
                         noise_pred=result.noise_pred,
                     )

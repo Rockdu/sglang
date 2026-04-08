@@ -14,6 +14,12 @@ import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
+from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
+    RolloutDebugTensors,
+    RolloutDenoisingEnv,
+    RolloutDitTrajectory,
+    RolloutTrajectoryData,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
@@ -70,7 +76,90 @@ def _prepare_single_output_batch(batch: Req, output_index: int) -> Req:
     sub_batch.latents = None
     sub_batch.num_outputs_per_prompt = 1
     sub_batch._current_output_index = output_index
+    # Rollout state is populated per sub-batch; don't share across outputs.
+    sub_batch.rollout_trajectory_data = None
     return sub_batch
+
+
+def _cat_field(parts: List, name: str) -> torch.Tensor | None:
+    """Concat a tensor field across dataclass instances along dim 0."""
+    tensors = [getattr(p, name) for p in parts if getattr(p, name) is not None]
+    if not tensors:
+        return None
+    return torch.cat(tensors, dim=0)
+
+
+def _merge_cond_kwargs(parts: List[dict]) -> dict | None:
+    """Merge a list of cond-kwargs dicts: concat tensor values along dim 0,
+    keep non-tensor values from the first part."""
+    if not parts:
+        return None
+    merged = {}
+    for k, v in parts[0].items():
+        if isinstance(v, torch.Tensor):
+            merged[k] = torch.cat([p[k] for p in parts], dim=0)
+        else:
+            merged[k] = v
+    return merged
+
+
+def _merge_denoising_env(
+    parts: List[RolloutDenoisingEnv],
+) -> RolloutDenoisingEnv | None:
+    if not parts:
+        return None
+    return RolloutDenoisingEnv(
+        image_kwargs=_merge_cond_kwargs(
+            [p.image_kwargs for p in parts if p.image_kwargs is not None]
+        ),
+        pos_cond_kwargs=_merge_cond_kwargs(
+            [p.pos_cond_kwargs for p in parts if p.pos_cond_kwargs is not None]
+        ),
+        neg_cond_kwargs=_merge_cond_kwargs(
+            [p.neg_cond_kwargs for p in parts if p.neg_cond_kwargs is not None]
+        ),
+        guidance=_cat_field(parts, "guidance"),
+    )
+
+
+def _merge_rollout_trajectory_data(
+    parts: List[RolloutTrajectoryData],
+) -> RolloutTrajectoryData | None:
+    if not parts:
+        return None
+
+    debug_parts = [p.rollout_debug_tensors for p in parts if p.rollout_debug_tensors]
+    debug = (
+        RolloutDebugTensors(
+            rollout_variance_noises=_cat_field(debug_parts, "rollout_variance_noises"),
+            rollout_prev_sample_means=_cat_field(
+                debug_parts, "rollout_prev_sample_means"
+            ),
+            rollout_noise_std_devs=_cat_field(debug_parts, "rollout_noise_std_devs"),
+            rollout_model_outputs=_cat_field(debug_parts, "rollout_model_outputs"),
+        )
+        if debug_parts
+        else None
+    )
+
+    dit_parts = [p.dit_trajectory for p in parts if p.dit_trajectory]
+    dit = (
+        RolloutDitTrajectory(
+            latent_model_inputs=_cat_field(dit_parts, "latent_model_inputs"),
+            timesteps=dit_parts[0].timesteps,
+        )
+        if dit_parts
+        else None
+    )
+
+    return RolloutTrajectoryData(
+        rollout_log_probs=_cat_field(parts, "rollout_log_probs"),
+        rollout_debug_tensors=debug,
+        denoising_env=_merge_denoising_env(
+            [p.denoising_env for p in parts if p.denoising_env]
+        ),
+        dit_trajectory=dit,
+    )
 
 
 def _merge_output_batches(output_batches: List[OutputBatch]) -> OutputBatch:
@@ -127,13 +216,28 @@ def _merge_output_batches(output_batches: List[OutputBatch]) -> OutputBatch:
             for t in range(len(traj_decoded_parts[0]))
         ]
 
+    rollout_parts = [
+        ob.rollout_trajectory_data
+        for ob in output_batches
+        if ob.rollout_trajectory_data is not None
+    ]
+    merged_rollout = _merge_rollout_trajectory_data(rollout_parts)
+
+    noise_pred_parts = [
+        ob.noise_pred for ob in output_batches if ob.noise_pred is not None
+    ]
+    merged_noise_pred = (
+        torch.cat(noise_pred_parts, dim=0) if noise_pred_parts else None
+    )
+
     return OutputBatch(
         output=outputs if has_outputs else None,
         trajectory_timesteps=merged_trajectory_timesteps,
         trajectory_latents=merged_trajectory_latents,
         trajectory_decoded=merged_trajectory_decoded,
+        rollout_trajectory_data=merged_rollout,
         metrics=output_batches[0].metrics,
-        noise_pred=None,
+        noise_pred=merged_noise_pred,
     )
 
 
