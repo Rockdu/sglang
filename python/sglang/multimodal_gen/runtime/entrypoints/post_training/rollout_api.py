@@ -120,12 +120,9 @@ def _serialize_rollout_trajectory(
     serialized_dit_trajectory = None
     if rtd.dit_trajectory:
         dit = rtd.dit_trajectory
-        dit_ts = serialized_dit_timesteps
-        if dit_ts is None and dit.timesteps is not None:
-            dit_ts = _maybe_serialize(dit.timesteps)
         serialized_dit_trajectory = {
             "latent_model_inputs": _maybe_serialize(dit.latent_model_inputs) if dit.latent_model_inputs is not None else None,
-            "timesteps": dit_ts,
+            "timesteps": serialized_dit_timesteps,
         }
     return serialized_log_probs, serialized_debug_tensors, serialized_denoising_env, serialized_dit_trajectory
 

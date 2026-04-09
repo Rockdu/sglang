@@ -205,7 +205,10 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
                 timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
             ),
         )
-        _, _, env, dit_traj = _serialize_rollout_trajectory(rtd)
+        _, _, env, dit_traj = _serialize_rollout_trajectory(
+            rtd,
+            serialized_dit_timesteps=_maybe_serialize(rtd.dit_trajectory.timesteps),
+        )
         self.assertIsNotNone(env)
         self.assertIn("pos_cond_kwargs", env)
         self.assertNotIn("trajectory", env)
