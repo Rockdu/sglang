@@ -732,10 +732,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             trajectory_tensor = None
             trajectory_timesteps_tensor = None
 
-        # Gather log probs for rollout
-        if batch.rollout:
-            self._maybe_collect_rollout_log_probs(batch)
-
         # Gather results if using sequence parallelism
         latents, trajectory_tensor = self._postprocess_sp_latents(
             batch, latents, trajectory_tensor
