@@ -24,7 +24,7 @@ class GetWeightsChecksumReqInput:
     module_names: list[str] | None = None
 
 
-class RolloutImageRequest(BaseModel):
+class RolloutRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
     seed: int = 1024
@@ -38,6 +38,10 @@ class RolloutImageRequest(BaseModel):
     guidance_scale: Optional[float] = None
     true_cfg_scale: Optional[float] = None
 
+    # video-specific (ignored by image pipelines)
+    num_frames: Optional[int] = None
+    fps: Optional[int] = None
+
     rollout: bool = True
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
@@ -48,6 +52,9 @@ class RolloutImageRequest(BaseModel):
     rollout_return_dit_trajectory: bool = False
 
     image_path: Optional[list[str]] = None
+
+    # suppress verbose per-request logging (also gates peak_memory_mb collection)
+    suppress_logs: bool = False
 
     extra_sampling_params: Optional[dict[str, Any]] = None
 

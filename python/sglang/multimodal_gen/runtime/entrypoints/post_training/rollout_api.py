@@ -11,7 +11,7 @@ from fastapi.responses import ORJSONResponse
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
-    RolloutImageRequest,
+    RolloutRequest,
     RolloutResponse,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import _maybe_serialize
@@ -133,6 +133,9 @@ def _serialize_rollout_trajectory(
 def _build_response(
     request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
 ) -> list[RolloutResponse]:
+    '''
+    rollout: bool - set to False when evaluating the model
+    '''
     batch_size = result.output.shape[0]
     inference_time_s = (
         result.metrics.total_duration_s
@@ -194,7 +197,7 @@ def _build_response(
 
 
 @router.post("/generate", response_model=list[RolloutResponse])
-async def rollout_generate(request: RolloutImageRequest):
+async def rollout_generate(request: RolloutRequest):
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_kwargs: dict = dict(
@@ -208,6 +211,8 @@ async def rollout_generate(request: RolloutImageRequest):
         num_outputs_per_prompt=request.num_outputs_per_prompt,
         guidance_scale=request.guidance_scale,
         true_cfg_scale=request.true_cfg_scale,
+        num_frames=request.num_frames,
+        fps=request.fps,
         image_path=request.image_path,
         rollout=request.rollout,
         rollout_sde_type=request.rollout_sde_type,
@@ -216,13 +221,13 @@ async def rollout_generate(request: RolloutImageRequest):
         rollout_debug_mode=request.rollout_debug_mode,
         rollout_return_denoising_env=request.rollout_return_denoising_env,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
+        suppress_logs=request.suppress_logs,
         save_output=False,
         return_trajectory_latents=False,
         return_trajectory_decoded=False,
     )
     if request.extra_sampling_params:
         sampling_kwargs.update(request.extra_sampling_params)
-        # Ensure user-supplied extras don't override the rollout flag
         sampling_kwargs["rollout"] = request.rollout
     sampling_kwargs = {k: v for k, v in sampling_kwargs.items() if v is not None}
     try:
@@ -237,5 +242,11 @@ async def rollout_generate(request: RolloutImageRequest):
         raise HTTPException(status_code=500, detail=f"Generation failed: {exc}") from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
-    rollout_responses = _build_response(request_id, request.prompt, request.seed, request.rollout, output_batch)
+    rollout_responses = _build_response(
+        request_id,
+        request.prompt,
+        request.seed,
+        request.rollout,
+        output_batch
+    )
     return ORJSONResponse(content=[r.model_dump() for r in rollout_responses])
