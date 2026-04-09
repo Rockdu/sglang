@@ -569,9 +569,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         if batch.rollout:
             self._maybe_prepare_rollout(batch)
 
-        if batch.rollout:
-            self._maybe_prepare_rollout(batch)
-
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
             self.scheduler.step,
@@ -1025,14 +1022,15 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         trajectory_timesteps: list[torch.Tensor] = []
         trajectory_latents: list[torch.Tensor] = []
 
-        self._maybe_init_dit_env_collection(
-            batch=batch,
-            pipeline_config=server_args.pipeline_config,
-            image_kwargs=image_kwargs,
-            pos_cond_kwargs=pos_cond_kwargs,
-            neg_cond_kwargs=neg_cond_kwargs,
-            guidance=guidance,
-        )
+        if batch.rollout:
+            self._maybe_init_denoising_env_collection(
+                batch=batch,
+                pipeline_config=server_args.pipeline_config,
+                image_kwargs=image_kwargs,
+                pos_cond_kwargs=pos_cond_kwargs,
+                neg_cond_kwargs=neg_cond_kwargs,
+                guidance=guidance,
+            )
 
         # Run denoising loop
         denoising_start_time = time.time()

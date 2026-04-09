@@ -425,11 +425,6 @@ class PipelineConfig:
         raise NotImplementedError("not yet implemented")
 
     def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
-        """SP all_gather for one static cond-kwargs dict (``pos`` / ``neg``) in rollout ``denoising_env``.
-
-        Not used for ``image_kwargs``, trajectory tensors, or guidance; extend in subclasses when
-        new sequence-sharded fields appear (e.g. ``freqs_cis`` image branch).
-        """
         return cond_kwargs
 
     @staticmethod

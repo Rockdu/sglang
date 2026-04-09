@@ -11,7 +11,6 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 
 
 class QwenImageRolloutPipelineMixin:
-    """``gather_dit_env_static_for_sp``: image RoPE is seq-sharded; text cache is replicated."""
 
     def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
         if cond_kwargs is None:
@@ -28,7 +27,7 @@ class QwenImageRolloutPipelineMixin:
 
 
 class QwenImageEditRolloutPipelineMixin:
-    """Edit / Plus shards noisy vs condition RoPE separately; full gather is not a single dim-0 op."""
+    # Edit/Plus shards noisy vs condition RoPE separately; override back to no-op.
 
     def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
         return cond_kwargs

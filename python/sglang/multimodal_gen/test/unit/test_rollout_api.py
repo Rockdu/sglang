@@ -2,11 +2,9 @@
 
 import types
 import unittest
-from unittest.mock import AsyncMock, MagicMock, patch
 
 import torch
 
-from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import RolloutImageRequest
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
     _maybe_serialize,
@@ -22,13 +20,7 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 )
 
 
-# =========================================================================
-# serialization.py
-# =========================================================================
-
-
 class TestTensorToBase64Roundtrip(unittest.TestCase):
-    """tensor_to_base64 / base64_to_tensor must be lossless."""
 
     def _roundtrip(self, t: torch.Tensor):
         encoded = tensor_to_base64(t)
@@ -126,10 +118,6 @@ class TestMaybeSerialize(unittest.TestCase):
         self.assertIsInstance(result, list)
         self.assertEqual(len(result), 2)
 
-
-# =========================================================================
-# rollout_api.py — _serialize_rollout_trajectory and _build_response
-# =========================================================================
 
 from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
     _build_response,
@@ -230,8 +218,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
 
 class TestBuildResponse(unittest.TestCase):
     def _make_metrics(self, duration_s: float = 1.0):
-        m = types.SimpleNamespace(total_duration_s=duration_s)
-        return m
+        return types.SimpleNamespace(total_duration_s=duration_s)
 
     def test_minimal_output(self):
         batch = OutputBatch(
@@ -291,20 +278,9 @@ class TestBuildResponse(unittest.TestCase):
         resp = _build_response("r4", "p", 1, True, batch)[0]
         self.assertIsNone(resp.inference_time_s)
 
-    def test_none_output(self):
-        batch = OutputBatch(
-            output=None,
-            rollout_trajectory_data=RolloutTrajectoryData(
-                rollout_log_probs=torch.tensor([0.0]),
-            ),
-        )
-        batch.metrics = None
-        resp = _build_response("r5", "p", 1, True, batch)[0]
-        self.assertIsNone(resp.generated_output)
-
     def test_zero_peak_memory(self):
         batch = OutputBatch(
-            output=None,
+            output=torch.randn(1, 3, 1, 64, 64),
             peak_memory_mb=0.0,
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.tensor([0.0]),
@@ -352,8 +328,6 @@ class TestBuildResponse(unittest.TestCase):
         self.assertEqual(len(resps), B)
         self.assertIsNotNone(resps[0].dit_trajectory)
         self.assertIsNotNone(resps[1].dit_trajectory)
-        self.assertIsNotNone(resps[0].dit_trajectory["timesteps"])
-        self.assertIsNotNone(resps[1].dit_trajectory["timesteps"])
         ts0 = base64_to_tensor(resps[0].dit_trajectory["timesteps"]["data"])
         ts1 = base64_to_tensor(resps[1].dit_trajectory["timesteps"]["data"])
         self.assertEqual(ts0.shape, (T,))
@@ -362,7 +336,7 @@ class TestBuildResponse(unittest.TestCase):
             _maybe_deserialize(resps[1].dit_trajectory["latent_model_inputs"]).shape, (T, D)
         )
 
-    def test_rollout_false_omits_trajectory_without_assert(self):
+    def test_rollout_false_omits_trajectory(self):
         batch = OutputBatch(
             output=torch.randn(2, 1, 8, 8),
             rollout_trajectory_data=None,
@@ -373,6 +347,7 @@ class TestBuildResponse(unittest.TestCase):
         self.assertIsNone(resps[0].rollout_log_probs)
         self.assertIsNone(resps[1].rollout_log_probs)
         self.assertIsNotNone(resps[0].generated_output)
+
 
 if __name__ == "__main__":
     unittest.main()

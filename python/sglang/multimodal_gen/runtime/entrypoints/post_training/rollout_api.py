@@ -1,5 +1,4 @@
-"""Rollout HTTP API (``POST /rollout/generate``).
-"""
+"""Rollout HTTP API (``POST /rollout/generate``)."""
 
 from __future__ import annotations
 
@@ -32,16 +31,7 @@ logger = init_logger(__name__)
 router = APIRouter(prefix="/rollout", tags=["rollout"])
 
 
-def _infer_rollout_batch_size(result: OutputBatch) -> int:
-    """Infer batch size from ``result.output``."""
-    out = result.output
-    assert type(out) == torch.Tensor, f"output must be a tensor, got {type(out)}"
-    return int(out.shape[0])
-
-
 def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) -> Any:
-    """Pull one sample out of a nested structure of batched tensors.
-    """
     if isinstance(obj, torch.Tensor):
         if obj.dim() >= 1 and obj.shape[0] == batch_size:
             return obj[sample_idx].contiguous()
@@ -57,73 +47,39 @@ def _extract_single_sample_tensor(obj: Any, sample_idx: int, batch_size: int) ->
     return obj
 
 
-def _extract_generated_output_for_sample(output: Any, sample_idx: int, batch_size: int) -> Any:
-    """One batch row of ``result.output`` (``[B, ...]`` tensor)."""
-    if output is None:
-        return None
-    assert isinstance(output, torch.Tensor), f"output must be a torch.Tensor, got {type(output)}"
-    assert output.dim() >= 1 and output.shape[0] == batch_size, (
-        f"output must have shape [B, ...], got {output.shape}"
-    )
-    return output[sample_idx].contiguous()
-
-
 def _slice_rollout_trajectory_for_sample(
-    rollout_trajectory_data: RolloutTrajectoryData | None,
+    rtd: RolloutTrajectoryData | None,
     sample_idx: int,
     batch_size: int,
 ) -> RolloutTrajectoryData | None:
-    """Extract per-sample ``RolloutTrajectoryData`` from a batch.
-
-    ``dit_trajectory.timesteps`` is usually ``[T]`` and shared across the batch; it is not extracted here and is
-    deduplicated during serialization later.
-    """
-    if rollout_trajectory_data is None:
+    if rtd is None:
         return None
-    log_probs = rollout_trajectory_data.rollout_log_probs
+    log_probs = rtd.rollout_log_probs
     if isinstance(log_probs, torch.Tensor) and log_probs.dim() >= 1 and log_probs.shape[0] == batch_size:
         log_probs = log_probs[sample_idx].contiguous()
     debug_tensors = None
-    if rollout_trajectory_data.rollout_debug_tensors:
-        rollout_debug = rollout_trajectory_data.rollout_debug_tensors
+    if rtd.rollout_debug_tensors:
+        rd = rtd.rollout_debug_tensors
         debug_tensors = RolloutDebugTensors(
-            rollout_variance_noises=_extract_single_sample_tensor(
-                rollout_debug.rollout_variance_noises, sample_idx, batch_size
-            ),
-            rollout_prev_sample_means=_extract_single_sample_tensor(
-                rollout_debug.rollout_prev_sample_means, sample_idx, batch_size
-            ),
-            rollout_noise_std_devs=_extract_single_sample_tensor(
-                rollout_debug.rollout_noise_std_devs, sample_idx, batch_size
-            ),
-            rollout_model_outputs=_extract_single_sample_tensor(
-                rollout_debug.rollout_model_outputs, sample_idx, batch_size
-            ),
+            rollout_variance_noises=_extract_single_sample_tensor(rd.rollout_variance_noises, sample_idx, batch_size),
+            rollout_prev_sample_means=_extract_single_sample_tensor(rd.rollout_prev_sample_means, sample_idx, batch_size),
+            rollout_noise_std_devs=_extract_single_sample_tensor(rd.rollout_noise_std_devs, sample_idx, batch_size),
+            rollout_model_outputs=_extract_single_sample_tensor(rd.rollout_model_outputs, sample_idx, batch_size),
         )
     denoising_env = None
-    if rollout_trajectory_data.denoising_env:
-        env = rollout_trajectory_data.denoising_env
+    if rtd.denoising_env:
+        env = rtd.denoising_env
         denoising_env = RolloutDenoisingEnv(
-            image_kwargs=_extract_single_sample_tensor(env.image_kwargs, sample_idx, batch_size)
-            if env.image_kwargs
-            else None,
-            pos_cond_kwargs=_extract_single_sample_tensor(env.pos_cond_kwargs, sample_idx, batch_size)
-            if env.pos_cond_kwargs
-            else None,
-            neg_cond_kwargs=_extract_single_sample_tensor(env.neg_cond_kwargs, sample_idx, batch_size)
-            if env.neg_cond_kwargs
-            else None,
-            guidance=_extract_single_sample_tensor(env.guidance, sample_idx, batch_size)
-            if env.guidance is not None
-            else None,
+            image_kwargs=_extract_single_sample_tensor(env.image_kwargs, sample_idx, batch_size) if env.image_kwargs else None,
+            pos_cond_kwargs=_extract_single_sample_tensor(env.pos_cond_kwargs, sample_idx, batch_size) if env.pos_cond_kwargs else None,
+            neg_cond_kwargs=_extract_single_sample_tensor(env.neg_cond_kwargs, sample_idx, batch_size) if env.neg_cond_kwargs else None,
+            guidance=_extract_single_sample_tensor(env.guidance, sample_idx, batch_size) if env.guidance is not None else None,
         )
     dit_trajectory = None
-    if rollout_trajectory_data.dit_trajectory:
-        dit = rollout_trajectory_data.dit_trajectory
+    if rtd.dit_trajectory:
+        dit = rtd.dit_trajectory
         dit_trajectory = RolloutDitTrajectory(
-            latent_model_inputs=_extract_single_sample_tensor(
-                dit.latent_model_inputs, sample_idx, batch_size
-            ),
+            latent_model_inputs=_extract_single_sample_tensor(dit.latent_model_inputs, sample_idx, batch_size),
             timesteps=dit.timesteps,
         )
     return RolloutTrajectoryData(
@@ -135,32 +91,26 @@ def _slice_rollout_trajectory_for_sample(
 
 
 def _serialize_rollout_trajectory(
-    rollout_trajectory_data: RolloutTrajectoryData | None,
+    rtd: RolloutTrajectoryData | None,
     *,
     serialized_dit_timesteps: dict | None = None,
 ) -> tuple[dict | None, dict | None, dict | None, dict | None]:
-    """Convert per-sample ``RolloutTrajectoryData`` to JSON-friendly dicts (tensors via ``_maybe_serialize``).
-
-    ``serialized_dit_timesteps``: if set, used as ``dit_trajectory["timesteps"]`` so the caller can run
-    ``_maybe_serialize`` once on the shared ``[T]`` tensor and attach the same dict to every response row.
-    Otherwise ``dit.timesteps`` is serialized here.
-    Return order: ``rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory``.
-    """
-    if rollout_trajectory_data is None:
+    """Return order: rollout_log_probs, rollout_debug_tensors, denoising_env, dit_trajectory."""
+    if rtd is None:
         return None, None, None, None
-    serialized_log_probs = _maybe_serialize(rollout_trajectory_data.rollout_log_probs)
+    serialized_log_probs = _maybe_serialize(rtd.rollout_log_probs)
     serialized_debug_tensors = None
-    if rollout_trajectory_data.rollout_debug_tensors:
-        rollout_debug = rollout_trajectory_data.rollout_debug_tensors
+    if rtd.rollout_debug_tensors:
+        rd = rtd.rollout_debug_tensors
         serialized_debug_tensors = {
-            "rollout_variance_noises": _maybe_serialize(rollout_debug.rollout_variance_noises),
-            "rollout_prev_sample_means": _maybe_serialize(rollout_debug.rollout_prev_sample_means),
-            "rollout_noise_std_devs": _maybe_serialize(rollout_debug.rollout_noise_std_devs),
-            "rollout_model_outputs": _maybe_serialize(rollout_debug.rollout_model_outputs),
+            "rollout_variance_noises": _maybe_serialize(rd.rollout_variance_noises),
+            "rollout_prev_sample_means": _maybe_serialize(rd.rollout_prev_sample_means),
+            "rollout_noise_std_devs": _maybe_serialize(rd.rollout_noise_std_devs),
+            "rollout_model_outputs": _maybe_serialize(rd.rollout_model_outputs),
         }
     serialized_denoising_env = None
-    if rollout_trajectory_data.denoising_env:
-        env = rollout_trajectory_data.denoising_env
+    if rtd.denoising_env:
+        env = rtd.denoising_env
         serialized_denoising_env = {
             "image_kwargs": _maybe_serialize(env.image_kwargs) if env.image_kwargs else None,
             "pos_cond_kwargs": _maybe_serialize(env.pos_cond_kwargs) if env.pos_cond_kwargs else None,
@@ -168,15 +118,13 @@ def _serialize_rollout_trajectory(
             "guidance": _maybe_serialize(env.guidance) if env.guidance is not None else None,
         }
     serialized_dit_trajectory = None
-    if rollout_trajectory_data.dit_trajectory:
-        dit = rollout_trajectory_data.dit_trajectory
+    if rtd.dit_trajectory:
+        dit = rtd.dit_trajectory
         dit_ts = serialized_dit_timesteps
         if dit_ts is None and dit.timesteps is not None:
             dit_ts = _maybe_serialize(dit.timesteps)
         serialized_dit_trajectory = {
-            "latent_model_inputs": (
-                _maybe_serialize(dit.latent_model_inputs) if dit.latent_model_inputs is not None else None
-            ),
+            "latent_model_inputs": _maybe_serialize(dit.latent_model_inputs) if dit.latent_model_inputs is not None else None,
             "timesteps": dit_ts,
         }
     return serialized_log_probs, serialized_debug_tensors, serialized_denoising_env, serialized_dit_trajectory
@@ -185,13 +133,7 @@ def _serialize_rollout_trajectory(
 def _build_response(
     request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
 ) -> list[RolloutResponse]:
-    """Build a list of ``RolloutResponse`` of length ``B``.
-
-    Rollout tensors in ``rollout_trajectory_data`` are split per row using ``B`` from ``rollout_log_probs``.
-
-    ``generated_output`` is sliced per row when ``result.output`` is a tensor with ``shape[0] == B``.
-    """
-    batch_size = _infer_rollout_batch_size(result)
+    batch_size = result.output.shape[0]
     inference_time_s = (
         result.metrics.total_duration_s
         if result.metrics and result.metrics.total_duration_s > 0
@@ -202,17 +144,14 @@ def _build_response(
     if rollout:
         assert rollout_trajectory_data is not None, "rollout_trajectory_data must be present when rollout=True"
 
-    # Shared DiT timesteps serialization
     serialized_dit_timesteps = None
     if rollout and rollout_trajectory_data and rollout_trajectory_data.dit_trajectory:
         serialized_dit_timesteps = _maybe_serialize(rollout_trajectory_data.dit_trajectory.timesteps)
 
     responses: list[RolloutResponse] = []
-
-    # Extract Samples from Batch
     for sample_idx in range(batch_size):
-        out_i = _extract_generated_output_for_sample(result.output, sample_idx, batch_size)
-        serialized_generated_output = _maybe_serialize(out_i) if out_i is not None else None
+        out_i = result.output[sample_idx].contiguous()
+        serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
             responses.append(
                 RolloutResponse(
@@ -256,8 +195,6 @@ def _build_response(
 
 @router.post("/generate", response_model=list[RolloutResponse])
 async def rollout_generate(request: RolloutImageRequest):
-    """Run one or a batch of diffusion generations; return a JSON array of length ``B``.
-    """
     request_id = generate_request_id()
     server_args = get_global_server_args()
     sampling_kwargs: dict = dict(
@@ -280,14 +217,14 @@ async def rollout_generate(request: RolloutImageRequest):
         rollout_return_denoising_env=request.rollout_return_denoising_env,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
         save_output=False,
+        return_trajectory_latents=False,
+        return_trajectory_decoded=False,
     )
     if request.extra_sampling_params:
         sampling_kwargs.update(request.extra_sampling_params)
-    sampling_kwargs["rollout"] = request.rollout
+        # Ensure user-supplied extras don't override the rollout flag
+        sampling_kwargs["rollout"] = request.rollout
     sampling_kwargs = {k: v for k, v in sampling_kwargs.items() if v is not None}
-    # This endpoint does not expose ODE latents or per-frame VAE decode; keep off to save bandwidth and memory.
-    sampling_kwargs["return_trajectory_latents"] = False
-    sampling_kwargs["return_trajectory_decoded"] = False
     try:
         sampling_params = build_sampling_params(request_id, **sampling_kwargs)
     except Exception as exc:

@@ -11,7 +11,6 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 
 
 class ZImageRolloutPipelineMixin:
-    """``gather_dit_env_static_for_sp``: gather sharded ``x_freqs_cis``; caption RoPE is replicated."""
 
     def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
         if cond_kwargs is None:
