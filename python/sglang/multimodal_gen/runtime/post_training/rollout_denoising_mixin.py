@@ -48,6 +48,28 @@ class RolloutDenoisingMixin:
         return out
 
     @staticmethod
+    def _squeeze_cond_batch_dim(d: dict[str, Any]) -> dict[str, Any]:
+        """Drop the leading batch dim from cond tensors with ndim >= 3 and size-1
+        first dim, so the rollout contract is stable across models regardless of
+        whether the pipeline kept or squeezed the batch axis upstream. Tensors
+        with ndim < 3 are left alone (likely no batch dim to begin with).
+        Recurses into list/tuple/dict values; non-tensor leaves untouched."""
+        def _rec(v: Any) -> Any:
+            if isinstance(v, torch.Tensor):
+                if v.ndim >= 3 and v.shape[0] == 1:
+                    return v.squeeze(0)
+                return v
+            if isinstance(v, list):
+                return [_rec(x) for x in v]
+            if isinstance(v, tuple):
+                return tuple(_rec(x) for x in v)
+            if isinstance(v, dict):
+                return {k: _rec(x) for k, x in v.items()}
+            return v
+
+        return {k: _rec(v) for k, v in d.items()}
+
+    @staticmethod
     def _should_collect_dit_env(batch) -> bool:
         return bool(getattr(batch, "rollout_return_denoising_env", False))
 
@@ -135,9 +157,13 @@ class RolloutDenoisingMixin:
         if self._should_collect_dit_env(batch):
             env = RolloutDenoisingEnv(
                 image_kwargs=self._kwargs_to_cpu(sanitize(image_kwargs)),
-                pos_cond_kwargs=self._kwargs_to_cpu(sanitize(pos_cond_kwargs)),
+                pos_cond_kwargs=self._squeeze_cond_batch_dim(
+                    self._kwargs_to_cpu(sanitize(pos_cond_kwargs))
+                ),
                 neg_cond_kwargs=(
-                    self._kwargs_to_cpu(sanitize(neg_cond_kwargs))
+                    self._squeeze_cond_batch_dim(
+                        self._kwargs_to_cpu(sanitize(neg_cond_kwargs))
+                    )
                     if neg_cond_kwargs
                     else None
                 ),
@@ -206,14 +232,18 @@ class RolloutDenoisingMixin:
                 gathered_pos = self._call_gather_dit_env_static_for_sp_if_defined(
                     pipeline_config, batch, pos_src
                 )
-                env.pos_cond_kwargs = self._kwargs_to_cpu(sanitize(gathered_pos))
+                env.pos_cond_kwargs = self._squeeze_cond_batch_dim(
+                    self._kwargs_to_cpu(sanitize(gathered_pos))
+                )
 
             neg_src = state.get("neg_cond_kwargs_src")
             if neg_src is not None and env.neg_cond_kwargs is not None:
                 gathered_neg = self._call_gather_dit_env_static_for_sp_if_defined(
                     pipeline_config, batch, neg_src
                 )
-                env.neg_cond_kwargs = self._kwargs_to_cpu(sanitize(gathered_neg))
+                env.neg_cond_kwargs = self._squeeze_cond_batch_dim(
+                    self._kwargs_to_cpu(sanitize(gathered_neg))
+                )
 
             batch.rollout_trajectory_data.denoising_env = env
 
