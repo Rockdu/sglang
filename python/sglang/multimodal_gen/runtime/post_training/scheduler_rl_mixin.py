@@ -16,10 +16,6 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import (
     SchedulerRLDebugMixin,
 )
-from sglang.multimodal_gen.runtime.post_training.sp_utils import (
-    all_reduce_if_sp_sharded,
-    should_do_sp_collective,
-)
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
@@ -145,10 +141,19 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             ), "True log-probability computation requires a non-zero noise level."
 
         dt = next_sigma - current_sigma
+        # sde/cps: cast to fp32 to match flowGRPO semantics and avoid the
+        # 0-dim-fp32 wrapped-scalar promotion demoting log-prob to bf16.
+        # ode: keep dtypes unchanged so rollout(ode) stays bit-exact with
+        # rollout=False (scheduling_flow_match_euler_discrete.step()).
+        # log_prob is computed on the full pre-shard noise buffer so SP ranks
+        # produce identical sums — see collect_rollout_log_probs().
         if sde_type == "sde":
+            model_output = model_output.float()
+            sample = sample.float()
             variance_noise = self._rollout_variance_noise(
                 batch, model_output, generator
             )
+            full_variance_noise = rollout_session_data.noise_buffer
             std_dev_t = (
                 torch.sqrt(
                     current_sigma
@@ -173,12 +178,15 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
 
             weighted_variance_noise = variance_noise * noise_std_dev
             prev_sample = prev_sample_mean + weighted_variance_noise
-            log_prob_no_const_val = -(weighted_variance_noise**2)
+            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
         elif sde_type == "cps":
+            model_output = model_output.float()
+            sample = sample.float()
             variance_noise = self._rollout_variance_noise(
                 batch, model_output, generator
             )
+            full_variance_noise = rollout_session_data.noise_buffer
             std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
             noise_std_dev = std_dev_t
             pred_original_sample = sample - current_sigma * model_output
@@ -189,7 +197,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
 
             weighted_variance_noise = variance_noise * noise_std_dev
             prev_sample = prev_sample_mean + weighted_variance_noise
-            log_prob_no_const_val = -(weighted_variance_noise**2)
+            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
 
         elif sde_type == "ode":
             prev_sample = sample + dt * model_output
@@ -198,7 +206,11 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             noise_std_dev = torch.zeros(
                 (), device=model_output.device, dtype=model_output.dtype
             )
-            log_prob_no_const_val = torch.zeros_like(model_output)
+            log_prob_no_const_val = torch.zeros(
+                rollout_session_data.latents_shape,
+                device=model_output.device,
+                dtype=torch.float32,
+            )
             assert (
                 log_prob_no_const
             ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
@@ -253,18 +265,12 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         return values_sum, values_count
 
     def collect_rollout_log_probs(self, batch: Req) -> torch.Tensor | None:
-        """Consume local rollout log probs and merge for all SP ranks."""
+        """Per-step sums are already computed on the full pre-shard noise
+        buffer inside flow_sde_sampling, so every SP rank holds identical
+        values here and no all-reduce is needed."""
 
         trajectory_log_prob_sum, trajectory_log_prob_count = (
             self.consume_local_rollout_log_probs(batch)
         )
-        if should_do_sp_collective(batch):
-            packed = torch.stack(
-                [trajectory_log_prob_sum, trajectory_log_prob_count], dim=0
-            )
-            packed = all_reduce_if_sp_sharded(batch, packed)
-            trajectory_log_prob_sum = packed[0]
-            trajectory_log_prob_count = packed[1]
-
         rollout_log_probs_tensor = trajectory_log_prob_sum / trajectory_log_prob_count
         return rollout_log_probs_tensor.cpu()
