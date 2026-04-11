@@ -33,11 +33,7 @@ class SchedulerRLDebugMixin:
     ) -> None:
         rollout_session_data = batch._rollout_session_data
         batch_size = variance_noise.shape[0]
-        # Clone variance_noise: the underlying noise buffer in
-        # _rollout_variance_noise is reused across denoising steps, and on the
-        # SP=1 path the returned tensor aliases that buffer. Without cloning,
-        # every appended entry would end up holding the last step's noise once
-        # the buffer is overwritten on the next step.
+        # the underlying noise buffer in batch._rollout_session_data.noise_buffer is reused.
         rollout_session_data.local_variance_noises.append(variance_noise.clone())
         rollout_session_data.local_prev_sample_means.append(prev_sample_mean)
         rollout_session_data.local_noise_std_devs.append(
