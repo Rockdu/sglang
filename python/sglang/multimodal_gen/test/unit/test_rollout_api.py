@@ -26,7 +26,9 @@ class TestTensorToBase64Roundtrip(unittest.TestCase):
         encoded = tensor_to_base64(t)
         self.assertIsInstance(encoded, str)
         decoded = base64_to_tensor(encoded)
-        self.assertTrue(torch.equal(t, decoded), f"Mismatch for shape={t.shape} dtype={t.dtype}")
+        self.assertTrue(
+            torch.equal(t, decoded), f"Mismatch for shape={t.shape} dtype={t.dtype}"
+        )
 
     def test_float32_1d(self):
         self._roundtrip(torch.randn(16))
@@ -100,7 +102,9 @@ class TestMaybeSerialize(unittest.TestCase):
         self.assertTrue(result[2]["__tensor__"])
 
     def test_nested_structure(self):
-        nested = {"level1": {"level2": [torch.tensor(1.0), {"level3": torch.tensor(2.0)}]}}
+        nested = {
+            "level1": {"level2": [torch.tensor(1.0), {"level3": torch.tensor(2.0)}]}
+        }
         result = _maybe_serialize(nested)
         self.assertTrue(result["level1"]["level2"][0]["__tensor__"])
         self.assertTrue(result["level1"]["level2"][1]["level3"]["__tensor__"])

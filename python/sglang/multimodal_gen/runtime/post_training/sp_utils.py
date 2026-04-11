@@ -30,7 +30,9 @@ def gather_stacked_latents_for_sp(
         return stacked_latents
     bsz, t_steps = stacked_latents.shape[0], stacked_latents.shape[1]
     flat_inputs = stacked_latents.flatten(0, 1).contiguous()
-    gathered_flat_inputs = pipeline_config.gather_latents_for_sp(flat_inputs, batch=batch)
+    gathered_flat_inputs = pipeline_config.gather_latents_for_sp(
+        flat_inputs, batch=batch
+    )
     return gathered_flat_inputs.unflatten(0, (bsz, t_steps))
 
 
@@ -42,9 +44,7 @@ def all_reduce_if_sp_sharded(batch, tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
-def all_gather_if_sp_sharded(
-    batch, x: torch.Tensor, dim: int = 0
-) -> torch.Tensor:
+def all_gather_if_sp_sharded(batch, x: torch.Tensor, dim: int = 0) -> torch.Tensor:
     if not should_do_sp_collective(batch):
         return x
     x = x.to(get_local_torch_device()).contiguous()

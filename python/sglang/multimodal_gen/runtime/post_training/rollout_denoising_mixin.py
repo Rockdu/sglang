@@ -90,11 +90,7 @@ class RolloutDenoisingMixin:
         # Append the final denoised latent as the (T+1)-th entry of the
         # dit-trajectory latents list.
         state = getattr(batch, "_rollout_dit_env_state", None)
-        if (
-            state is not None
-            and batch.rollout
-            and batch.rollout_return_dit_trajectory
-        ):
+        if state is not None and batch.rollout and batch.rollout_return_dit_trajectory:
             state["step_latents"].append(latents.detach())
         self._maybe_finalize_dit_env_collection(
             batch=batch,
