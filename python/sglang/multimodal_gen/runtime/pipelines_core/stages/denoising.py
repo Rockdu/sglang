@@ -1061,10 +1061,8 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                             )
                         )
 
-                        # Capture the raw (pre-scale, pre-I2V-concat) noisy
-                        # latent x_{t_i} for rollout trajectory collection.
-                        # Gated at the call site so non-rollout main path is
-                        # strictly untouched.
+                        # Capture the raw (pre-scale, pre-I2V-concat) latent for rollout
+                        # Decoupled from original trajectory backpass due to logic diff
                         if batch.rollout:
                             self._maybe_append_dit_trajectory_step(
                                 batch=batch,
@@ -1161,11 +1159,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
 
-        # Rollout postprocess must run before ``_post_denoising_loop`` because
-        # the latter gathers/post-processes ``latents`` via SP, and the rollout
-        # trajectory wants the still-sharded final latent so it can be gathered
-        # uniformly alongside the per-step trajectory latents. Gated at the
-        # call site so non-rollout main path is strictly untouched.
         if batch.rollout:
             self._postprocess_rollout_outputs(
                 batch=batch,
