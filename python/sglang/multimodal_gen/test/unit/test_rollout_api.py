@@ -201,7 +201,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
                 guidance=torch.tensor([3.5]),
             ),
             dit_trajectory=RolloutDitTrajectory(
-                latent_model_inputs=torch.randn(1, 4, 4, 2, 2, 2),
+                latents=torch.randn(1, 5, 4, 2, 2, 2),
                 timesteps=torch.tensor([1.0, 0.75, 0.5, 0.25]),
             ),
         )
@@ -213,9 +213,9 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertIn("pos_cond_kwargs", env)
         self.assertNotIn("trajectory", env)
         self.assertIsNotNone(dit_traj)
-        self.assertIn("latent_model_inputs", dit_traj)
+        self.assertIn("latents", dit_traj)
         self.assertIn("timesteps", dit_traj)
-        self.assertTrue(dit_traj["latent_model_inputs"]["__tensor__"])
+        self.assertTrue(dit_traj["latents"]["__tensor__"])
         self.assertTrue(dit_traj["timesteps"]["__tensor__"])
 
 
@@ -321,7 +321,7 @@ class TestBuildResponse(unittest.TestCase):
             rollout_trajectory_data=RolloutTrajectoryData(
                 rollout_log_probs=torch.randn(B, T),
                 dit_trajectory=RolloutDitTrajectory(
-                    latent_model_inputs=torch.randn(B, T, D),
+                    latents=torch.randn(B, T + 1, D),
                     timesteps=torch.linspace(1.0, 0.0, T),
                 ),
             ),
@@ -336,7 +336,7 @@ class TestBuildResponse(unittest.TestCase):
         self.assertEqual(ts0.shape, (T,))
         self.assertTrue(torch.equal(ts0, ts1))
         self.assertEqual(
-            _maybe_deserialize(resps[1].dit_trajectory["latent_model_inputs"]).shape, (T, D)
+            _maybe_deserialize(resps[1].dit_trajectory["latents"]).shape, (T + 1, D)
         )
 
     def test_rollout_false_omits_trajectory(self):

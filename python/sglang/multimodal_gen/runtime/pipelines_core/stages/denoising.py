@@ -1061,6 +1061,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                             )
                         )
 
+                        # Capture the raw (pre-scale, pre-I2V-concat) noisy
+                        # latent x_{t_i} for rollout trajectory collection.
+                        # Gated at the call site so non-rollout main path is
+                        # strictly untouched.
+                        if batch.rollout:
+                            self._maybe_append_dit_trajectory_step(
+                                batch=batch,
+                                latents=latents,
+                                timestep_value=t_host,
+                            )
+
                         # Expand latents for I2V
                         latent_model_input = latents.to(target_dtype)
                         if batch.image_latent is not None:
@@ -1113,12 +1124,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                         if server_args.comfyui_mode:
                             batch.noise_pred = noise_pred
 
-                        self._maybe_append_dit_env_step(
-                            batch=batch,
-                            latent_model_input=latent_model_input,
-                            timestep_value=t_host,
-                        )
-
                         # Compute the previous noisy sample
                         latents = self.scheduler.step(
                             model_output=noise_pred,
@@ -1156,6 +1161,17 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
                 (denoising_end_time - denoising_start_time) / len(timesteps),
             )
 
+        # Rollout postprocess must run before ``_post_denoising_loop`` because
+        # the latter gathers/post-processes ``latents`` via SP, and the rollout
+        # trajectory wants the still-sharded final latent so it can be gathered
+        # uniformly alongside the per-step trajectory latents. Gated at the
+        # call site so non-rollout main path is strictly untouched.
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch=batch,
+                latents=latents,
+                server_args=server_args,
+            )
         self._post_denoising_loop(
             batch=batch,
             latents=latents,
@@ -1164,7 +1180,6 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             server_args=server_args,
             is_warmup=is_warmup,
         )
-        self._postprocess_rollout_outputs(batch=batch, server_args=server_args)
         return batch
 
     # TODO: this will extends the preparation stage, should let subclass/passed-in variables decide which to prepare

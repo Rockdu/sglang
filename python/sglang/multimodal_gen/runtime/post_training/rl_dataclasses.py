@@ -48,7 +48,9 @@ class RolloutDenoisingEnv:
 
 @dataclass
 class RolloutDitTrajectory:
-    latent_model_inputs: torch.Tensor | None = None  # [B, T, ...]
+    # [B, T+1, ...]: per-step noisy latents x_{t_0..t_{T-1}} followed by the
+    # final denoised latent x_{t_T} (last scheduler.step output).
+    latents: torch.Tensor | None = None
     timesteps: torch.Tensor | None = None  # [T]
 
 

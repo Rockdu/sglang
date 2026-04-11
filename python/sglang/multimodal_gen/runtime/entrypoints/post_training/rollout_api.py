@@ -79,7 +79,7 @@ def _slice_rollout_trajectory_for_sample(
     if rtd.dit_trajectory:
         dit = rtd.dit_trajectory
         dit_trajectory = RolloutDitTrajectory(
-            latent_model_inputs=_extract_single_sample_tensor(dit.latent_model_inputs, sample_idx, batch_size),
+            latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
             timesteps=dit.timesteps,
         )
     return RolloutTrajectoryData(
@@ -121,7 +121,7 @@ def _serialize_rollout_trajectory(
     if rtd.dit_trajectory:
         dit = rtd.dit_trajectory
         serialized_dit_trajectory = {
-            "latent_model_inputs": _maybe_serialize(dit.latent_model_inputs) if dit.latent_model_inputs is not None else None,
+            "latents": _maybe_serialize(dit.latents) if dit.latents is not None else None,
             "timesteps": serialized_dit_timesteps,
         }
     return serialized_log_probs, serialized_debug_tensors, serialized_denoising_env, serialized_dit_trajectory

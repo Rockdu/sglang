@@ -78,8 +78,28 @@ class RolloutDenoisingMixin:
                 )
             self.scheduler.release_rollout_resources(batch)
 
-    def _postprocess_rollout_outputs(self, batch: Req, server_args: ServerArgs) -> None:
+    def _postprocess_rollout_outputs(
+        self,
+        batch: Req,
+        latents: torch.Tensor,
+        server_args: ServerArgs,
+    ) -> None:
+        """Finalize rollout-only outputs.
+
+        Must be called before ``_post_denoising_loop`` so that ``latents`` (the
+        last ``scheduler.step`` output) is still SP-sharded and can be gathered
+        uniformly with the per-step trajectory latents.
+        """
         self._maybe_collect_rollout_log_probs(batch)
+        # Append the final denoised latent as the (T+1)-th entry of the
+        # dit-trajectory latents list.
+        state = getattr(batch, "_rollout_dit_env_state", None)
+        if (
+            state is not None
+            and batch.rollout
+            and batch.rollout_return_dit_trajectory
+        ):
+            state["step_latents"].append(latents.detach())
         self._maybe_finalize_dit_env_collection(
             batch=batch,
             pipeline_config=server_args.pipeline_config,
@@ -121,24 +141,26 @@ class RolloutDenoisingMixin:
 
         batch._rollout_dit_env_state = {
             "env": env,
-            "trajectory_latent_model_inputs": [],
-            "trajectory_timesteps": [],
+            "step_latents": [],
+            "step_timesteps": [],
             "pos_cond_kwargs_src": pos_src,
             "neg_cond_kwargs_src": neg_src,
         }
 
-    def _maybe_append_dit_env_step(
+    def _maybe_append_dit_trajectory_step(
         self,
         batch,
-        latent_model_input: torch.Tensor,
+        latents: torch.Tensor,
         timestep_value: torch.Tensor,
     ) -> None:
+        if not batch.rollout or not batch.rollout_return_dit_trajectory:
+            return
         state = getattr(batch, "_rollout_dit_env_state", None)
-        if state is None or not batch.rollout_return_dit_trajectory:
+        if state is None:
             return
 
-        state["trajectory_latent_model_inputs"].append(latent_model_input.detach())
-        state["trajectory_timesteps"].append(timestep_value.detach().cpu())
+        state["step_latents"].append(latents.detach())
+        state["step_timesteps"].append(timestep_value.detach().cpu())
 
     def _maybe_finalize_dit_env_collection(self, batch, pipeline_config) -> None:
         state = getattr(batch, "_rollout_dit_env_state", None)
@@ -146,21 +168,21 @@ class RolloutDenoisingMixin:
             return
 
         env: RolloutDenoisingEnv | None = state["env"]
-        step_inputs: list[torch.Tensor] = state["trajectory_latent_model_inputs"]
-        step_timesteps: list[torch.Tensor] = state["trajectory_timesteps"]
+        step_latents: list[torch.Tensor] = state["step_latents"]
+        step_timesteps: list[torch.Tensor] = state["step_timesteps"]
 
         if batch.rollout_trajectory_data is None:
             batch.rollout_trajectory_data = RolloutTrajectoryData()
 
-        if step_inputs and batch.rollout_return_dit_trajectory:
-            step_inputs_tensor = torch.stack(step_inputs, dim=1)
-            step_inputs_tensor = gather_stacked_latents_for_sp(
+        if step_latents and batch.rollout_return_dit_trajectory:
+            step_latents_tensor = torch.stack(step_latents, dim=1)
+            step_latents_tensor = gather_stacked_latents_for_sp(
                 pipeline_config=pipeline_config,
                 batch=batch,
-                stacked_latents=step_inputs_tensor,
+                stacked_latents=step_latents_tensor,
             )
             batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
-                latent_model_inputs=step_inputs_tensor.cpu(),
+                latents=step_latents_tensor.cpu(),
                 timesteps=torch.stack(step_timesteps, dim=0).cpu(),
             )
 
