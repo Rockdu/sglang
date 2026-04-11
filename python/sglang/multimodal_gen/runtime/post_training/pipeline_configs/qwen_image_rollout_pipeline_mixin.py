@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import torch
+
 from sglang.multimodal_gen.runtime.post_training.sp_utils import (
     all_gather_if_sp_sharded,
     maybe_trim_sp_rope_seq_for_batch,
@@ -24,10 +25,3 @@ class QwenImageRolloutPipelineMixin:
                 img_g = maybe_trim_sp_rope_seq_for_batch(batch, img_g)
                 out["freqs_cis"] = (img_g, txt_cache)
         return out
-
-
-class QwenImageEditRolloutPipelineMixin:
-    # Edit/Plus shards noisy vs condition RoPE separately; override back to no-op.
-
-    def gather_dit_env_static_for_sp(self, batch, cond_kwargs: dict | None):
-        return cond_kwargs

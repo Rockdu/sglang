@@ -24,20 +24,16 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 
 
-def _kwargs_to_cpu(d: dict[str, Any]) -> dict[str, Any]:
-    out: dict[str, Any] = {}
-    for k, v in d.items():
-        if isinstance(v, torch.Tensor):
-            out[k] = v.detach().cpu()
-        elif isinstance(v, (list, tuple)):
-            out[k] = [
-                t.detach().cpu() if isinstance(t, torch.Tensor) else t for t in v
-            ]
-        elif isinstance(v, dict):
-            out[k] = _kwargs_to_cpu(v)
-        else:
-            out[k] = v
-    return out
+def _kwargs_to_cpu(d: Any) -> Any:
+    if isinstance(d, torch.Tensor):
+        return d.detach().cpu()
+    if isinstance(d, dict):
+        return {k: _kwargs_to_cpu(v) for k, v in d.items()}
+    if isinstance(d, list):
+        return [_kwargs_to_cpu(v) for v in d]
+    if isinstance(d, tuple):
+        return tuple(_kwargs_to_cpu(v) for v in d)
+    return d
 
 
 class RolloutDenoisingMixin:

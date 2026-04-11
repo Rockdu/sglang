@@ -20,7 +20,6 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 )
 from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.runtime.post_training.pipeline_configs import (
-    QwenImageEditRolloutPipelineMixin,
     QwenImageRolloutPipelineMixin,
 )
 from sglang.multimodal_gen.utils import calculate_dimensions
@@ -318,9 +317,7 @@ class QwenImagePipelineConfig(QwenImageRolloutPipelineMixin, ImagePipelineConfig
 
 
 @dataclass
-class QwenImageEditPipelineConfig(
-    QwenImageEditRolloutPipelineMixin, QwenImagePipelineConfig
-):
+class QwenImageEditPipelineConfig(QwenImagePipelineConfig):
     """Configuration for the QwenImageEdit pipeline."""
 
     task_type: ModelTaskType = ModelTaskType.I2I
