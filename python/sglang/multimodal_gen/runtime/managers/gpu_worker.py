@@ -103,17 +103,12 @@ def _move_unregistered_tensors(module: torch.nn.Module, device: str) -> None:
 
     attrs = module.__dict__
     for attr_name, attr_value in list(attrs.items()):
+        if attr_name.startswith("_"):
+            continue
         if attr_name in {"_parameters", "_buffers", "_modules"}:
             continue
 
-        try:
-            moved_value = move_tensors(attr_value)
-        except Exception as e:
-            logger.warning(
-                f"[move_unregistered_tensors] attr move failed: module={module.__class__.__name__} attr={attr_name} type={type(attr_value)} target={device} error={e}",
-            )
-            raise
-
+        moved_value = move_tensors(attr_value)
         if moved_value is not attr_value:
             attrs[attr_name] = moved_value
 
@@ -534,21 +529,11 @@ class GPUWorker:
         """
         moved: list[str] = []
 
-        if self.pipeline is None:
-            raise RuntimeError(
-                f"_move_modules called but pipeline is None, target={device}"
-            )
-
         modules = get_updatable_modules(self.pipeline)
         src_device_map: dict[str, str] = {}
         try:
             for name in names:
-                module = modules.get(name)
-                if module is None:
-                    raise RuntimeError(
-                        f"module not found during move: name={name}, target={device}"
-                    )
-
+                module = modules[name]
                 src_device_map[name] = _get_module_device(module)
                 module.to(device)
                 moved.append(name)
