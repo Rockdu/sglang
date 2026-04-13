@@ -15,10 +15,7 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.runtime.error_types import (
-    RequestRejectedError,
-    SLEEPING_ERROR_TYPE,
-)
+from sglang.multimodal_gen.runtime.error_types import SLEEPING_ERROR_TYPE
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -265,47 +262,33 @@ async def process_generation_batch(
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
 
-    try:
-        with log_generation_timer(logger, batch.prompt):
-            result = await scheduler_client.forward([batch])
+    with log_generation_timer(logger, batch.prompt):
+        result = await scheduler_client.forward([batch])
 
-            if result.output is None and result.output_file_paths is None:
-                error_msg = result.error or "Unknown error"
-                if result.error_type == SLEEPING_ERROR_TYPE:
-                    raise RequestRejectedError(
-                        message=error_msg,
-                        status_code=400,
-                    )
-                raise RuntimeError(
-                    f"Model generation returned no output. Error from scheduler: {error_msg}"
-                )
+        if result.output is None and result.output_file_paths is None:
+            _raise_generation_error(result)
 
-            if result.output_file_paths:
-                save_file_path_list = result.output_file_paths
-            else:
-                num_outputs = len(result.output)
-                save_file_path_list = save_outputs(
-                    result.output,
-                    batch.data_type,
-                    batch.fps,
-                    batch.save_output,
-                    lambda idx: str(batch.output_file_path(num_outputs, idx)),
-                    audio=result.audio,
-                    audio_sample_rate=result.audio_sample_rate,
-                    output_compression=batch.output_compression,
-                    enable_frame_interpolation=batch.enable_frame_interpolation,
-                    frame_interpolation_exp=batch.frame_interpolation_exp,
-                    frame_interpolation_scale=batch.frame_interpolation_scale,
-                    frame_interpolation_model_path=batch.frame_interpolation_model_path,
-                    enable_upscaling=batch.enable_upscaling,
-                    upscaling_model_path=batch.upscaling_model_path,
-                    upscaling_scale=batch.upscaling_scale,
-                )
-    except RequestRejectedError as e:
-        raise HTTPException(
-            status_code=e.status_code,
-            detail={"message": e.message},
-        ) from None
+        if result.output_file_paths:
+            save_file_path_list = result.output_file_paths
+        else:
+            num_outputs = len(result.output)
+            save_file_path_list = save_outputs(
+                result.output,
+                batch.data_type,
+                batch.fps,
+                batch.save_output,
+                lambda idx: str(batch.output_file_path(num_outputs, idx)),
+                audio=result.audio,
+                audio_sample_rate=result.audio_sample_rate,
+                output_compression=batch.output_compression,
+                enable_frame_interpolation=batch.enable_frame_interpolation,
+                frame_interpolation_exp=batch.frame_interpolation_exp,
+                frame_interpolation_scale=batch.frame_interpolation_scale,
+                frame_interpolation_model_path=batch.frame_interpolation_model_path,
+                enable_upscaling=batch.enable_upscaling,
+                upscaling_model_path=batch.upscaling_model_path,
+                upscaling_scale=batch.upscaling_scale,
+            )
 
     total_time = time.perf_counter() - total_start_time
     log_batch_completion(logger, 1, total_time)
@@ -314,6 +297,18 @@ async def process_generation_batch(
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
 
     return save_file_path_list, result
+
+
+def _raise_generation_error(result: OutputBatch) -> None:
+    error_msg = result.error or "Unknown error"
+    if result.error_type == SLEEPING_ERROR_TYPE:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": error_msg},
+        )
+    raise RuntimeError(
+        f"Model generation returned no output. Error from scheduler: {error_msg}"
+    )
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:

@@ -20,8 +20,9 @@ from logging import Logger
 from types import MethodType
 from typing import Any, cast
 
+from fastapi import HTTPException
+
 import sglang.multimodal_gen.envs as envs
-from sglang.multimodal_gen.runtime.error_types import RequestRejectedError
 
 SGLANG_DIFFUSION_LOGGING_LEVEL = envs.SGLANG_DIFFUSION_LOGGING_LEVEL
 SGLANG_DIFFUSION_LOGGING_PREFIX = envs.SGLANG_DIFFUSION_LOGGING_PREFIX
@@ -632,10 +633,10 @@ def log_generation_timer(
             timer.duration,
         )
 
-    except RequestRejectedError as e:
+    except HTTPException as e:
         # Expected user-facing errors (e.g., server sleeping -> 400).
         # Do NOT print traceback for these.
-        msg = e.message
+        msg = e.detail
         if request_idx is not None:
             logger.warning(
                 f"Request {request_idx} rejected (HTTP {e.status_code}): {msg}",
