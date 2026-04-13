@@ -12,7 +12,6 @@ import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import get_world_group
-from sglang.multimodal_gen.runtime.error_types import SLEEPING_ERROR_TYPE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     save_image_to_path,
@@ -149,7 +148,7 @@ class Scheduler:
             return OutputBatch(
                 error="Cannot update weights while the server is sleeping. "
                 "Call resume_memory_occupation first.",
-                error_type=SLEEPING_ERROR_TYPE,
+                error_status_code=400,
             )
         req = reqs[0]
         success, message = self.worker.update_weights_from_disk(
@@ -172,7 +171,7 @@ class Scheduler:
         if self.worker.is_sleeping():
             return OutputBatch(
                 error="Server is sleeping. Call resume_memory_occupation first.",
-                error_type=SLEEPING_ERROR_TYPE,
+                error_status_code=400,
             )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:

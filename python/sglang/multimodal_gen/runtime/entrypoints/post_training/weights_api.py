@@ -2,7 +2,6 @@
 
 from fastapi import APIRouter, Request
 
-from sglang.multimodal_gen.runtime.error_types import SLEEPING_ERROR_TYPE
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     GetWeightsChecksumReqInput,
     ReleaseMemoryOccupationReqInput,
@@ -44,7 +43,7 @@ async def update_weights_from_disk(request: Request):
         )
 
     if response.output is None:
-        status_code = 400 if response.error_type == SLEEPING_ERROR_TYPE else 500
+        status_code = response.error_status_code or 500
         return orjson_response(
             {
                 "success": False,

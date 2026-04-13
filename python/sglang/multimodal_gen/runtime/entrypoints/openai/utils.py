@@ -15,7 +15,6 @@ from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     SamplingParams,
 )
-from sglang.multimodal_gen.runtime.error_types import SLEEPING_ERROR_TYPE
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -301,9 +300,9 @@ async def process_generation_batch(
 
 def _raise_generation_error(result: OutputBatch) -> None:
     error_msg = result.error or "Unknown error"
-    if result.error_type == SLEEPING_ERROR_TYPE:
+    if result.error_status_code is not None:
         raise HTTPException(
-            status_code=400,
+            status_code=result.error_status_code,
             detail={"message": error_msg},
         )
     raise RuntimeError(
