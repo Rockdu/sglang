@@ -567,69 +567,99 @@ class GPUWorker:
 
         return True
 
-    def release_memory_occupation(self) -> dict:
-        logger.info(f"[SLEEP] GPUWorker.release_memory_occupation rank={self.rank}")
-        if self._sleeping:
-            return {"success": True, "sleeping": True, "message": "already sleeping"}
-        if self.pipeline is None:
-            return {
-                "success": False,
-                "sleeping": False,
-                "message": "pipeline not initialized",
-            }
+    @staticmethod
+    def _memory_occupation_result(
+        success: bool, sleeping: bool, message: str
+    ) -> dict[str, bool | str]:
+        return {
+            "success": success,
+            "sleeping": sleeping,
+            "message": message,
+        }
 
-        modules = get_updatable_modules(self.pipeline)
-        restore_map: dict[str, str] = {}
-        for name, m in modules.items():
-            dev_str = _get_module_device(m)
-            if not dev_str.startswith("cpu"):
-                restore_map[name] = dev_str
-
-        self._move_modules(list(restore_map.keys()), "cpu")
+    @staticmethod
+    def _clear_torch_device_cache() -> None:
         device = torch.get_device_module()
         device.synchronize()
         gc.collect()
         device.empty_cache()
 
-        self._sleep_restore_map = restore_map
+    def _offload_active_modules_to_cpu(self) -> dict[str, str]:
+        restore_map: dict[str, str] = {}
+        for name, module in get_updatable_modules(self.pipeline).items():
+            device = _get_module_device(module)
+            if not device.startswith("cpu"):
+                restore_map[name] = device
+
+        self._move_modules(list(restore_map.keys()), "cpu")
+        self._clear_torch_device_cache()
+        return restore_map
+
+    def _restore_modules_to_original_devices(
+        self, module_device_map: dict[str, str]
+    ) -> None:
+        grouped: dict[str, list[str]] = {}
+        for name, device in module_device_map.items():
+            grouped.setdefault(device, []).append(name)
+
+        for device, names in grouped.items():
+            self._move_modules(names, device)
+
+    def release_memory_occupation(self) -> dict:
+        logger.info(f"[SLEEP] GPUWorker.release_memory_occupation rank={self.rank}")
+        if self._sleeping:
+            return self._memory_occupation_result(
+                success=True,
+                sleeping=True,
+                message="already sleeping",
+            )
+        if self.pipeline is None:
+            return self._memory_occupation_result(
+                success=False,
+                sleeping=False,
+                message="pipeline not initialized",
+            )
+
+        self._sleep_restore_map = self._offload_active_modules_to_cpu()
         self._sleeping = True
-        return {
-            "success": True,
-            "sleeping": True,
-            "message": "released GPU memory (moved active modules to CPU)",
-        }
+        return self._memory_occupation_result(
+            success=True,
+            sleeping=True,
+            message="released GPU memory (moved active modules to CPU)",
+        )
 
     def resume_memory_occupation(self) -> dict:
         "Resume previously released GPU memory occupation."
         logger.info(f"[WAKE] GPUWorker.resume_memory_occupation rank={self.rank}")
         if not self._sleeping:
-            return {"success": True, "sleeping": False, "message": "already awake"}
+            return self._memory_occupation_result(
+                success=True,
+                sleeping=False,
+                message="already awake",
+            )
         if self.pipeline is None:
-            return {
-                "success": False,
-                "sleeping": True,
-                "message": "pipeline not initialized",
-            }
+            return self._memory_occupation_result(
+                success=False,
+                sleeping=True,
+                message="pipeline not initialized",
+            )
 
         if not self._sleep_restore_map:
             self._sleeping = False
-            return {
-                "success": True,
-                "sleeping": False,
-                "message": "no restore map; marked awake",
-            }
+            return self._memory_occupation_result(
+                success=True,
+                sleeping=False,
+                message="no restore map; marked awake",
+            )
 
-        for dev_str in sorted(set(self._sleep_restore_map.values())):
-            names = [n for n, d in self._sleep_restore_map.items() if d == dev_str]
-            self._move_modules(names, dev_str)
-
+        self._restore_modules_to_original_devices(self._sleep_restore_map)
         self._sleep_restore_map = {}
         self._sleeping = False
-        return {
-            "success": True,
-            "sleeping": False,
-            "message": "resumed GPU memory (restored modules to original devices)",
-        }
+        return self._memory_occupation_result(
+            success=True,
+            sleeping=False,
+            message="resumed GPU memory (restored modules to original devices)",
+        )
 
 
 OOM_MSG = f"""
