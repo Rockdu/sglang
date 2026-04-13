@@ -491,16 +491,8 @@ class Scheduler:
 
     def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
         logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
-        detail = self.worker.release_memory_occupation()
-        detail["success"] = bool(detail.get("success", False))
-        detail["sleeping"] = self.worker.is_sleeping()
-        detail.setdefault("message", "memory occupation operation finished")
-        return OutputBatch(output=detail)
+        return OutputBatch(output=self.worker.release_memory_occupation())
 
     def _handle_resume_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
         logger.info(f"[WAKE] handle_resume_memory_occupation on rank={self.gpu_id}")
-        detail = self.worker.resume_memory_occupation()
-        detail["success"] = bool(detail.get("success", False))
-        detail["sleeping"] = self.worker.is_sleeping()
-        detail.setdefault("message", "memory occupation operation finished")
-        return OutputBatch(output=detail)
+        return OutputBatch(output=self.worker.resume_memory_occupation())

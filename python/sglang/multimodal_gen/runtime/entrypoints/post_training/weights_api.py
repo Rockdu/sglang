@@ -10,11 +10,8 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
 )
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.srt.utils.json_response import orjson_response
-from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 router = APIRouter()
-
-logger = init_logger(__name__)
 
 
 @router.post("/update_weights_from_disk")
@@ -80,25 +77,22 @@ async def get_weights_checksum(request: Request):
 async def _handle_memory_occupation_request(
     req: ReleaseMemoryOccupationReqInput | ResumeMemoryOccupationReqInput,
 ):
-    """Handle memory sleep/wake requests forwarded to scheduler."""
     try:
         response = await async_scheduler_client.forward(req)
     except Exception as e:
-        logger.exception(f"scheduler_client.forward failed for {type(req).__name__}")
         return orjson_response({"success": False, "message": str(e)}, status_code=500)
 
-    payload = response.output if isinstance(response.output, dict) else None
-
-    if not isinstance(payload, dict) or "success" not in payload:
-        logger.error(f"missing success in scheduler output: {response.output}")
+    if response.output is None:
+        status_code = response.error_status_code or 500
         return orjson_response(
             {
                 "success": False,
-                "message": f"Missing 'success' field in scheduler response: {response.output}",
+                "message": response.error or "Unknown status",
             },
-            status_code=500,
+            status_code=status_code,
         )
 
+    payload = response.output
     success = bool(payload["success"])
     return orjson_response(payload, status_code=200 if success else 400)
 

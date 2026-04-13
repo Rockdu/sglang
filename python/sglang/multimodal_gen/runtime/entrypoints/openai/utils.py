@@ -265,7 +265,15 @@ async def process_generation_batch(
         result = await scheduler_client.forward([batch])
 
         if result.output is None and result.output_file_paths is None:
-            _raise_generation_error(result)
+            error_msg = result.error or "Unknown error"
+            if result.error_status_code is not None:
+                raise HTTPException(
+                    status_code=result.error_status_code,
+                    detail={"message": error_msg},
+                )
+            raise RuntimeError(
+                f"Model generation returned no output. Error from scheduler: {error_msg}"
+            )
 
         if result.output_file_paths:
             save_file_path_list = result.output_file_paths
@@ -296,18 +304,6 @@ async def process_generation_batch(
         logger.info(f"Peak memory usage: {result.peak_memory_mb:.2f} MB")
 
     return save_file_path_list, result
-
-
-def _raise_generation_error(result: OutputBatch) -> None:
-    error_msg = result.error or "Unknown error"
-    if result.error_status_code is not None:
-        raise HTTPException(
-            status_code=result.error_status_code,
-            detail={"message": error_msg},
-        )
-    raise RuntimeError(
-        f"Model generation returned no output. Error from scheduler: {error_msg}"
-    )
 
 
 def merge_image_input_list(*inputs: Union[List, Any, None]) -> List:
