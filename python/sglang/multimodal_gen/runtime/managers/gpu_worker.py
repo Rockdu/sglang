@@ -578,42 +578,26 @@ class GPUWorker:
                 "message": "pipeline not initialized",
             }
 
-        try:
-            modules = get_updatable_modules(self.pipeline)
-            restore_map: dict[str, str] = {}
-            for name, m in modules.items():
-                try:
-                    dev_str = _get_module_device(m)
-                except RuntimeError as e:
-                    logger.debug(
-                        f"[SLEEP] module device query failed; skip module. rank={self.rank} module={name} error={e}",
-                    )
-                    continue
-                if not dev_str.startswith("cpu"):
-                    restore_map[name] = dev_str
+        modules = get_updatable_modules(self.pipeline)
+        restore_map: dict[str, str] = {}
+        for name, m in modules.items():
+            dev_str = _get_module_device(m)
+            if not dev_str.startswith("cpu"):
+                restore_map[name] = dev_str
 
-            self._move_modules(list(restore_map.keys()), "cpu")
-            device = torch.get_device_module()
-            device.synchronize()
-            gc.collect()
-            device.empty_cache()
+        self._move_modules(list(restore_map.keys()), "cpu")
+        device = torch.get_device_module()
+        device.synchronize()
+        gc.collect()
+        device.empty_cache()
 
-            self._sleep_restore_map = restore_map
-            self._sleeping = True
-            return {
-                "success": True,
-                "sleeping": True,
-                "message": "released GPU memory (moved active modules to CPU)",
-            }
-        except Exception as e:
-            logger.warning(
-                f"[SLEEP] release_memory_occupation failed. rank={self.rank} error={e}",
-            )
-            return {
-                "success": False,
-                "sleeping": self._sleeping,
-                "message": f"offload failed; rolled back to keep state consistent: {e}",
-            }
+        self._sleep_restore_map = restore_map
+        self._sleeping = True
+        return {
+            "success": True,
+            "sleeping": True,
+            "message": "released GPU memory (moved active modules to CPU)",
+        }
 
     def resume_memory_occupation(self) -> dict:
         "Resume previously released GPU memory occupation."
@@ -627,35 +611,25 @@ class GPUWorker:
                 "message": "pipeline not initialized",
             }
 
-        try:
-            if not self._sleep_restore_map:
-                self._sleeping = False
-                return {
-                    "success": True,
-                    "sleeping": False,
-                    "message": "no restore map; marked awake",
-                }
-
-            for dev_str in sorted(set(self._sleep_restore_map.values())):
-                names = [n for n, d in self._sleep_restore_map.items() if d == dev_str]
-                self._move_modules(names, dev_str)
-
-            self._sleep_restore_map = {}
+        if not self._sleep_restore_map:
             self._sleeping = False
             return {
                 "success": True,
                 "sleeping": False,
-                "message": "resumed GPU memory (restored modules to original devices)",
+                "message": "no restore map; marked awake",
             }
-        except Exception as e:
-            logger.warning(
-                f"[WAKE] resume_memory_occupation failed. rank={self.rank} error={e}",
-            )
-            return {
-                "success": False,
-                "sleeping": self._sleeping,
-                "message": f"resume failed; rolled back to keep state consistent: {e}",
-            }
+
+        for dev_str in sorted(set(self._sleep_restore_map.values())):
+            names = [n for n, d in self._sleep_restore_map.items() if d == dev_str]
+            self._move_modules(names, dev_str)
+
+        self._sleep_restore_map = {}
+        self._sleeping = False
+        return {
+            "success": True,
+            "sleeping": False,
+            "message": "resumed GPU memory (restored modules to original devices)",
+        }
 
 
 OOM_MSG = f"""
