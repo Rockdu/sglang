@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=195, suite="stage-b-test-1-gpu-small")
+register_cuda_ci(est_time=136, suite="stage-b-test-1-gpu-small")
 register_amd_ci(est_time=195, suite="stage-b-test-1-gpu-small-amd")
 
 import gc
@@ -49,6 +49,7 @@ def test_update_weights_from_tensor(tp_size):
 
     del new_tensor
     gc.collect()
+    torch.cuda.ipc_collect()
     torch.cuda.empty_cache()
     memory_after = torch.cuda.memory_allocated()
     assert (
