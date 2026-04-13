@@ -6,6 +6,7 @@ import torch
 
 from sglang.multimodal_gen.runtime.loader.weights_updater import get_updatable_modules
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
+from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -53,6 +54,12 @@ def _move_unregistered_tensors(module: torch.nn.Module, device: str) -> None:
         moved_value = move_tensors(attr_value)
         if moved_value is not attr_value:
             attrs[attr_name] = moved_value
+
+
+def _is_layerwise_offload_managed(module: torch.nn.Module) -> bool:
+    if not isinstance(module, OffloadableDiTMixin):
+        return False
+    return any(manager.enabled for manager in module.layerwise_offload_managers)
 
 
 class MemoryOccupationController:
@@ -117,6 +124,8 @@ class MemoryOccupationController:
     def _offload_active_modules_to_cpu(self) -> dict[str, str]:
         restore_map: dict[str, str] = {}
         for name, module in get_updatable_modules(self.pipeline).items():
+            if _is_layerwise_offload_managed(module):
+                continue
             device = _get_module_device(module)
             if not device.startswith("cpu"):
                 restore_map[name] = device
