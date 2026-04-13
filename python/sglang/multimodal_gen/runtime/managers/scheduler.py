@@ -6,11 +6,10 @@ import os
 import pickle
 import tempfile
 from collections import deque
-from typing import Any, Callable, List
+from typing import Any, List
 
 import zmq
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import get_world_group
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
@@ -490,42 +489,18 @@ class Scheduler:
             results.append(pipe.recv())
         return results
 
-    def _handle_memory_occupation(
-        self,
-        tag: str,
-        operation_name: str,
-        worker_call: Callable[[], dict[str, Any]],
-    ) -> OutputBatch:
-        logger.info(f"[{tag}] {operation_name} on rank={self.gpu_id}")
+    def _handle_release_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[SLEEP] handle_release_memory_occupation on rank={self.gpu_id}")
+        detail = self.worker.release_memory_occupation()
+        detail["success"] = bool(detail.get("success", False))
+        detail["sleeping"] = self.worker.is_sleeping()
+        detail.setdefault("message", "memory occupation operation finished")
+        return OutputBatch(output=detail)
 
-        try:
-            detail = worker_call()
-        except Exception as e:
-            logger.exception(f"[{tag}] {operation_name} failed on rank={self.gpu_id}")
-            detail = {"success": False, "message": str(e)}
-
-        if not isinstance(detail, dict):
-            detail = {
-                "success": False,
-                "message": f"invalid worker response: {detail}",
-            }
-
-        normalized_detail = dict(detail)
-        normalized_detail["success"] = bool(normalized_detail.get("success", False))
-        normalized_detail["sleeping"] = self.worker.is_sleeping()
-        normalized_detail.setdefault("message", "memory occupation operation finished")
-        return OutputBatch(output=normalized_detail)
-
-    def _handle_release_memory_occupation(self, reqs: List[Any]) -> OutputBatch:
-        return self._handle_memory_occupation(
-            tag="SLEEP",
-            operation_name="handle_release_memory_occupation",
-            worker_call=self.worker.release_memory_occupation,
-        )
-
-    def _handle_resume_memory_occupation(self, reqs: List[Any]) -> OutputBatch:
-        return self._handle_memory_occupation(
-            tag="WAKE",
-            operation_name="handle_resume_memory_occupation",
-            worker_call=self.worker.resume_memory_occupation,
-        )
+    def _handle_resume_memory_occupation(self, _reqs: List[Any]) -> OutputBatch:
+        logger.info(f"[WAKE] handle_resume_memory_occupation on rank={self.gpu_id}")
+        detail = self.worker.resume_memory_occupation()
+        detail["success"] = bool(detail.get("success", False))
+        detail["sleeping"] = self.worker.is_sleeping()
+        detail.setdefault("message", "memory occupation operation finished")
+        return OutputBatch(output=detail)
