@@ -1,8 +1,4 @@
-"""Request/response data structures for post-training APIs.
-
-TODO(Shuwen, Chenyang): Split RL-oriented request types and serving-oriented
-request types into dedicated files.
-"""
+"""Request/response data structures for post-training APIs."""
 
 from dataclasses import dataclass
 
@@ -26,9 +22,6 @@ class GetWeightsChecksumReqInput:
 @dataclass
 class ReleaseMemoryOccupationReqInput:
     """Request to release (sleep) GPU memory occupation for the diffusion engine."""
-
-    # TODO (Kun, Chenyang): We shall have rather dedicated
-    # control of the Diffusion model's memory occupation.
     pass
 
 
