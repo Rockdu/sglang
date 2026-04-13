@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 
 # DeepSeek-V3 MLA tests with torch compile, FA3, and MTP speculative decoding
-register_cuda_ci(est_time=442, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=543, suite="stage-b-test-1-gpu-large")
 register_amd_ci(
     est_time=221,
     suite="stage-b-test-1-gpu-small-amd",
@@ -199,7 +199,7 @@ class TestDeepseekV3MTP(CustomTestCase):
 
         self.assertGreater(metrics["score"], 0.60)
 
-        server_info = requests.get(self.base_url + "/get_server_info")
+        server_info = requests.get(self.base_url + "/server_info")
         avg_spec_accept_length = server_info.json()["internal_states"][0][
             "avg_spec_accept_length"
         ]
