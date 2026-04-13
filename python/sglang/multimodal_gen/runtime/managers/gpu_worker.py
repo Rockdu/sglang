@@ -555,13 +555,12 @@ class GPUWorker:
 
         return True
 
-    @staticmethod
     def _memory_occupation_result(
-        success: bool, sleeping: bool, message: str
+        self, success: bool, message: str
     ) -> dict[str, bool | str]:
         return {
             "success": success,
-            "sleeping": sleeping,
+            "sleeping": self._sleeping,
             "message": message,
         }
 
@@ -598,13 +597,11 @@ class GPUWorker:
         if self._sleeping:
             return self._memory_occupation_result(
                 success=True,
-                sleeping=True,
                 message="already sleeping",
             )
         if self.pipeline is None:
             return self._memory_occupation_result(
                 success=False,
-                sleeping=False,
                 message="pipeline not initialized",
             )
 
@@ -612,7 +609,6 @@ class GPUWorker:
         self._sleeping = True
         return self._memory_occupation_result(
             success=True,
-            sleeping=True,
             message="released GPU memory (moved active modules to CPU)",
         )
 
@@ -622,13 +618,11 @@ class GPUWorker:
         if not self._sleeping:
             return self._memory_occupation_result(
                 success=True,
-                sleeping=False,
                 message="already awake",
             )
         if self.pipeline is None:
             return self._memory_occupation_result(
                 success=False,
-                sleeping=True,
                 message="pipeline not initialized",
             )
 
@@ -636,7 +630,6 @@ class GPUWorker:
             self._sleeping = False
             return self._memory_occupation_result(
                 success=True,
-                sleeping=False,
                 message="no restore map; marked awake",
             )
 
@@ -645,7 +638,6 @@ class GPUWorker:
         self._sleeping = False
         return self._memory_occupation_result(
             success=True,
-            sleeping=False,
             message="resumed GPU memory (restored modules to original devices)",
         )
 
