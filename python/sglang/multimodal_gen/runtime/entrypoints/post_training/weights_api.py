@@ -40,13 +40,12 @@ async def update_weights_from_disk(request: Request):
         )
 
     if response.output is None:
-        status_code = response.error_status_code or 500
         return orjson_response(
             {
                 "success": False,
                 "message": response.error or "Unknown status",
             },
-            status_code=status_code,
+            status_code=500,
         )
 
     result = response.output
@@ -83,13 +82,12 @@ async def release_memory_occupation():
         return orjson_response({"success": False, "message": str(e)}, status_code=500)
 
     if response.output is None:
-        status_code = response.error_status_code or 500
         return orjson_response(
             {
                 "success": False,
                 "message": response.error or "Unknown status",
             },
-            status_code=status_code,
+            status_code=500,
         )
 
     payload = response.output
@@ -106,13 +104,12 @@ async def resume_memory_occupation():
         return orjson_response({"success": False, "message": str(e)}, status_code=500)
 
     if response.output is None:
-        status_code = response.error_status_code or 500
         return orjson_response(
             {
                 "success": False,
                 "message": response.error or "Unknown status",
             },
-            status_code=status_code,
+            status_code=500,
         )
 
     payload = response.output

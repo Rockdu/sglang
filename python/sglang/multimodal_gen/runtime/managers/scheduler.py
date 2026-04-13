@@ -147,7 +147,6 @@ class Scheduler:
             return OutputBatch(
                 error="Cannot update weights while the server is sleeping. "
                 "Call resume_memory_occupation first.",
-                error_status_code=400,
             )
         req = reqs[0]
         success, message = self.worker.update_weights_from_disk(
@@ -170,7 +169,6 @@ class Scheduler:
         if self.worker.is_sleeping():
             return OutputBatch(
                 error="Server is sleeping. Call resume_memory_occupation first.",
-                error_status_code=400,
             )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:

@@ -9,7 +9,7 @@ from contextlib import contextmanager
 from typing import Any, Generator, List, Optional, Union
 
 import httpx
-from fastapi import HTTPException, UploadFile
+from fastapi import UploadFile
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
@@ -266,11 +266,6 @@ async def process_generation_batch(
 
         if result.output is None and result.output_file_paths is None:
             error_msg = result.error or "Unknown error"
-            if result.error_status_code is not None:
-                raise HTTPException(
-                    status_code=result.error_status_code,
-                    detail={"message": error_msg},
-                )
             raise RuntimeError(
                 f"Model generation returned no output. Error from scheduler: {error_msg}"
             )

@@ -347,7 +347,6 @@ class OutputBatch:
     rollout_trajectory_data: RolloutTrajectoryData | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
-    error_status_code: int | None = None
     output_file_paths: list[str] | None = None
 
     # logged metrics info, directly from Req.timings
