@@ -62,19 +62,6 @@ from sglang.srt.utils.network import NetworkAddress
 
 logger = init_logger(__name__)
 
-OOM_MSG = f"""
-OOM detected. Possible solutions:
-  - If the OOM occurs during loading:
-    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
-  - If the OOM occurs during runtime:
-    1. Enable SP and/or TP (in a multi-GPU setup)
-    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
-    3. Opt for a sparse-attention backend
-    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
-    5. Enable quantization (e.g. nunchaku)
-  Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
-"""
-
 
 def _get_module_device(module: torch.nn.Module) -> str:
     """Return best-effort device string for a module."""
@@ -671,6 +658,20 @@ class GPUWorker:
             }
 
 
+OOM_MSG = f"""
+OOM detected. Possible solutions:
+  - If the OOM occurs during loading:
+    1. Enable CPU offload for memory-intensive components, or use `--dit-layerwise-offload` for DiT
+  - If the OOM occurs during runtime:
+    1. Enable SP and/or TP (in a multi-GPU setup)
+    2. Reduce the number of output tokens by lowering resolution or decreasing `--num-frames`
+    3. Opt for a sparse-attention backend
+    4. Enable FSDP by `--use-fsdp-inference` (in a multi-GPU setup)
+    5. Enable quantization (e.g. nunchaku)
+  Or, open an issue on GitHub https://github.com/sgl-project/sglang/issues/new/choose
+"""
+
+
 def _oom_exceptions():
     # torch.OutOfMemoryError exists only in some PyTorch builds
     types = [torch.cuda.OutOfMemoryError]
@@ -729,7 +730,7 @@ def run_scheduler_process(
         )
         scheduler.event_loop()
     except _oom_exceptions() as _e:
-        logger.warning(f"{OOM_MSG}")
+        logger.warning(OOM_MSG)
         raise
     finally:
         # Clean up resources to speed up shutdown

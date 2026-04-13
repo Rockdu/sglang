@@ -5,7 +5,6 @@ import asyncio
 import os
 import pickle
 from collections import deque
-from copy import deepcopy
 from typing import Any, Callable, List
 
 import zmq
@@ -423,7 +422,7 @@ class Scheduler:
                                 f"Warmup req ({self._warmup_processed}/{self._warmup_total}) processing failed"
                             )
                         else:
-                            logger.info(f"Warmup req processing failed")
+                            logger.info("Warmup req processing failed")
 
                 # TODO: Support sending back to multiple identities if batched
                 self.return_result(output_batch, identities[0], is_warmup=is_warmup)
