@@ -630,7 +630,6 @@ def log_generation_timer(
             f"Pixel data generated successfully in {GREEN}%.2f{RESET} seconds",
             timer.duration,
         )
-
     except Exception as e:
         if request_idx is not None:
             logger.error(

@@ -260,7 +260,6 @@ async def process_generation_batch(
     batch,
 ) -> tuple[list[str], OutputBatch]:
     total_start_time = time.perf_counter()
-
     with log_generation_timer(logger, batch.prompt):
         result = await scheduler_client.forward([batch])
 
