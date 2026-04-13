@@ -32,9 +32,6 @@ from sglang.multimodal_gen.utils import align_to
 
 logger = init_logger(__name__)
 
-# Sentinel prefix for sleep-state errors, used by scheduler and HTTP layer.
-SLEEPING_ERROR_PREFIX = "[SLEEPING]"
-
 SAMPLING_PARAMS_FIELDS = {f.name for f in fields(SamplingParams)}
 
 
@@ -340,6 +337,7 @@ class OutputBatch:
     trajectory_latents: torch.Tensor | None = None
     trajectory_decoded: list[torch.Tensor] | None = None
     error: str | None = None
+    error_type: str | None = None
     output_file_paths: list[str] | None = None
 
     # logged metrics info, directly from Req.timings

@@ -10,6 +10,7 @@ from typing import Any, Callable, List
 import zmq
 
 from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
+from sglang.multimodal_gen.runtime.error_types import SLEEPING_ERROR_TYPE
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     _parse_size,
     save_image_to_path,
@@ -29,10 +30,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.pipelines_core import Req
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import (
-    SLEEPING_ERROR_PREFIX,
-    OutputBatch,
-)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.server_args import (
     PortArgs,
     ServerArgs,
@@ -148,7 +146,8 @@ class Scheduler:
         if self.worker.is_sleeping():
             return OutputBatch(
                 error="Cannot update weights while the server is sleeping. "
-                "Call resume_memory_occupation first."
+                "Call resume_memory_occupation first.",
+                error_type=SLEEPING_ERROR_TYPE,
             )
         req = reqs[0]
         success, message = self.worker.update_weights_from_disk(
@@ -170,7 +169,8 @@ class Scheduler:
     def _handle_generation(self, reqs: List[Req]):
         if self.worker.is_sleeping():
             return OutputBatch(
-                error=f"{SLEEPING_ERROR_PREFIX} Server is sleeping. Call resume_memory_occupation first."
+                error="Server is sleeping. Call resume_memory_occupation first.",
+                error_type=SLEEPING_ERROR_TYPE,
             )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
