@@ -74,11 +74,11 @@ async def get_weights_checksum(request: Request):
     return orjson_response(response.output, status_code=200)
 
 
-async def _handle_memory_occupation_request(
-    req: ReleaseMemoryOccupationReqInput | ResumeMemoryOccupationReqInput,
-):
+@router.post("/release_memory_occupation")
+async def release_memory_occupation():
+    """Release GPU memory occupation (sleep the engine)."""
     try:
-        response = await async_scheduler_client.forward(req)
+        response = await async_scheduler_client.forward(ReleaseMemoryOccupationReqInput())
     except Exception as e:
         return orjson_response({"success": False, "message": str(e)}, status_code=500)
 
@@ -97,13 +97,24 @@ async def _handle_memory_occupation_request(
     return orjson_response(payload, status_code=200 if success else 400)
 
 
-@router.post("/release_memory_occupation")
-async def release_memory_occupation():
-    """Release GPU memory occupation (sleep the engine)."""
-    return await _handle_memory_occupation_request(ReleaseMemoryOccupationReqInput())
-
-
 @router.post("/resume_memory_occupation")
 async def resume_memory_occupation():
     """Resume GPU memory occupation (wake the engine)."""
-    return await _handle_memory_occupation_request(ResumeMemoryOccupationReqInput())
+    try:
+        response = await async_scheduler_client.forward(ResumeMemoryOccupationReqInput())
+    except Exception as e:
+        return orjson_response({"success": False, "message": str(e)}, status_code=500)
+
+    if response.output is None:
+        status_code = response.error_status_code or 500
+        return orjson_response(
+            {
+                "success": False,
+                "message": response.error or "Unknown status",
+            },
+            status_code=status_code,
+        )
+
+    payload = response.output
+    success = bool(payload["success"])
+    return orjson_response(payload, status_code=200 if success else 400)
