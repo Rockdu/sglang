@@ -15,13 +15,13 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
     ModelTaskType,
 )
+from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
+    ZImageRolloutPipelineMixin,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_group,
     get_sp_parallel_rank,
     get_sp_world_size,
-)
-from sglang.multimodal_gen.runtime.post_training.pipeline_configs import (
-    ZImageRolloutPipelineMixin,
 )
 
 

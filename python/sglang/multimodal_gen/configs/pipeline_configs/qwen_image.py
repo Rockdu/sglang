@@ -18,10 +18,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
     maybe_unpad_latents,
     shard_rotary_emb_for_sp,
 )
-from sglang.multimodal_gen.runtime.models.vision_utils import resize
-from sglang.multimodal_gen.runtime.post_training.pipeline_configs import (
+from sglang.multimodal_gen.configs.post_training.pipeline_configs import (
     QwenImageRolloutPipelineMixin,
 )
+from sglang.multimodal_gen.runtime.models.vision_utils import resize
 from sglang.multimodal_gen.utils import calculate_dimensions
 
 
