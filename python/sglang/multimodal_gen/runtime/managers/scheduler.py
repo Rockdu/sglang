@@ -146,12 +146,6 @@ class Scheduler(SchedulerPostTrainingMixin):
         self._running = False
         return OutputBatch()
 
-    def _handle_get_weights_checksum(self, reqs: List[Any]) -> OutputBatch:
-        """Handle get_weights_checksum request."""
-        req = reqs[0]
-        checksums = self.worker.get_weights_checksum(module_names=req.module_names)
-        return OutputBatch(output=checksums)
-
     def _handle_generation(self, reqs: List[Req]):
         if self.worker.is_sleeping():
             raise RuntimeError(
