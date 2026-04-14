@@ -20,6 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
     UpdateWeightFromDiskReqInput,
+    UpdateWeightFromTensorReqInput,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     ListLorasReq,
@@ -101,6 +102,7 @@ class Scheduler(SchedulerPostTrainingMixin):
             ListLorasReq: self._handle_list_loras,
             ShutdownReq: self._handle_shutdown,
             UpdateWeightFromDiskReqInput: self._handle_update_weights_from_disk,
+            UpdateWeightFromTensorReqInput: self._handle_update_weights_from_tensor,
             GetWeightsChecksumReqInput: self._handle_get_weights_checksum,
             ReleaseMemoryOccupationReqInput: self._handle_release_memory_occupation,
             ResumeMemoryOccupationReqInput: self._handle_resume_memory_occupation,
