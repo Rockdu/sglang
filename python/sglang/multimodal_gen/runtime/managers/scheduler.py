@@ -144,9 +144,9 @@ class Scheduler:
     def _handle_update_weights_from_disk(self, reqs: List[Any]) -> OutputBatch:
         """Handle update_weights_from_disk request for RL workflows."""
         if self.worker.is_sleeping():
-            return OutputBatch(
-                error="Cannot update weights while the server is sleeping. "
-                "Call resume_memory_occupation first.",
+            raise RuntimeError(
+                "Cannot update weights while the server is sleeping. "
+                "Call resume_memory_occupation first."
             )
         req = reqs[0]
         success, message = self.worker.update_weights_from_disk(
@@ -167,8 +167,8 @@ class Scheduler:
 
     def _handle_generation(self, reqs: List[Req]):
         if self.worker.is_sleeping():
-            return OutputBatch(
-                error="Server is sleeping. Call resume_memory_occupation first.",
+            raise RuntimeError(
+                "Server is sleeping. Call resume_memory_occupation first."
             )
         warmup_reqs = [req for req in reqs if req.is_warmup]
         if warmup_reqs:
