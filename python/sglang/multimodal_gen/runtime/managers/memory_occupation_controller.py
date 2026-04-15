@@ -63,9 +63,15 @@ def _is_layerwise_offload_managed(module: torch.nn.Module) -> bool:
 
 
 class MemoryOccupationController:
-    def __init__(self, pipeline: ComposedPipelineBase | None, rank: int):
+    def __init__(
+        self,
+        pipeline: ComposedPipelineBase | None,
+        rank: int,
+        use_fsdp_inference: bool,
+    ):
         self.pipeline = pipeline
         self.rank = rank
+        self.use_fsdp_inference = use_fsdp_inference
         self._sleeping = False
         self._sleep_restore_map: dict[str, str] = {}
 
@@ -151,6 +157,8 @@ class MemoryOccupationController:
                 success=True,
                 message="already sleeping",
             )
+        if self.use_fsdp_inference:
+            raise RuntimeError("sleep/wake does not support FSDP inference")
         if self.pipeline is None:
             return self._memory_occupation_result(
                 success=False,

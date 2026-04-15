@@ -97,6 +97,7 @@ class GPUWorker:
         self.memory_occupation = MemoryOccupationController(
             pipeline=self.pipeline,
             rank=self.rank,
+            use_fsdp_inference=self.server_args.use_fsdp_inference,
         )
 
     def is_sleeping(self) -> bool:
