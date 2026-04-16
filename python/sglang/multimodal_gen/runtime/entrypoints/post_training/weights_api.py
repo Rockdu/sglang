@@ -77,7 +77,9 @@ async def get_weights_checksum(request: Request):
 async def release_memory_occupation():
     """Release GPU memory occupation (sleep the engine)."""
     try:
-        response = await async_scheduler_client.forward(ReleaseMemoryOccupationReqInput())
+        response = await async_scheduler_client.forward(
+            ReleaseMemoryOccupationReqInput()
+        )
     except Exception as e:
         return orjson_response({"success": False, "message": str(e)}, status_code=500)
 
@@ -99,7 +101,9 @@ async def release_memory_occupation():
 async def resume_memory_occupation():
     """Resume GPU memory occupation (wake the engine)."""
     try:
-        response = await async_scheduler_client.forward(ResumeMemoryOccupationReqInput())
+        response = await async_scheduler_client.forward(
+            ResumeMemoryOccupationReqInput()
+        )
     except Exception as e:
         return orjson_response({"success": False, "message": str(e)}, status_code=500)
 
