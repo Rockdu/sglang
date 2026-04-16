@@ -94,14 +94,19 @@ class GPUWorker:
         self.cfg_group = get_cfg_group()
         self.cfg_cpu_group = self.cfg_group.cpu_group
 
-        self.memory_occupation = MemoryOccupationController(
-            pipeline=self.pipeline,
-            rank=self.rank,
-            use_fsdp_inference=self.server_args.use_fsdp_inference,
-        )
+        self.memory_occupation: MemoryOccupationController | None = None
 
     def is_sleeping(self) -> bool:
-        return self.memory_occupation.is_sleeping()
+        return self.memory_occupation.is_sleeping() if self.memory_occupation else False
+
+    def _get_memory_occupation(self) -> MemoryOccupationController:
+        if self.memory_occupation is None:
+            self.memory_occupation = MemoryOccupationController(
+                pipeline=self.pipeline,
+                rank=self.rank,
+                use_fsdp_inference=self.server_args.use_fsdp_inference,
+            )
+        return self.memory_occupation
 
     def init_device_and_model(self) -> None:
         """Initialize the device and load the model."""
@@ -475,9 +480,15 @@ class GPUWorker:
         return checksums
 
     def release_memory_occupation(self) -> dict:
-        return self.memory_occupation.release_memory_occupation()
+        return self._get_memory_occupation().release_memory_occupation()
 
     def resume_memory_occupation(self) -> dict:
+        if self.memory_occupation is None:
+            return {
+                "success": True,
+                "sleeping": False,
+                "message": "already awake",
+            }
         return self.memory_occupation.resume_memory_occupation()
 
 
