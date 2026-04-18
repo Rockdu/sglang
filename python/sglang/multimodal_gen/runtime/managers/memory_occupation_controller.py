@@ -4,7 +4,9 @@ import gc
 
 import torch
 
-from sglang.multimodal_gen.runtime.loader.weights_updater import get_updatable_modules
+from sglang.multimodal_gen.runtime.post_training.weights_updater import (
+    get_updatable_modules,
+)
 from sglang.multimodal_gen.runtime.pipelines_core import ComposedPipelineBase
 from sglang.multimodal_gen.runtime.utils.layerwise_offload import OffloadableDiTMixin
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
