@@ -52,6 +52,12 @@ class RolloutDitTrajectory:
     # final denoised latent x_{t_T} (last scheduler.step output).
     latents: torch.Tensor | None = None
     timesteps: torch.Tensor | None = None  # [T]
+    # Full scheduler.sigmas tensor at rollout time. Stored so the training
+    # side can reuse them verbatim instead of recomputing as
+    # `timesteps / num_train_timesteps`, which round-trips fp32 through
+    # `σ * 1000 / 1000` and drifts 1-2 ULPs — that drift then propagates
+    # to prev_sample_mean and amplifies to ~3e-5 log_prob diff.
+    sigmas: torch.Tensor | None = None  # [T+1] (post-shift, includes terminal 0)
 
 
 @dataclass

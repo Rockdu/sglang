@@ -118,6 +118,7 @@ def _slice_rollout_trajectory_for_sample(
         dit_trajectory = RolloutDitTrajectory(
             latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
             timesteps=dit.timesteps,
+            sigmas=dit.sigmas,
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
@@ -170,6 +171,7 @@ def _serialize_rollout_trajectory(
                 _maybe_serialize(dit.latents) if dit.latents is not None else None
             ),
             "timesteps": serialized_dit_timesteps,
+            "sigmas": _maybe_serialize(dit.sigmas) if dit.sigmas is not None else None,
         }
     return (
         serialized_log_probs,

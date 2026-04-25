@@ -14,7 +14,7 @@ import sys
 import tempfile
 from dataclasses import field
 from enum import Enum
-from typing import Any, Optional
+from typing import Any, Literal, Optional
 
 import addict
 import yaml
@@ -183,6 +183,11 @@ class ServerArgs:
 
     disable_autocast: bool | None = None
 
+    # DiT forward compute dtype. When set to "fp32", autocast is forced off and
+    # the DiT runs in pure fp32 (slow but deterministic). Default None =
+    # preserve per-pipeline default (typically bf16).
+    dit_dtype: Literal["bf16", "fp16", "fp32"] | None = None
+
     # Quantization / Nunchaku SVDQuant configuration
     nunchaku_config: NunchakuSVDQuantArgs | NunchakuConfig | None = field(
         default_factory=NunchakuSVDQuantArgs, repr=False
@@ -260,6 +265,7 @@ class ServerArgs:
         self._adjust_parallelism()
         self._adjust_attention_backend()
         self._adjust_platform_specific()
+        self._adjust_dtype()
         self._adjust_autocast()
         self.adjust_pipeline_config()
 
@@ -567,6 +573,19 @@ class ServerArgs:
     def _adjust_autocast(self):
         if self.disable_autocast is None:
             self.disable_autocast = not self.pipeline_config.enable_autocast
+
+    def _adjust_dtype(self):
+        """`dit_dtype` is a DiT-only override (not text encoder / VAE / adapter).
+
+        Previously we overrode pipeline_config.dit_precision here, but several
+        unrelated loaders (bridge, adapter, text-encoder under diffusers
+        pipeline) also read dit_precision and would incorrectly switch to fp32,
+        breaking bf16-specialized custom kernels (e.g. sgl's fused RMSNorm in
+        Qwen2.5-VL text encoder). Now the override is read directly at the
+        DiT-specific callsites (transformer_load_utils._resolve_target_param_dtype
+        and DenoisingStage target_dtype). No-op here; kept for call-site hook.
+        """
+        pass
 
     def _parse_attention_backend_config(self, config_str: str) -> dict[str, Any]:
         """parse attention backend config from string."""

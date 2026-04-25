@@ -17,7 +17,10 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import
     SchedulerRLDebugMixin,
 )
 
-_LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
+# Match flow_grpo's `torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))`
+# tensor-op form bit-exactly (see sd3_sde_with_logprob.py:67). Using a
+# pre-computed Python scalar would broadcast-subtract and round differently.
+_LOG_SQRT_2PI_TENSOR = torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
 
 
 class SchedulerRLMixin(SchedulerRLDebugMixin):
@@ -170,13 +173,16 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 batch, model_output, generator
             )
             full_variance_noise = rollout_session_data.noise_buffer
+            # Match flow_grpo `sigma == 1` (sd3_sde_with_logprob.py:50), not
+            # torch.isclose — at σ ≈ 1 (first denoising step) they round
+            # different values to the sigma_max branch.
             std_dev_t = (
                 torch.sqrt(
                     current_sigma
                     / (
                         1
                         - torch.where(
-                            torch.isclose(current_sigma, current_sigma.new_tensor(1.0)),
+                            current_sigma == 1,
                             rollout_session_data.sigma_max,
                             current_sigma,
                         )
@@ -194,7 +200,9 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
 
             weighted_variance_noise = variance_noise * noise_std_dev
             prev_sample = prev_sample_mean + weighted_variance_noise
-            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
+            # Match flow_grpo's `(prev_sample - prev_sample_mean)**2` bit-
+            # exactly (sd3_sde_with_logprob.py:65).
+            log_prob_no_const_val = -((prev_sample - prev_sample_mean) ** 2)
 
         elif effective_sde_type == "cps":
             model_output = model_output.float()
@@ -213,7 +221,8 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
 
             weighted_variance_noise = variance_noise * noise_std_dev
             prev_sample = prev_sample_mean + weighted_variance_noise
-            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
+            # Same rationale as the sde branch above.
+            log_prob_no_const_val = -((prev_sample - prev_sample_mean) ** 2)
 
         elif effective_sde_type == "ode":
             prev_sample = sample + dt * model_output
@@ -238,19 +247,33 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             raise ValueError(f"Unsupported sde_type: {sde_type}")
 
         reduce_dims = list(range(1, len(log_prob_no_const_val.shape)))
-        local_elem_count = log_prob_no_const_val.new_full(
-            (log_prob_no_const_val.shape[0],),
-            float(math.prod(log_prob_no_const_val.shape[1:])),
+        # Match flow_grpo: per-element formula then mean along non-batch dims.
+        # Stored as "sum" with count=1 so collect_rollout_log_probs (which
+        # does sum/count) preserves the mean.
+        log_const_tensor = _LOG_SQRT_2PI_TENSOR.to(
+            log_prob_no_const_val.device, log_prob_no_const_val.dtype
         )
 
         if log_prob_no_const or effective_sde_type == "ode":
-            log_prob_local_sum = log_prob_no_const_val.sum(dim=reduce_dims)
+            log_prob_local_sum = log_prob_no_const_val.mean(dim=reduce_dims)
         else:
             log_prob_local_sum = (
                 log_prob_no_const_val / (2 * (noise_std_dev**2))
                 - torch.log(noise_std_dev)
-                - _LOG_SQRT_2PI
-            ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
+                - log_const_tensor
+            ).mean(dim=reduce_dims)
+        local_elem_count = torch.ones_like(log_prob_local_sum)
+        # DEBUG: print rollout-side computed log_prob values at 8 decimals
+        # to compare vs training's stored + recomputed path.
+        print(
+            f"[rollout-local log_prob] sde_type={effective_sde_type} "
+            f"sample_0={log_prob_local_sum.flatten()[0].item():.8e} "
+            f"nsd={noise_std_dev.flatten()[0].item():.8e} "
+            f"lpnc_norm={log_prob_no_const_val.norm().item():.8e} "
+            f"psm_norm={prev_sample_mean.norm().item():.8e} "
+            f"ps_norm={prev_sample.norm().item():.8e}",
+            flush=True,
+        )
 
         if debug_mode:
             self.append_local_rollout_debug_tensors(
