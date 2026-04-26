@@ -56,11 +56,9 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             next_sigma=next_sigma,
             generator=torch.Generator(device=sample.device).manual_seed(1),
         )
-        log_prob_local_sum, local_elem_count = (
-            scheduler.consume_local_rollout_log_probs(batch)
+        log_prob_local_sum = scheduler.consume_local_rollout_log_probs(batch).squeeze(
+            -1
         )
-        log_prob_local_sum = log_prob_local_sum.squeeze(-1)
-        local_elem_count = local_elem_count.squeeze(-1)
 
         expected_prev = sample + (next_sigma - current_sigma) * model_output
         self.assertTrue(torch.allclose(prev_sample, expected_prev, atol=1e-6, rtol=0.0))
@@ -68,8 +66,6 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             torch.allclose(log_prob_local_sum, torch.zeros_like(log_prob_local_sum))
         )
         self.assertEqual(tuple(log_prob_local_sum.shape), (sample.shape[0],))
-        self.assertEqual(tuple(local_elem_count.shape), (sample.shape[0],))
-        self.assertTrue(torch.all(local_elem_count == float(sample[0].numel())))
 
     def test_ode_bit_exact_with_non_rollout_path(self):
         """ODE rollout must produce the exact same prev_sample as the
@@ -372,7 +368,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 next_sigma=next_sigma,
                 generator=g,
             )
-            log_prob, _count = scheduler.consume_local_rollout_log_probs(batch)
+            log_prob = scheduler.consume_local_rollout_log_probs(batch)
             self.assertEqual(
                 log_prob.dtype,
                 torch.float32,
@@ -458,7 +454,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         self.assertEqual(variance_noise_call_count["n"], 1)
         self.assertFalse(torch.allclose(prev_1, expected_ode, atol=1e-3))
 
-        log_prob, elem_count = scheduler.consume_local_rollout_log_probs(batch)
+        log_prob = scheduler.consume_local_rollout_log_probs(batch)
         self.assertEqual(tuple(log_prob.shape), (shape[0], 2))
         # Filtered step contributes zero log-prob; real SDE step does not.
         self.assertTrue(
@@ -467,9 +463,6 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         self.assertFalse(
             torch.allclose(log_prob[:, 1], torch.zeros_like(log_prob[:, 1]))
         )
-        # elem_count dimension must be preserved for both steps so downstream
-        # consume_local_rollout_log_probs stacking stays consistent.
-        self.assertTrue(torch.all(elem_count > 0))
 
         # --- Part 2: rollout_return_step_indices gates dit trajectory append ---
         class _DummyDit(RolloutDenoisingMixin):

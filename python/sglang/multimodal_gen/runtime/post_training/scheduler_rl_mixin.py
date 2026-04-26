@@ -58,7 +58,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """Get or create the reusable noise buffer (local or full shape) for rollout."""
+        """Get or create the reusable full pre-shard noise buffer for rollout."""
         buffer = rollout_session_data.noise_buffer
         if (
             buffer is None
@@ -162,15 +162,12 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         # 0-dim-fp32 wrapped-scalar promotion demoting log-prob to bf16.
         # ode: keep dtypes unchanged so rollout(ode) stays bit-exact with
         # rollout=False (scheduling_flow_match_euler_discrete.step()).
-        # log_prob is computed on the full pre-shard noise buffer so SP ranks
-        # produce identical sums — see collect_rollout_log_probs().
         if effective_sde_type == "sde":
             model_output = model_output.float()
             sample = sample.float()
             variance_noise = self._rollout_variance_noise(
                 batch, model_output, generator
             )
-            full_variance_noise = rollout_session_data.noise_buffer
             # Match flow_grpo `sigma == 1` (sd3_sde_with_logprob.py:50)
             std_dev_t = (
                 torch.sqrt(
@@ -206,7 +203,6 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             variance_noise = self._rollout_variance_noise(
                 batch, model_output, generator
             )
-            full_variance_noise = rollout_session_data.noise_buffer
             std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
             noise_std_dev = std_dev_t
             pred_original_sample = sample - current_sigma * model_output
@@ -284,6 +280,6 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         rollout_session_data.local_log_probs = []
         return log_probs
 
-    def collect_rollout_log_probs(self, batch: Req) -> torch.Tensor | None:
+    def collect_rollout_log_probs(self, batch: Req) -> torch.Tensor:
         trajectory_log_probs = self.consume_local_rollout_log_probs(batch)
         return trajectory_log_probs.cpu()
