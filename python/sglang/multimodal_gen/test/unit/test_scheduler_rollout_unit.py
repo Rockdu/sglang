@@ -289,11 +289,10 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     next_sigma=next_sigma,
                     generator=g,
                 )
-                log_prob_sum, elem_count = scheduler.consume_local_rollout_log_probs(
+                log_probs = scheduler.consume_local_rollout_log_probs(
                     batch
                 )
-                log_prob_sum = log_prob_sum.squeeze(-1)
-                elem_count = elem_count.squeeze(-1)
+                log_prob = log_probs.squeeze(-1)
                 (
                     _variance_noises,
                     prev_sample_means,
@@ -314,8 +313,6 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                     )
                 )
 
-                log_prob_mean = log_prob_sum / elem_count
-
                 errs = {
                     "prev_sample": float((prev_sgl - prev_ref).abs().max().item()),
                     "prev_sample_mean": float(
@@ -327,9 +324,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                         .max()
                         .item()
                     ),
-                    "log_prob": float(
-                        (log_prob_mean - log_prob_ref).abs().max().item()
-                    ),
+                    "log_prob": float((log_prob - log_prob_ref).abs().max().item()),
                 }
 
                 for name, err in errs.items():
@@ -377,11 +372,11 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
                 next_sigma=next_sigma,
                 generator=g,
             )
-            log_prob_sum, _count = scheduler.consume_local_rollout_log_probs(batch)
+            log_prob, _count = scheduler.consume_local_rollout_log_probs(batch)
             self.assertEqual(
-                log_prob_sum.dtype,
+                log_prob.dtype,
                 torch.float32,
-                msg=f"{sde_type}: log_prob_sum must be fp32 with bf16 model_output",
+                msg=f"{sde_type}: log_prob must be fp32 with bf16 model_output",
             )
             noise_buffer = scheduler._get_rollout_session_data(batch).noise_buffer
             self.assertEqual(
@@ -463,14 +458,14 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         self.assertEqual(variance_noise_call_count["n"], 1)
         self.assertFalse(torch.allclose(prev_1, expected_ode, atol=1e-3))
 
-        log_prob_sum, elem_count = scheduler.consume_local_rollout_log_probs(batch)
-        self.assertEqual(tuple(log_prob_sum.shape), (shape[0], 2))
+        log_prob, elem_count = scheduler.consume_local_rollout_log_probs(batch)
+        self.assertEqual(tuple(log_prob.shape), (shape[0], 2))
         # Filtered step contributes zero log-prob; real SDE step does not.
         self.assertTrue(
-            torch.allclose(log_prob_sum[:, 0], torch.zeros_like(log_prob_sum[:, 0]))
+            torch.allclose(log_prob[:, 0], torch.zeros_like(log_prob[:, 0]))
         )
         self.assertFalse(
-            torch.allclose(log_prob_sum[:, 1], torch.zeros_like(log_prob_sum[:, 1]))
+            torch.allclose(log_prob[:, 1], torch.zeros_like(log_prob[:, 1]))
         )
         # elem_count dimension must be preserved for both steps so downstream
         # consume_local_rollout_log_probs stacking stays consistent.

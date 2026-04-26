@@ -430,10 +430,4 @@ def _resolve_target_param_dtype(
 ) -> Optional[torch.dtype]:
     if quant_config is not None or nunchaku_config is not None:
         return None
-    # ServerArgs.dit_dtype is a DiT-only override (leaves text encoder / VAE /
-    # adapter dtypes untouched so sgl-specialized bf16 kernels in those
-    # modules keep working).
-    dit_override = getattr(server_args, "dit_dtype", None)
-    if dit_override is not None and dit_override in PRECISION_TO_TYPE:
-        return PRECISION_TO_TYPE[dit_override]
     return PRECISION_TO_TYPE[server_args.pipeline_config.dit_precision]

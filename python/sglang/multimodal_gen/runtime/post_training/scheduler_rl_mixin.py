@@ -18,8 +18,6 @@ from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import
 )
 
 # Match flow_grpo's `torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))`
-# tensor-op form bit-exactly (see sd3_sde_with_logprob.py:67). Using a
-# pre-computed Python scalar would broadcast-subtract and round differently.
 _LOG_SQRT_2PI_TENSOR = torch.log(torch.sqrt(2 * torch.as_tensor(math.pi)))
 
 
@@ -173,9 +171,7 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 batch, model_output, generator
             )
             full_variance_noise = rollout_session_data.noise_buffer
-            # Match flow_grpo `sigma == 1` (sd3_sde_with_logprob.py:50), not
-            # torch.isclose — at σ ≈ 1 (first denoising step) they round
-            # different values to the sigma_max branch.
+            # Match flow_grpo `sigma == 1` (sd3_sde_with_logprob.py:50)
             std_dev_t = (
                 torch.sqrt(
                     current_sigma
@@ -247,33 +243,19 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             raise ValueError(f"Unsupported sde_type: {sde_type}")
 
         reduce_dims = list(range(1, len(log_prob_no_const_val.shape)))
-        # Match flow_grpo: per-element formula then mean along non-batch dims.
-        # Stored as "sum" with count=1 so collect_rollout_log_probs (which
-        # does sum/count) preserves the mean.
+        # Match flow_grpo per-element formula then mean along non-batch dims.
         log_const_tensor = _LOG_SQRT_2PI_TENSOR.to(
             log_prob_no_const_val.device, log_prob_no_const_val.dtype
         )
 
         if log_prob_no_const or effective_sde_type == "ode":
-            log_prob_local_sum = log_prob_no_const_val.mean(dim=reduce_dims)
+            log_prob_local = log_prob_no_const_val.mean(dim=reduce_dims)
         else:
-            log_prob_local_sum = (
+            log_prob_local = (
                 log_prob_no_const_val / (2 * (noise_std_dev**2))
                 - torch.log(noise_std_dev)
                 - log_const_tensor
             ).mean(dim=reduce_dims)
-        local_elem_count = torch.ones_like(log_prob_local_sum)
-        # DEBUG: print rollout-side computed log_prob values at 8 decimals
-        # to compare vs training's stored + recomputed path.
-        print(
-            f"[rollout-local log_prob] sde_type={effective_sde_type} "
-            f"sample_0={log_prob_local_sum.flatten()[0].item():.8e} "
-            f"nsd={noise_std_dev.flatten()[0].item():.8e} "
-            f"lpnc_norm={log_prob_no_const_val.norm().item():.8e} "
-            f"psm_norm={prev_sample_mean.norm().item():.8e} "
-            f"ps_norm={prev_sample.norm().item():.8e}",
-            flush=True,
-        )
 
         if debug_mode:
             self.append_local_rollout_debug_tensors(
@@ -284,35 +266,24 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
                 model_output=model_output,
             )
 
-        self.append_local_rollout_log_probs(batch, log_prob_local_sum, local_elem_count)
+        self.append_local_rollout_log_probs(batch, log_prob_local)
 
         return prev_sample
 
     def append_local_rollout_log_probs(
-        self, batch, log_prob_sum: torch.Tensor, log_prob_count: torch.Tensor
+        self, batch, log_prob: torch.Tensor
     ) -> None:
         rollout_session_data = self._get_rollout_session_data(batch)
-        rollout_session_data.local_log_prob_sum.append(log_prob_sum)
-        rollout_session_data.local_log_prob_count.append(log_prob_count)
+        rollout_session_data.local_log_probs.append(log_prob)
 
     def consume_local_rollout_log_probs(
         self, batch
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         rollout_session_data = self._get_rollout_session_data(batch)
-        # [B, T]: batch dim 0, denoising step dim 1
-        values_sum = torch.stack(rollout_session_data.local_log_prob_sum, dim=1)
-        values_count = torch.stack(rollout_session_data.local_log_prob_count, dim=1)
-        rollout_session_data.local_log_prob_sum = []
-        rollout_session_data.local_log_prob_count = []
-        return values_sum, values_count
+        log_probs = torch.stack(rollout_session_data.local_log_probs, dim=1)
+        rollout_session_data.local_log_probs = []
+        return log_probs
 
     def collect_rollout_log_probs(self, batch: Req) -> torch.Tensor | None:
-        """Per-step sums are already computed on the full pre-shard noise
-        buffer inside flow_sde_sampling, so every SP rank holds identical
-        values here and no all-reduce is needed."""
-
-        trajectory_log_prob_sum, trajectory_log_prob_count = (
-            self.consume_local_rollout_log_probs(batch)
-        )
-        rollout_log_probs_tensor = trajectory_log_prob_sum / trajectory_log_prob_count
-        return rollout_log_probs_tensor.cpu()
+        trajectory_log_probs = self.consume_local_rollout_log_probs(batch)
+        return trajectory_log_probs.cpu()

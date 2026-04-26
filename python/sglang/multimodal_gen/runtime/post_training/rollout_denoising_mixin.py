@@ -175,18 +175,9 @@ class RolloutDenoisingMixin:
                 batch=batch,
                 stacked_latents=step_latents_tensor,
             )
-            # Snapshot scheduler.sigmas so the training side can reuse them
-            # bit-exactly instead of recomputing from timesteps (that path
-            # round-trips σ * 1000 / 1000 and drifts 1-2 fp32 ULPs).
-            sigmas_tensor = (
-                self.scheduler.sigmas.detach().cpu()
-                if getattr(self.scheduler, "sigmas", None) is not None
-                else None
-            )
             batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
                 latents=step_latents_tensor.cpu(),
                 timesteps=torch.stack(step_timesteps, dim=0).cpu(),
-                sigmas=sigmas_tensor,
             )
 
         if env is not None and batch.rollout_return_denoising_env:
