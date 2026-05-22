@@ -58,7 +58,7 @@ class ResumeMemoryOccupationReqInput:
 class RolloutRequest(BaseModel):
     prompt: str
     negative_prompt: Optional[str] = None
-    seed: int = 1024
+    seed: Optional[int] = None
     generator_device: str = "cuda"
 
     width: Optional[int] = None
