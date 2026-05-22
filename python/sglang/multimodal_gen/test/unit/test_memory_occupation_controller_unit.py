@@ -30,7 +30,14 @@ class _FakeEnabledManager:
 class _ToSpyModule(torch.nn.Module):
     """Base class that records every `to(device)` invocation in `to_calls`.
     Used by both fake module types so the test can verify the layerwise-managed
-    module's device is never touched and the plain module is moved to 'cpu'."""
+    module's device is never touched and the plain module is moved to 'cpu'.
+
+    `to()` is overridden to ONLY record the requested device and return self,
+    without delegating to `nn.Module.to`. This keeps the test CPU-safe: a real
+    `super().to('cuda:0')` from `resume_memory_occupation` would otherwise fail
+    on a CPU-only runner where CUDA is not available. The spy is sufficient
+    because the assertions are about the call sequence, not the tensor device
+    state after the move."""
 
     def __init__(self):
         super().__init__()
@@ -38,7 +45,7 @@ class _ToSpyModule(torch.nn.Module):
 
     def to(self, device, *args, **kwargs):  # type: ignore[override]
         self.to_calls.append(str(device))
-        return super().to(device, *args, **kwargs)
+        return self
 
 
 class _FakeLayerwiseManagedModule(LayerwiseOffloadableModuleMixin, _ToSpyModule):
