@@ -27,13 +27,27 @@ class _FakeEnabledManager:
     enabled = True
 
 
-class _FakeLayerwiseManagedModule(LayerwiseOffloadableModuleMixin, torch.nn.Module):
+class _ToSpyModule(torch.nn.Module):
+    """Base class that records every `to(device)` invocation in `to_calls`.
+    Used by both fake module types so the test can verify the layerwise-managed
+    module's device is never touched and the plain module is moved to 'cpu'."""
+
     def __init__(self):
-        torch.nn.Module.__init__(self)
+        super().__init__()
+        self.to_calls: list[str] = []
+
+    def to(self, device, *args, **kwargs):  # type: ignore[override]
+        self.to_calls.append(str(device))
+        return super().to(device, *args, **kwargs)
+
+
+class _FakeLayerwiseManagedModule(LayerwiseOffloadableModuleMixin, _ToSpyModule):
+    def __init__(self):
+        _ToSpyModule.__init__(self)
         self.layerwise_offload_managers = [_FakeEnabledManager()]
 
 
-class _PlainModule(torch.nn.Module):
+class _PlainModule(_ToSpyModule):
     def __init__(self):
         super().__init__()
         self.weight = torch.nn.Parameter(torch.zeros(1))
@@ -52,7 +66,15 @@ class TestMemoryOccupationControllerLayerwiseSkip(unittest.TestCase):
             use_fsdp_inference=False,
         )
 
-    def test_layerwise_managed_module_skipped_release(self):
+    def test_release_moves_plain_module_to_cpu_and_skips_layerwise(self):
+        """Behavior assertion: after release_memory_occupation,
+        - the plain module's recorded `to()` invocation is to 'cpu', AND
+        - the layerwise-managed module's `to()` is never invoked.
+
+        Also asserts the controller's restore map remembers the plain module's
+        source device ('cuda:0', supplied via the patched _get_module_device)
+        so a subsequent resume_memory_occupation will return it to the right
+        device."""
         controller = self._make_controller()
         plain = _PlainModule()
         layerwise = _FakeLayerwiseManagedModule()
@@ -68,20 +90,59 @@ class TestMemoryOccupationControllerLayerwiseSkip(unittest.TestCase):
             "sglang.multimodal_gen.runtime.managers.memory_occupation_controller._get_module_device",
             return_value="cuda:0",
         ), patch.object(
-            MemoryOccupationController, "_move_modules", autospec=True
-        ) as move_mock, patch.object(
             MemoryOccupationController, "_clear_torch_device_cache", autospec=True
         ):
+            # _move_modules NOT patched — real implementation runs and calls
+            # plain.to("cpu") while leaving the layerwise module untouched.
             result = controller.release_memory_occupation()
 
         self.assertTrue(result["success"])
         self.assertTrue(result["sleeping"])
         self.assertEqual(controller._sleep_restore_map, {"plain": "cuda:0"})
-        move_mock.assert_called_once()
-        moved_names = move_mock.call_args.args[1]
-        self.assertEqual(moved_names, ["plain"])
+        # Behavior: plain module was moved to CPU exactly once
+        self.assertEqual(plain.to_calls, ["cpu"])
+        # Behavior: layerwise-managed module was never moved
+        self.assertEqual(layerwise.to_calls, [])
 
-    def test_layerwise_managed_module_skipped_predicate_check(self):
+    def test_resume_restores_plain_module_to_source_device(self):
+        """Round-trip behavior: a release_memory_occupation followed by a
+        resume_memory_occupation must invoke .to('cuda:0') on the plain
+        module (its recorded source device) and still leave the
+        layerwise-managed module untouched."""
+        controller = self._make_controller()
+        plain = _PlainModule()
+        layerwise = _FakeLayerwiseManagedModule()
+        fake_modules = {
+            "plain": plain,
+            "layerwise": layerwise,
+        }
+
+        # Pre-load the restore map as if a release already happened, then
+        # patch _move_modules to a real call-through for the resume.
+        with patch(
+            "sglang.multimodal_gen.runtime.managers.memory_occupation_controller.get_updatable_modules",
+            return_value=fake_modules,
+        ), patch(
+            "sglang.multimodal_gen.runtime.managers.memory_occupation_controller._get_module_device",
+            return_value="cuda:0",
+        ), patch.object(
+            MemoryOccupationController, "_clear_torch_device_cache", autospec=True
+        ):
+            controller.release_memory_occupation()
+            # Clear the recorded sleep-time .to() so the assertion below is
+            # unambiguous about the resume-path call.
+            plain.to_calls.clear()
+            result = controller.resume_memory_occupation()
+
+        self.assertTrue(result["success"])
+        self.assertFalse(result["sleeping"])
+        self.assertEqual(plain.to_calls, ["cuda:0"])
+        self.assertEqual(layerwise.to_calls, [])
+
+    def test_predicate_directly(self):
+        """Direct predicate sanity check: the upstream
+        is_layerwise_offloaded_module helper must return True for our fake
+        managed module and False for a plain torch.nn.Module."""
         from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (  # noqa: I001
             is_layerwise_offloaded_module,
         )
