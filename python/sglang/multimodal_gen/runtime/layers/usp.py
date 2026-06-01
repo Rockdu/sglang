@@ -33,15 +33,38 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+class _AllToAllSingle(torch.autograd.Function):
+    """Even-split all_to_all_single, made autograd-aware for training (Ulysses backward).
+
+    ft_c.all_to_all_single has no registered autograd kernel, so gradients silently stop
+    there. An even-split all_to_all is an involution (its own inverse), so the adjoint is the
+    same collective on the upstream gradient. Inference (no_grad) never calls backward, so this
+    is transparent to the rollout path.
+    """
+
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        return _maybe_wait(
+            ft_c.all_to_all_single(x, output_split_sizes=None, input_split_sizes=None, group=group)
+        )
+
+    @staticmethod
+    def backward(ctx, grad):
+        grad = _maybe_wait(
+            ft_c.all_to_all_single(
+                grad.contiguous(), output_split_sizes=None, input_split_sizes=None, group=ctx.group
+            )
+        )
+        return grad, None
+
+
 def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten()
-    x = ft_c.all_to_all_single(
-        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
-    )
-    x = _maybe_wait(x)
+    x = _AllToAllSingle.apply(x, ulysses_pg)
     x = x.reshape(x_shape)
     return x
 
