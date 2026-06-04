@@ -392,5 +392,10 @@ def compute_weights_checksum(
         # DTensor doesn't support .numpy(); extract the local tensor.
         if isinstance(t, DTensor):
             t = t._local_tensor
+        # Cover dtype + shape, not only raw bytes: a transpose/reshape that
+        # keeps the same element count and dtype is byte-identical but
+        # semantically wrong, and would otherwise pass a bytes-only checksum.
+        hasher.update(str(t.dtype).encode())
+        hasher.update(str(tuple(t.shape)).encode())
         hasher.update(t.cpu().contiguous().reshape(-1).view(torch.uint8).numpy().data)
     return hasher.hexdigest()
