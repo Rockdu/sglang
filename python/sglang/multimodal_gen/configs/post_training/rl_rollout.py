@@ -11,7 +11,7 @@ from typing import Any, Callable
 
 from sglang.multimodal_gen.utils import StoreBoolean
 
-_VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode")
+_VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode", "flow_sde")
 
 
 @dataclass
@@ -21,6 +21,7 @@ class RLRolloutArgs:
     rollout: bool = False
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
+    rollout_sigma_min: float | None = None
     rollout_log_prob_no_const: bool = False
     rollout_debug_mode: bool = False
 
@@ -50,6 +51,7 @@ class RLRolloutArgs:
             rollout=params.rollout,
             rollout_sde_type=params.rollout_sde_type,
             rollout_noise_level=params.rollout_noise_level,
+            rollout_sigma_min=getattr(params, "rollout_sigma_min", None),
             rollout_log_prob_no_const=params.rollout_log_prob_no_const,
             rollout_debug_mode=params.rollout_debug_mode,
         ).validate()
@@ -112,6 +114,7 @@ class RLRolloutArgs:
             rollout_noise_level=float(
                 kwargs.get("rollout_noise_level", cls.rollout_noise_level)
             ),
+            rollout_sigma_min=kwargs.get("rollout_sigma_min", cls.rollout_sigma_min),
             rollout_log_prob_no_const=bool(
                 kwargs.get("rollout_log_prob_no_const", cls.rollout_log_prob_no_const)
             ),

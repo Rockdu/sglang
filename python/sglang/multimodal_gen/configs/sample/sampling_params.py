@@ -181,6 +181,7 @@ class SamplingParams:
     rollout: bool = False
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
+    rollout_sigma_min: float | None = None
     rollout_log_prob_no_const: bool = False  # exclude constants in rollout logprob
     rollout_debug_mode: bool = (
         False  # return rollout debug tensors (intermediate states)
