@@ -46,13 +46,22 @@ class LTX2TextConnectorStage(PipelineStage):
             )
 
         # Handle CFG: Concatenate negative and positive inputs
+        need_guider_negatives = bool(
+            (batch.extra or {}).get("ltx2_stage1_guider_params")
+        )
         if batch.do_classifier_free_guidance:
-
             # Concatenate: [Negative, Positive]
             prompt_embeds = torch.cat([neg_prompt_embeds, prompt_embeds], dim=0)
             prompt_attention_mask = torch.cat(
                 [neg_prompt_attention_mask, prompt_attention_mask], dim=0
             )
+        elif need_guider_negatives and neg_prompt_embeds is not None:
+            # LTX guider path needs separate negative video/audio contexts even
+            # when diffusers-style CFG is disabled (guidance_scale == 1).
+            pass
+        else:
+            neg_prompt_embeds = None
+            neg_prompt_attention_mask = None
 
         # Prepare additive mask for connectors (as per Diffusers implementation)
         dtype = prompt_embeds.dtype
@@ -80,6 +89,18 @@ class LTX2TextConnectorStage(PipelineStage):
             batch.audio_prompt_embeds = [pos_audio_embeds]
             batch.prompt_attention_mask = pos_mask
 
+            batch.negative_prompt_embeds = [neg_embeds]
+            batch.negative_audio_prompt_embeds = [neg_audio_embeds]
+            batch.negative_attention_mask = neg_mask
+        elif need_guider_negatives and neg_prompt_embeds is not None:
+            neg_additive_mask = (1 - neg_prompt_attention_mask.to(dtype)) * -1000000.0
+            with set_forward_context(current_timestep=None, attn_metadata=None):
+                neg_embeds, neg_audio_embeds, neg_mask = self.connectors(
+                    neg_prompt_embeds, neg_additive_mask, additive_mask=True
+                )
+            batch.prompt_embeds = [connector_prompt_embeds]
+            batch.audio_prompt_embeds = [connector_audio_prompt_embeds]
+            batch.prompt_attention_mask = connector_mask
             batch.negative_prompt_embeds = [neg_embeds]
             batch.negative_audio_prompt_embeds = [neg_audio_embeds]
             batch.negative_attention_mask = neg_mask

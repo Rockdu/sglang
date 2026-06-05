@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pickle
 from typing import TYPE_CHECKING
+
+import pybase64
+import torch
 
 from sglang.multimodal_gen.runtime.distributed import get_tp_rank, get_tp_world_size
 from sglang.multimodal_gen.runtime.loader.weight_utils import compute_weights_checksum
@@ -22,6 +26,18 @@ if TYPE_CHECKING:
         UpdateWeightFromTensorCheckerReqInput,
         UpdateWeightFromTensorReqInput,
     )
+
+
+def _decode_cpu_flattened_bucket_payload(payload: str) -> dict:
+    cpu_payload = pickle.loads(pybase64.b64decode(payload))
+    flattened_tensor_data: dict = {}
+    for module_name, module_payload in cpu_payload.items():
+        raw = pybase64.b64decode(module_payload["flattened_tensor_b64"])
+        flattened_tensor_data[module_name] = {
+            "flattened_tensor": torch.frombuffer(bytearray(raw), dtype=torch.uint8).clone(),
+            "metadata": module_payload["metadata"],
+        }
+    return flattened_tensor_data
 
 
 class GPUWorkerPostTrainingMixin:
@@ -59,16 +75,24 @@ class GPUWorkerPostTrainingMixin:
         if error is not None:
             return False, error
 
-        monkey_patch_torch_reductions()
-        try:
-            named_tensors = MultiprocessingSerializer.deserialize(payload)
-        except Exception as e:
-            return False, f"Failed to deserialize serialized_named_tensors: {e}"
+        load_format = req.load_format
+        if load_format == "flattened_bucket_cpu":
+            try:
+                named_tensors = _decode_cpu_flattened_bucket_payload(payload)
+            except Exception as e:
+                return False, f"Failed to deserialize serialized_named_tensors: {e}"
+            load_format = "flattened_bucket"
+        else:
+            monkey_patch_torch_reductions()
+            try:
+                named_tensors = MultiprocessingSerializer.deserialize(payload)
+            except Exception as e:
+                return False, f"Failed to deserialize serialized_named_tensors: {e}"
 
         updater = WeightsUpdater(self.pipeline)
         return updater.update_weights_from_tensor(
             named_tensors=named_tensors,
-            load_format=req.load_format,
+            load_format=load_format,
             target_modules=req.target_modules,
         )
 

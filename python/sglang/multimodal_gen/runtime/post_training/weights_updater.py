@@ -470,16 +470,28 @@ class WeightsUpdater:
 
         converted_metadata: list[FlattenedTensorMetadata] = []
         for meta in metadata:
-            converted_metadata.append(
-                FlattenedTensorMetadata(
-                    name=meta.name,
-                    shape=torch.Size(meta.shape),
-                    dtype=self._normalize_torch_dtype(meta.dtype),
-                    start_idx=int(meta.start_idx),
-                    end_idx=int(meta.end_idx),
-                    numel=int(meta.numel),
+            if isinstance(meta, dict):
+                converted_metadata.append(
+                    FlattenedTensorMetadata(
+                        name=meta["name"],
+                        shape=torch.Size(meta["shape"]),
+                        dtype=self._normalize_torch_dtype(meta["dtype"]),
+                        start_idx=int(meta["start_idx"]),
+                        end_idx=int(meta["end_idx"]),
+                        numel=int(meta["numel"]),
+                    )
                 )
-            )
+            else:
+                converted_metadata.append(
+                    FlattenedTensorMetadata(
+                        name=meta.name,
+                        shape=torch.Size(meta.shape),
+                        dtype=self._normalize_torch_dtype(meta.dtype),
+                        start_idx=int(meta.start_idx),
+                        end_idx=int(meta.end_idx),
+                        numel=int(meta.numel),
+                    )
+                )
 
         bucket = FlattenedTensorBucket(
             flattened_tensor=flattened_tensor,
