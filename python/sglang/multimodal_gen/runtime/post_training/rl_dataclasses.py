@@ -52,6 +52,8 @@ class RolloutDitTrajectory:
     # final denoised latent x_{t_T} (last scheduler.step output).
     latents: torch.Tensor | None = None
     timesteps: torch.Tensor | None = None  # [T]
+    # Full noise schedule [T+1]; sigmas[i+1] is sigma_next for denoising step i.
+    sigmas: torch.Tensor | None = None
 
 
 @dataclass

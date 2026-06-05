@@ -175,9 +175,24 @@ class RolloutDenoisingMixin:
                 batch=batch,
                 stacked_latents=step_latents_tensor,
             )
+            sigmas_snapshot = None
+            scheduler = getattr(self, "scheduler", None)
+            scheduler_sigmas = (
+                getattr(scheduler, "sigmas", None) if scheduler is not None else None
+            )
+            if isinstance(scheduler_sigmas, torch.Tensor):
+                sigmas_snapshot = scheduler_sigmas.detach().cpu().float()
+            timesteps_tensor = torch.stack(step_timesteps, dim=0).cpu()
+            if (
+                sigmas_snapshot is not None
+                and sigmas_snapshot.numel() == timesteps_tensor.numel() + 1
+            ):
+                # LTX stores raw sigma in timesteps; keep aligned with miles trainer-rollout.
+                timesteps_tensor = sigmas_snapshot[:-1]
             batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
                 latents=step_latents_tensor.cpu(),
-                timesteps=torch.stack(step_timesteps, dim=0).cpu(),
+                timesteps=timesteps_tensor,
+                sigmas=sigmas_snapshot,
             )
 
         if env is not None and batch.rollout_return_denoising_env:
