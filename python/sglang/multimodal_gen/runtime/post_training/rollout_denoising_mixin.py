@@ -192,7 +192,6 @@ class RolloutDenoisingMixin:
             batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
                 latents=step_latents_tensor.cpu(),
                 timesteps=timesteps_tensor,
-                sigmas=sigmas_snapshot,
             )
 
         if env is not None and batch.rollout_return_denoising_env:

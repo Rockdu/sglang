@@ -126,7 +126,6 @@ def _slice_rollout_trajectory_for_sample(
         dit_trajectory = RolloutDitTrajectory(
             latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
             timesteps=dit.timesteps,
-            sigmas=dit.sigmas,
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
@@ -179,9 +178,6 @@ def _serialize_rollout_trajectory(
                 _maybe_serialize(dit.latents) if dit.latents is not None else None
             ),
             "timesteps": serialized_dit_timesteps,
-            "sigmas": (
-                _maybe_serialize(dit.sigmas) if dit.sigmas is not None else None
-            ),
         }
     return (
         serialized_log_probs,
@@ -281,7 +277,6 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         rollout=request.rollout,
         rollout_sde_type=request.rollout_sde_type,
         rollout_noise_level=request.rollout_noise_level,
-        rollout_sigma_min=request.rollout_sigma_min,
         rollout_log_prob_no_const=request.rollout_log_prob_no_const,
         rollout_debug_mode=request.rollout_debug_mode,
         rollout_return_denoising_env=request.rollout_return_denoising_env,
