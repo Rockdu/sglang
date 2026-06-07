@@ -56,17 +56,6 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
     def already_prepared_rollout(self, batch) -> bool:
         return getattr(batch, "_rollout_session_data", None) is not None
 
-    @staticmethod
-    def _resolve_flow_sde_sigma_min(batch, sigmas: torch.Tensor) -> float:
-        override = getattr(batch, "rollout_sigma_min", None)
-        if override == 0.0:
-            override = None
-        if override is not None:
-            return float(override)
-        if len(sigmas) > 1:
-            return max(sigmas[-2].float().item(), 1e-4)
-        return 1e-4
-
     def _get_or_create_rollout_noise_buffer(
         self,
         rollout_session_data: RolloutSessionData,
@@ -164,11 +153,6 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             log_prob_no_const=log_prob_no_const,
         )
 
-        sigma_min = (
-            self._resolve_flow_sde_sigma_min(batch, self.sigmas)
-            if effective_sde_type == "flow_sde"
-            else None
-        )
         sigma_max = (
             rollout_session_data.sigma_max
             if effective_sde_type == "sde"
@@ -183,7 +167,6 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             next_sigma,
             noise_level=noise_level,
             sigma_max=sigma_max,
-            sigma_min=sigma_min,
         )
 
         if coeffs.use_fp32_inputs:

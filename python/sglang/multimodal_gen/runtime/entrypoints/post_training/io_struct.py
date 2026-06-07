@@ -76,7 +76,6 @@ class RolloutRequest(BaseModel):
     rollout: bool = True
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
-    rollout_sigma_min: float | None = None
     rollout_log_prob_no_const: bool = False
     rollout_debug_mode: bool = True
 

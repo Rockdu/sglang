@@ -25,7 +25,7 @@ import torch
 
 _LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
-CANONICAL_DYNAMICS_TYPES = ("sde", "flow_sde", "cps", "ode", "dance_sde")
+CANONICAL_DYNAMICS_TYPES = ("sde", "cps", "ode", "dance_sde")
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,6 @@ class FlowDynamicsStep(ABC):
         *,
         noise_level: float,
         sigma_max: float,
-        sigma_min: float | None = None,
     ) -> FlowStepCoeffs:
         """Return ``(prev_sample_mean, noise_std)``; caller draws ε and samples."""
 
@@ -107,9 +106,7 @@ class SD3SdeStep(FlowDynamicsStep):
         *,
         noise_level: float,
         sigma_max: float,
-        sigma_min: float | None = None,
     ) -> FlowStepCoeffs:
-        del sigma_min
         model_output = model_output.float()
         sample = sample.float()
         current_sigma = current_sigma.float()
@@ -137,63 +134,6 @@ class SD3SdeStep(FlowDynamicsStep):
             * (1 + std_dev_t**2 * (1 - current_sigma) / (2 * current_sigma))
             * dt
         )
-        return FlowStepCoeffs(
-            prev_sample_mean=prev_sample_mean,
-            noise_std_dev=noise_std_dev,
-            use_fp32_inputs=True,
-            is_deterministic=False,
-        )
-
-
-class FlowSdeStep(FlowDynamicsStep):
-    """LTX / verl Flow-SDE (linear σ_min↔σ_max noise interpolation).
-
-    .. math::
-
-        \\sigma_t = (\\sigma_{\\min} + (\\sigma_{\\max} - \\sigma_{\\min}) \\cdot \\sigma) \\cdot \\eta
-
-        \\text{mean} = x \\cdot \\text{drift\\_x} + v \\cdot \\text{drift\\_v}
-
-        \\text{noise\\_std} = \\sigma_t \\sqrt{-\\Delta\\sigma}
-
-    Full Gaussian log-prob.  Requires ``sigma_min`` (scheduler or batch override).
-    """
-
-    name = "flow_sde"
-    default_log_prob_no_const = False
-    supported_on_rollout = True
-
-    def step_coeffs(
-        self,
-        model_output: torch.Tensor,
-        sample: torch.Tensor,
-        current_sigma: torch.Tensor,
-        next_sigma: torch.Tensor,
-        *,
-        noise_level: float,
-        sigma_max: float,
-        sigma_min: float | None = None,
-    ) -> FlowStepCoeffs:
-        if sigma_min is None:
-            raise ValueError("flow_sde requires sigma_min")
-
-        model_output = model_output.float()
-        sample = sample.float()
-        current_sigma = current_sigma.float()
-        next_sigma = next_sigma.float()
-        dt = next_sigma - current_sigma
-
-        std_dev_t = (
-            sigma_min + (sigma_max - sigma_min) * current_sigma
-        ) * noise_level
-        sigma_safe = torch.clamp(current_sigma, min=1e-8)
-        drift_sample = 1.0 + std_dev_t**2 / (2.0 * sigma_safe) * dt
-        drift_model = (
-            1.0 + std_dev_t**2 * (1.0 - current_sigma) / (2.0 * sigma_safe)
-        ) * dt
-        prev_sample_mean = sample * drift_sample + model_output * drift_model
-        noise_std_dev = std_dev_t * torch.sqrt(torch.clamp(-dt, min=1e-12))
-
         return FlowStepCoeffs(
             prev_sample_mean=prev_sample_mean,
             noise_std_dev=noise_std_dev,
@@ -231,9 +171,8 @@ class CpsStep(FlowDynamicsStep):
         *,
         noise_level: float,
         sigma_max: float,
-        sigma_min: float | None = None,
     ) -> FlowStepCoeffs:
-        del sigma_max, sigma_min
+        del sigma_max
         model_output = model_output.float()
         sample = sample.float()
         current_sigma = current_sigma.float()
@@ -278,9 +217,8 @@ class OdeStep(FlowDynamicsStep):
         *,
         noise_level: float,
         sigma_max: float,
-        sigma_min: float | None = None,
     ) -> FlowStepCoeffs:
-        del noise_level, sigma_max, sigma_min
+        del noise_level, sigma_max
         dt = next_sigma - current_sigma
         prev_sample_mean = sample + dt * model_output
         noise_std_dev = torch.zeros(
@@ -323,9 +261,8 @@ class DanceSdeStep(FlowDynamicsStep):
         *,
         noise_level: float,
         sigma_max: float,
-        sigma_min: float | None = None,
     ) -> FlowStepCoeffs:
-        del sigma_max, sigma_min
+        del sigma_max
         model_output = model_output.float()
         sample = sample.float()
         current_sigma = current_sigma.float()
@@ -356,14 +293,12 @@ class DanceSdeStep(FlowDynamicsStep):
 
 # Singleton instances — import and call ``CPS.step_coeffs(...)`` directly if helpful.
 SD3_SDE = SD3SdeStep()
-FLOW_SDE = FlowSdeStep()
 CPS = CpsStep()
 ODE = OdeStep()
 DANCE_SDE = DanceSdeStep()
 
 FLOW_DYNAMICS_BY_NAME: dict[str, FlowDynamicsStep] = {
     SD3_SDE.name: SD3_SDE,
-    FLOW_SDE.name: FLOW_SDE,
     CPS.name: CPS,
     ODE.name: ODE,
     DANCE_SDE.name: DANCE_SDE,
@@ -377,7 +312,7 @@ ROLLOUT_DYNAMICS_TYPES = tuple(
 
 
 def normalize_dynamics_type(name: str) -> str:
-    """Map CLI / legacy aliases (``Flow-SDE``, ``CPS``, …) to canonical names."""
+    """Map CLI / legacy aliases (``CPS``, …) to canonical names."""
     key = str(name).strip().lower().replace("-", "_")
     if key not in FLOW_DYNAMICS_BY_NAME:
         raise ValueError(
@@ -418,7 +353,6 @@ def compute_flow_step_coeffs(
     *,
     noise_level: float,
     sigma_max: float,
-    sigma_min: float | None = None,
 ) -> FlowStepCoeffs:
     """Dispatch to the concrete dynamics class for ``dynamics_type``."""
     return get_flow_dynamics(dynamics_type).step_coeffs(
@@ -428,7 +362,6 @@ def compute_flow_step_coeffs(
         next_sigma,
         noise_level=noise_level,
         sigma_max=sigma_max,
-        sigma_min=sigma_min,
     )
 
 

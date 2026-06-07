@@ -213,29 +213,6 @@ def _flowgrpo_sde_step_with_logprob(
 
         log_prob = -((prev_sample.detach() - prev_sample_mean) ** 2)
 
-    elif sde_type == "flow_sde":
-        sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
-        sigma_max = sigmas[0].item()
-        sigma_min = max(sigmas[-2].item(), 1e-4)
-        std_dev_t = (sigma_min + (sigma_max - sigma_min) * sigma) * noise_level
-        sigma_safe = torch.clamp(sigma, min=1e-8)
-
-        drift_sample = 1.0 + std_dev_t**2 / (2.0 * sigma_safe) * dt
-        drift_model = (
-            1.0 + std_dev_t**2 * (1.0 - sigma) / (2.0 * sigma_safe)
-        ) * dt
-        prev_sample_mean = sample * drift_sample + model_output * drift_model
-
-        noise_std_dev = std_dev_t * torch.sqrt(torch.clamp(-dt, min=1e-12))
-        prev_sample = prev_sample_mean + noise_std_dev * variance_noise
-
-        log_prob = (
-            -((prev_sample.detach() - prev_sample_mean) ** 2)
-            / (2.0 * noise_std_dev**2 + 1e-12)
-            - torch.log(noise_std_dev + 1e-12)
-            - 0.5 * math.log(2.0 * math.pi)
-        )
-
     else:
         raise ValueError(f"Unsupported sde_type: {sde_type}")
 
@@ -244,7 +221,7 @@ def _flowgrpo_sde_step_with_logprob(
 
 
 # FlowGRPO convention: SDE uses full Gaussian log-prob, CPS uses no_const.
-_FLOWGRPO_LOG_PROB_NO_CONST = {"sde": False, "cps": True, "flow_sde": False}
+_FLOWGRPO_LOG_PROB_NO_CONST = {"sde": False, "cps": True}
 
 
 class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
@@ -279,7 +256,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             shard_latents_for_sp=lambda _batch, latents: (latents, False)
         )
 
-        for sde_type in ("sde", "cps", "flow_sde"):
+        for sde_type in ("sde", "cps"):
             for seed in (0, 1, 2, 3):
                 batch = self._build_batch(sde_type=sde_type, shape=shape)
                 scheduler.release_rollout_resources(batch)
@@ -377,7 +354,7 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
             shard_latents_for_sp=lambda batch, latents: (latents, False)
         )
 
-        for sde_type in ("sde", "cps", "flow_sde"):
+        for sde_type in ("sde", "cps"):
             batch = self._build_batch(sde_type=sde_type, shape=shape)
             scheduler.release_rollout_resources(batch)
             scheduler.prepare_rollout(batch=batch, pipeline_config=pipeline_config)
