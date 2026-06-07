@@ -83,11 +83,8 @@ class TextEncodingStage(PipelineStage):
             for am in prompt_masks_list:
                 batch.prompt_attention_mask.append(am)
 
-        # Encode negative prompt if CFG is enabled, or LTX guider path needs it.
-        need_negative_embeds = batch.do_classifier_free_guidance or bool(
-            (batch.extra or {}).get("ltx2_stage1_guider_params")
-        )
-        if need_negative_embeds:
+        # Encode negative prompt if CFG is enabled
+        if batch.do_classifier_free_guidance:
             assert isinstance(batch.negative_prompt, str)
             neg_embeds_list, neg_masks_list, neg_pooler_embeds_list = self.encode_text(
                 batch.negative_prompt,
