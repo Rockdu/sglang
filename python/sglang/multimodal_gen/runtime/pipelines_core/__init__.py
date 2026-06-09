@@ -48,7 +48,6 @@ def build_pipeline(
         from sglang.multimodal_gen.registry import (
             _PIPELINE_REGISTRY,
             _discover_and_register_pipelines,
-            _get_config_info,
         )
 
         _discover_and_register_pipelines()
@@ -62,16 +61,6 @@ def build_pipeline(
                 f"Pipeline class '{server_args.pipeline_class_name}' not found in registry. "
                 f"Available pipelines: {list(_PIPELINE_REGISTRY.keys())}"
             )
-
-        # Also resolve the pipeline_config from the model_path registry so that
-        # component loaders (e.g. text_encoder_loader) have the correct configs.
-        config_info = _get_config_info(model_path, model_id=server_args.model_id)
-        if config_info is not None:
-            server_args.pipeline_config = config_info.pipeline_config_cls()
-            logger.info(
-                f"✓ Resolved pipeline_config: {config_info.pipeline_config_cls.__name__}"
-            )
-
         logger.info(
             f"✓ Using explicitly specified pipeline: {server_args.pipeline_class_name} (class: {pipeline_cls.__name__})"
         )
