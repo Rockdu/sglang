@@ -675,15 +675,6 @@ class LTX2DenoisingStage(DenoisingStage):
                     clean_latent_background=clean_latent_background,
                 )
             )
-        if batch.rollout and batch.rollout_return_denoising_env:
-            ctx.pos_cond_kwargs = dict(ctx.pos_cond_kwargs)
-            if batch.audio_prompt_embeds:
-                ctx.pos_cond_kwargs["audio_encoder_hidden_states"] = (
-                    batch.audio_prompt_embeds[0]
-                )
-            attn_mask = batch.prompt_attention_mask
-            if attn_mask is not None:
-                ctx.pos_cond_kwargs["audio_encoder_attention_mask"] = attn_mask
         return ctx
 
     def _before_denoising_loop(
