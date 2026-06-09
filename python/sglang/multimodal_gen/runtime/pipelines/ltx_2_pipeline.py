@@ -3,8 +3,6 @@ import os
 
 import numpy as np
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler as DiffusersFlowMatchEulerDiscreteScheduler
-
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )

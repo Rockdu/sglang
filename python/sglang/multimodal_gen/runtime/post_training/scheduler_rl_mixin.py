@@ -10,20 +10,14 @@ from sglang.multimodal_gen.runtime.distributed import (
     get_sp_world_size,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
-from sglang.multimodal_gen.runtime.post_training.flow_dynamics import (
-    aggregate_log_prob_sum,
-    compute_flow_step_coeffs,
-    log_prob_no_const_from_noise,
-    resolve_effective_dynamics_type,
-    validate_ode_log_prob_config,
-    validate_rollout_noise_level,
-)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutSessionData,
 )
 from sglang.multimodal_gen.runtime.post_training.scheduler_rl_debug_mixin import (
     SchedulerRLDebugMixin,
 )
+
+_LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
 
 
 class SchedulerRLMixin(SchedulerRLDebugMixin):
@@ -129,8 +123,11 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
     ) -> torch.Tensor:
         """Flow rollout step for log-prob / sampling (see FlowGRPO-style references).
 
-        Dynamics kernels live in :mod:`flow_dynamics`; this method wires them to
-        rollout noise buffers, step-index gating, and log-prob accumulation.
+        ``rollout_sde_type`` (from batch SamplingParams):
+
+        1. ``"sde"``: Standard stochastic differential equation transition (Gaussian).
+        2. ``"cps"``: Coupled Particle Sampling.
+        3. ``"ode"``: Deterministic ODE step (no diffusion noise).
         """
         rollout_session_data = self._get_rollout_session_data(batch)
         sde_type = batch.rollout_sde_type
@@ -138,73 +135,122 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         log_prob_no_const = batch.rollout_log_prob_no_const
         debug_mode = bool(getattr(batch, "rollout_debug_mode", False))
 
-        validate_rollout_noise_level(
-            noise_level, sde_type, log_prob_no_const=log_prob_no_const
-        )
+        if not log_prob_no_const and sde_type != "ode":
+            assert (
+                noise_level > 0
+            ), "True log-probability computation requires a non-zero noise level."
 
-        effective_sde_type = resolve_effective_dynamics_type(
-            sde_type,
-            loop_step_index=getattr(batch, "_rollout_loop_step_index", None),
-            sde_step_indices=getattr(batch, "rollout_sde_step_indices", None),
-        )
-        validate_ode_log_prob_config(
-            sde_type,
-            effective_sde_type,
-            log_prob_no_const=log_prob_no_const,
-        )
+        dt = next_sigma - current_sigma
 
-        sigma_max = (
-            rollout_session_data.sigma_max
-            if effective_sde_type == "sde"
-            else self.sigmas[0].float().item()
-        )
+        # step_index comes from the denoising-loop counter stashed by
+        # DenoisingStage — scheduler._step_index would differ when
+        # _begin_index != 0 (e.g. partial denoising).
+        sde_step_indices = getattr(batch, "rollout_sde_step_indices", None)
+        loop_step_index = getattr(batch, "_rollout_loop_step_index", None)
+        if (
+            sde_type != "ode"
+            and sde_step_indices is not None
+            and loop_step_index is not None
+            and loop_step_index not in sde_step_indices
+        ):
+            effective_sde_type = "ode"
+        else:
+            effective_sde_type = sde_type
 
-        coeffs = compute_flow_step_coeffs(
-            effective_sde_type,
-            model_output,
-            sample,
-            current_sigma,
-            next_sigma,
-            noise_level=noise_level,
-            sigma_max=sigma_max,
-        )
-
-        if coeffs.use_fp32_inputs:
+        # sde/cps: cast to fp32 to match flowGRPO semantics and avoid the
+        # 0-dim-fp32 wrapped-scalar promotion demoting log-prob to bf16.
+        # ode: keep dtypes unchanged so rollout(ode) stays bit-exact with
+        # rollout=False (scheduling_flow_match_euler_discrete.step()).
+        # log_prob is computed on the full pre-shard noise buffer so SP ranks
+        # produce identical sums — see collect_rollout_log_probs().
+        if effective_sde_type == "sde":
             model_output = model_output.float()
             sample = sample.float()
+            variance_noise = self._rollout_variance_noise(
+                batch, model_output, generator
+            )
+            full_variance_noise = rollout_session_data.noise_buffer
+            std_dev_t = (
+                torch.sqrt(
+                    current_sigma
+                    / (
+                        1
+                        - torch.where(
+                            torch.isclose(current_sigma, current_sigma.new_tensor(1.0)),
+                            rollout_session_data.sigma_max,
+                            current_sigma,
+                        )
+                    )
+                )
+                * noise_level
+            )
+            noise_std_dev = std_dev_t * torch.sqrt(-1 * dt)
+            prev_sample_mean = (
+                sample * (1 + std_dev_t**2 / (2 * current_sigma) * dt)
+                + model_output
+                * (1 + std_dev_t**2 * (1 - current_sigma) / (2 * current_sigma))
+                * dt
+            )
 
-        if coeffs.is_deterministic:
-            prev_sample = coeffs.prev_sample_mean
-            prev_sample_mean = coeffs.prev_sample_mean
+            weighted_variance_noise = variance_noise * noise_std_dev
+            prev_sample = prev_sample_mean + weighted_variance_noise
+            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
+
+        elif effective_sde_type == "cps":
+            model_output = model_output.float()
+            sample = sample.float()
+            variance_noise = self._rollout_variance_noise(
+                batch, model_output, generator
+            )
+            full_variance_noise = rollout_session_data.noise_buffer
+            std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
+            noise_std_dev = std_dev_t
+            pred_original_sample = sample - current_sigma * model_output
+            noise_estimate = sample + model_output * (1 - current_sigma)
+            prev_sample_mean = pred_original_sample * (
+                1 - next_sigma
+            ) + noise_estimate * torch.sqrt(next_sigma**2 - std_dev_t**2)
+
+            weighted_variance_noise = variance_noise * noise_std_dev
+            prev_sample = prev_sample_mean + weighted_variance_noise
+            log_prob_no_const_val = -((full_variance_noise * noise_std_dev) ** 2)
+
+        elif effective_sde_type == "ode":
+            prev_sample = sample + dt * model_output
+            prev_sample_mean = prev_sample
             variance_noise = torch.zeros_like(model_output)
-            noise_std_dev = coeffs.noise_std_dev
+            noise_std_dev = torch.zeros(
+                (), device=model_output.device, dtype=model_output.dtype
+            )
             log_prob_no_const_val = torch.zeros(
                 rollout_session_data.latents_shape,
                 device=model_output.device,
                 dtype=torch.float32,
             )
-        else:
-            variance_noise = self._rollout_variance_noise(
-                batch, model_output, generator
-            )
-            full_variance_noise = rollout_session_data.noise_buffer
-            noise_std_dev = coeffs.noise_std_dev
-            prev_sample_mean = coeffs.prev_sample_mean
-            prev_sample = prev_sample_mean + variance_noise * noise_std_dev
-            log_prob_no_const_val = log_prob_no_const_from_noise(
-                full_variance_noise, noise_std_dev
-            )
+            # Only enforce the "no full log-prob with ODE" constraint when the
+            # user explicitly chose ODE globally.
+            if sde_type == "ode":
+                assert (
+                    log_prob_no_const
+                ), "p_ode is always 0, true log_prob is meaningless, set rollout_log_prob_no_const to True to enable log_prob computation"
 
-        log_prob_local_sum = aggregate_log_prob_sum(
-            log_prob_no_const_val,
-            noise_std_dev,
-            log_prob_no_const=log_prob_no_const,
-            dynamics_type=effective_sde_type,
-        )
+        else:
+            raise ValueError(f"Unsupported sde_type: {sde_type}")
+
+        reduce_dims = list(range(1, len(log_prob_no_const_val.shape)))
         local_elem_count = log_prob_no_const_val.new_full(
             (log_prob_no_const_val.shape[0],),
             float(math.prod(log_prob_no_const_val.shape[1:])),
         )
+
+        if log_prob_no_const or effective_sde_type == "ode":
+            log_prob_local_sum = log_prob_no_const_val.sum(dim=reduce_dims)
+        else:
+            log_prob_local_sum = (
+                log_prob_no_const_val / (2 * (noise_std_dev**2))
+                - torch.log(noise_std_dev)
+                - _LOG_SQRT_2PI
+            ).sum(dim=list(range(1, len(log_prob_no_const_val.shape))))
 
         if debug_mode:
             self.append_local_rollout_debug_tensors(

@@ -82,71 +82,6 @@ class LTX2DenoisingStage(DenoisingStage):
             {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
-    def _apply_video_latent_update(
-        self,
-        *,
-        batch: Req,
-        step: DenoisingStepState,
-        latents: torch.Tensor,
-        model_output: torch.Tensor,
-        dt: torch.Tensor,
-    ) -> torch.Tensor:
-        """Update video latents; use scheduler SDE rollout when ``batch.rollout``."""
-        if batch.rollout:
-            self.scheduler._step_index = step.step_index
-            return self.scheduler.step(
-                model_output,
-                step.t_device,
-                latents,
-                return_dict=False,
-                **self._scheduler_step_kwargs(batch),
-            )[0]
-        return (latents.float() + model_output.float() * dt).to(dtype=latents.dtype)
-
-    def _attach_ltx_rollout_cond_kwargs(
-        self,
-        ctx: LTX2DenoisingContext,
-        batch: Req,
-    ) -> None:
-        if not (batch.rollout and batch.rollout_return_denoising_env):
-            return
-        ctx.pos_cond_kwargs = dict(ctx.pos_cond_kwargs)
-        denoise_mask = ctx.denoise_mask
-        clean_latent = ctx.clean_latent
-        if (
-            denoise_mask is None
-            and isinstance(ctx.latents, torch.Tensor)
-            and ctx.latents.ndim == 3
-        ):
-            batch_size, seq_len, _ = ctx.latents.shape
-            denoise_mask = torch.ones(
-                batch_size,
-                seq_len,
-                1,
-                device=ctx.latents.device,
-                dtype=torch.float32,
-            )
-            clean_latent = torch.zeros_like(ctx.latents)
-        if denoise_mask is not None:
-            ctx.pos_cond_kwargs["ltx_denoise_mask"] = denoise_mask
-            ctx.pos_cond_kwargs["denoise_mask"] = denoise_mask
-        if clean_latent is not None:
-            ctx.pos_cond_kwargs["ltx_clean_latent"] = clean_latent
-            ctx.pos_cond_kwargs["clean_latent"] = clean_latent
-        transformer = self.transformer
-        rope = getattr(transformer, "rope", None) if transformer is not None else None
-        if rope is not None and hasattr(rope, "prepare_video_coords"):
-            positions = rope.prepare_video_coords(
-                batch_size=int(ctx.latents.shape[0]),
-                num_frames=ctx.latent_num_frames_for_model,
-                height=ctx.latent_height,
-                width=ctx.latent_width,
-                device=ctx.latents.device,
-                fps=float(getattr(batch, "fps", 24.0) or 24.0),
-            )
-            ctx.pos_cond_kwargs["ltx_positions"] = positions
-            ctx.pos_cond_kwargs["positions"] = positions
-
     @staticmethod
     def _get_video_latent_num_frames_for_model(
         batch: Req, server_args: ServerArgs, latents: torch.Tensor
@@ -740,7 +675,15 @@ class LTX2DenoisingStage(DenoisingStage):
                     clean_latent_background=clean_latent_background,
                 )
             )
-        self._attach_ltx_rollout_cond_kwargs(ctx, batch)
+        if batch.rollout and batch.rollout_return_denoising_env:
+            ctx.pos_cond_kwargs = dict(ctx.pos_cond_kwargs)
+            if batch.audio_prompt_embeds:
+                ctx.pos_cond_kwargs["audio_encoder_hidden_states"] = (
+                    batch.audio_prompt_embeds[0]
+                )
+            attn_mask = batch.prompt_attention_mask
+            if attn_mask is not None:
+                ctx.pos_cond_kwargs["audio_encoder_attention_mask"] = attn_mask
         return ctx
 
     def _before_denoising_loop(
@@ -1555,12 +1498,8 @@ class LTX2DenoisingStage(DenoisingStage):
                 (ctx.audio_latents.float() - denoised_audio.float()) / sigma_val
             ).to(ctx.audio_latents.dtype)
 
-        ctx.latents = self._apply_video_latent_update(
-            batch=batch,
-            step=step,
-            latents=ctx.latents,
-            model_output=v_video,
-            dt=dt,
+        ctx.latents = (ctx.latents.float() + v_video.float() * dt).to(
+            dtype=ctx.latents.dtype
         )
         ctx.audio_latents = (ctx.audio_latents.float() + v_audio.float() * dt).to(
             dtype=ctx.audio_latents.dtype
