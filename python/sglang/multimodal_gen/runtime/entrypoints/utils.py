@@ -290,6 +290,10 @@ def prepare_request(
         VSA_sparsity=server_args.attention_backend_config.VSA_sparsity,
     )
     sampling_params.apply_request_extra(req)
+    # Req.sigmas is a Req-local field (always initialized), so SamplingParams
+    # delegation never reaches it — bridge the per-request schedule explicitly.
+    if sampling_params.sigmas is not None:
+        req.sigmas = [float(s) for s in sampling_params.sigmas]
 
     req.adjust_size(server_args)
 

@@ -159,6 +159,9 @@ class SamplingParams:
     guidance_rescale: float = 0.0
     cfg_normalization: float | bool = 0.0
     boundary_ratio: float | None = None
+    # Custom per-request sigma schedule (diffusers convention: the scheduler
+    # still applies its configured shift on top). None = scheduler default.
+    sigmas: list[float] | None = None
 
     # TeaCache parameters
     enable_teacache: bool = False
