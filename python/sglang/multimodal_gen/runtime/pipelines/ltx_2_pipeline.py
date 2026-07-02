@@ -3,7 +3,9 @@ import os
 
 import numpy as np
 import torch
-from diffusers import FlowMatchEulerDiscreteScheduler
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 
 from sglang.multimodal_gen.configs.pipeline_configs.ltx_2 import (
     is_ltx23_native_variant,

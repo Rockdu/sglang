@@ -76,6 +76,12 @@ class LTX2DenoisingStage(DenoisingStage):
         self._condition_image_encoder = None
         self._condition_image_encoder_dir = None
 
+    def _scheduler_step_kwargs(self, batch, scheduler) -> dict:
+        return self.prepare_extra_func_kwargs(
+            scheduler.step,
+            {"generator": batch.generator, "eta": batch.eta, "batch": batch},
+        )
+
     @staticmethod
     def _get_video_latent_num_frames_for_model(
         batch: Req, server_args: ServerArgs, latents: torch.Tensor
@@ -960,9 +966,19 @@ class LTX2DenoisingStage(DenoisingStage):
                     batch.guidance_scale * (model_audio_text - model_audio_uncond)
                 )
 
-            ctx.latents = self.scheduler.step(
-                model_video, step.t_device, ctx.latents, return_dict=False
-            )[0]
+            if batch.rollout:
+                self.scheduler._step_index = step.step_index
+                ctx.latents = self.scheduler.step(
+                    model_video,
+                    step.t_device,
+                    ctx.latents,
+                    return_dict=False,
+                    **self._scheduler_step_kwargs(batch, self.scheduler),
+                )[0]
+            else:
+                ctx.latents = self.scheduler.step(
+                    model_video, step.t_device, ctx.latents, return_dict=False
+                )[0]
             ctx.audio_latents = ctx.audio_scheduler.step(
                 model_audio, step.t_device, ctx.audio_latents, return_dict=False
             )[0]

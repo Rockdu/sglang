@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 from typing import Any
 
+import numpy as np
 import torch
 from safetensors.torch import load, save
 
@@ -21,6 +22,8 @@ def base64_to_tensor(s: str) -> torch.Tensor:
 
 
 def _maybe_serialize(obj: Any) -> Any:
+    if isinstance(obj, np.ndarray):
+        return _maybe_serialize(torch.from_numpy(obj))
     if isinstance(obj, torch.Tensor):
         return {
             "__tensor__": True,
