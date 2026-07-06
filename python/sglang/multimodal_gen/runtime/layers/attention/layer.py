@@ -393,6 +393,22 @@ class USPAttention(nn.Module):
 
         self.skip_sequence_parallel = skip_sequence_parallel
 
+    def _sdpa_local(self, q, k, v):
+        """Differentiable local attention for training: the jit FA kernels are
+        forward-only (backward silently produces no grads)."""
+        return (
+            torch.nn.functional.scaled_dot_product_attention(
+                q.transpose(1, 2),
+                k.transpose(1, 2),
+                v.transpose(1, 2),
+                dropout_p=self.dropout_p,
+                is_causal=self.causal,
+                scale=self.softmax_scale,
+            )
+            .transpose(1, 2)
+            .contiguous()
+        )
+
     def forward(
         self,
         q: torch.Tensor,
@@ -500,6 +516,10 @@ class USPAttention(nn.Module):
 
         if effective_skip_sp or get_sequence_parallel_world_size() == 1:
             # No sequence parallelism, just run local attention.
+            if torch.is_grad_enabled() and (
+                q.requires_grad or k.requires_grad or v.requires_grad
+            ):
+                return self._sdpa_local(q, k, v)
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
             return out
 
@@ -534,6 +554,10 @@ class USPAttention(nn.Module):
                 is_causal=self.causal,
                 dropout_p=self.dropout_p,
             )
+        elif torch.is_grad_enabled() and (
+            q.requires_grad or k.requires_grad or v.requires_grad
+        ):
+            out = self._sdpa_local(q, k, v)
         else:
             # -> [B, S, H_local, D]
             out = self.attn_impl.forward(q, k, v, ctx_attn_metadata)
