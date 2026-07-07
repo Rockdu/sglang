@@ -128,6 +128,11 @@ class Req:
     timestep: torch.Tensor | float | int | None = None
     step_index: int | None = None
 
+    # Request-bound scheduler set by the timestep preparation stage; stages
+    # after it read the scheduler from here so per-request choices
+    # (e.g. the RL rollout scheduler) take effect.
+    scheduler: Any | None = None
+
     eta: float = 0.0
     sigmas: list[float] | None = None
 

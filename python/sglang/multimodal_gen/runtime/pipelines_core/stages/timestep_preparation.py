@@ -24,13 +24,16 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
 )
+from sglang.multimodal_gen.runtime.post_training.rollout_timestep_mixin import (
+    RolloutTimestepPreparationMixin,
+)
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
 
-class TimestepPreparationStage(PipelineStage):
+class TimestepPreparationStage(PipelineStage, RolloutTimestepPreparationMixin):
     """
     Stage for preparing timesteps for the diffusion process.
 
@@ -44,9 +47,12 @@ class TimestepPreparationStage(PipelineStage):
         prepare_extra_set_timesteps_kwargs: list[
             Callable[[Req, ServerArgs], Tuple[str, Any]]
         ] = [],
+        rollout_scheduler=None,
     ) -> None:
         super().__init__()
         self.scheduler = scheduler
+        # See RolloutTimestepPreparationMixin.
+        self.rollout_scheduler = rollout_scheduler
         self.prepare_extra_set_timesteps_kwargs = (
             prepare_extra_set_timesteps_kwargs or []
         )
@@ -68,7 +74,8 @@ class TimestepPreparationStage(PipelineStage):
         Returns:
             The batch with prepared timesteps.
         """
-        scheduler = self.scheduler
+        rollout_template = self._resolve_rollout_scheduler(batch)
+        scheduler = rollout_template if rollout_template is not None else self.scheduler
         device = get_local_torch_device()
         num_inference_steps = batch.num_inference_steps
         timesteps = batch.timesteps
@@ -131,8 +138,12 @@ class TimestepPreparationStage(PipelineStage):
             )
             timesteps = scheduler.timesteps
 
+        if rollout_template is not None:
+            self._check_rollout_timesteps(scheduler)
+
         # Update batch with prepared timesteps
         batch.timesteps = timesteps
+        batch.scheduler = scheduler
         if not batch.is_warmup:
             self.log_debug("timesteps: %s", timesteps)
         return batch

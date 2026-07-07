@@ -116,6 +116,9 @@ class DenoisingContext:
     seq_len: int | None
     guidance: torch.Tensor
     is_warmup: bool
+    # Request-bound scheduler (batch.scheduler when set, else the stage
+    # module) — the denoising loop must not touch self.scheduler directly.
+    scheduler: Any
     trajectory_timesteps: list[torch.Tensor] = field(default_factory=list)
     trajectory_latents: list[torch.Tensor] = field(default_factory=list)
     extra: dict[str, Any] = field(default_factory=dict)
@@ -464,6 +467,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self,
         server_args,
         batch,
+        scheduler,
     ):
         """
         (Wan2.2) Calculate timestep to switch from high noise expert to low noise expert
@@ -478,7 +482,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             boundary_ratio = batch.boundary_ratio
 
         if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * self.scheduler.num_train_timesteps
+            boundary_timestep = boundary_ratio * scheduler.num_train_timesteps
         else:
             boundary_timestep = None
 
@@ -494,11 +498,16 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         assert self.transformer is not None
         pipeline = self.pipeline() if self.pipeline else None
 
-        boundary_timestep = self._handle_boundary_ratio(server_args, batch)
+        # Request-bound scheduler (set by the timestep preparation stage);
+        # fall back to the stage module for pipelines whose timestep stage
+        # does not bind one.
+        scheduler = batch.scheduler if batch.scheduler is not None else self.scheduler
+
+        boundary_timestep = self._handle_boundary_ratio(server_args, batch, scheduler)
         # Get timesteps and calculate warmup steps
         timesteps = batch.timesteps
         num_inference_steps = batch.num_inference_steps
-        num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+        num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
 
         if self.transformer_2 is not None:
             assert boundary_timestep is not None, "boundary_timestep must be provided"
@@ -528,7 +537,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(
-            self.scheduler.step,
+            scheduler.step,
             {"generator": batch.generator, "eta": batch.eta, "batch": batch},
         )
 
@@ -652,6 +661,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             extra_step_kwargs=extra_step_kwargs,
             target_dtype=target_dtype,
             autocast_enabled=autocast_enabled,
+            scheduler=scheduler,
             timesteps=timesteps,
             num_inference_steps=num_inference_steps,
             num_warmup_steps=num_warmup_steps,
@@ -671,7 +681,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         self, ctx: DenoisingContext, batch: Req, server_args: ServerArgs
     ) -> None:
         """Prepare scheduler state before entering the shared denoising loop."""
-        self.scheduler.set_begin_index(0)
+        ctx.scheduler.set_begin_index(0)
 
     def _prepare_step_state(
         self,
@@ -774,7 +784,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
         )
 
         # 3. Apply scheduler-side input scaling before the model forward.
-        latent_model_input = self.scheduler.scale_model_input(
+        latent_model_input = ctx.scheduler.scale_model_input(
             latent_model_input, step.t_device
         )
 
@@ -799,7 +809,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
             batch.noise_pred = noise_pred
 
         # 5. Advance the scheduler state with the predicted noise.
-        ctx.latents = self.scheduler.step(
+        ctx.latents = ctx.scheduler.step(
             model_output=noise_pred,
             timestep=step.t_device,
             sample=ctx.latents,
@@ -1147,7 +1157,7 @@ class DenoisingStage(PipelineStage, RolloutDenoisingMixin):
 
                         if step_index == num_timesteps - 1 or (
                             (step_index + 1) > ctx.num_warmup_steps
-                            and (step_index + 1) % self.scheduler.order == 0
+                            and (step_index + 1) % ctx.scheduler.order == 0
                             and progress_bar is not None
                         ):
                             progress_bar.update()
