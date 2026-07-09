@@ -33,15 +33,38 @@ def _maybe_wait(tensor: torch.Tensor) -> torch.Tensor:
     return tensor
 
 
+class _AllToAllSingle(torch.autograd.Function):
+    """Even-split all_to_all_single, made autograd-aware for training (Ulysses backward).
+
+    ft_c.all_to_all_single has no registered autograd kernel, so gradients silently stop
+    there. An even-split all_to_all is an involution (its own inverse), so the adjoint is the
+    same collective on the upstream gradient. Inference (no_grad) never calls backward, so this
+    is transparent to the rollout path.
+    """
+
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        return _maybe_wait(
+            ft_c.all_to_all_single(x, output_split_sizes=None, input_split_sizes=None, group=group)
+        )
+
+    @staticmethod
+    def backward(ctx, grad):
+        grad = _maybe_wait(
+            ft_c.all_to_all_single(
+                grad.contiguous(), output_split_sizes=None, input_split_sizes=None, group=ctx.group
+            )
+        )
+        return grad, None
+
+
 def _usp_all_to_all_single(x: torch.Tensor) -> torch.Tensor:
     ulysses_pg = get_sp_group().ulysses_group
     assert ulysses_pg is not None, "Ulysses process group is not initialized."
     x_shape = x.shape
     x = x.flatten()
-    x = ft_c.all_to_all_single(
-        x, output_split_sizes=None, input_split_sizes=None, group=ulysses_pg
-    )
-    x = _maybe_wait(x)
+    x = _AllToAllSingle.apply(x, ulysses_pg)
     x = x.reshape(x_shape)
     return x
 
@@ -158,6 +181,70 @@ def _usp_output_all_to_all(x: torch.Tensor, head_dim: int = 1) -> torch.Tensor:
     return x
 
 
+class _RingFlashAttention(torch.autograd.Function):
+    """Differentiable ring attention for training.
+
+    sglang's inference ring_attn calls _templated_ring_attention (forward template) directly;
+    its KV ring rotation is non-differentiable, so dK/dV never get the reverse-ring gradient
+    pass (dQ survives since Q isn't rotated). torch keeps the ring backward in a separate
+    template (_templated_ring_attention_backward) that does the reverse-ring dKV communication,
+    normally wired by torch's context_parallel autograd.Function. We mirror that here using
+    torch's native aten flash op (the canonical op both templates expect). q/k/v: [B, H, S, D].
+    """
+
+    @staticmethod
+    def forward(ctx, query, key, value, group, scale, is_causal):
+        from torch.distributed.tensor.experimental._attention import _templated_ring_attention
+
+        out, lse, cum_q, cum_k, max_q, max_k, philox_seed, philox_offset, _dbg = (
+            _templated_ring_attention(
+                group,
+                2,
+                torch.ops.aten._scaled_dot_product_flash_attention,
+                query=query,
+                key=key,
+                value=value,
+                is_causal=is_causal,
+                dropout_p=0.0,
+                scale=scale,
+            )
+        )
+        out = out.to(query.dtype)
+        ctx.save_for_backward(query, key, value, out, lse, cum_q, cum_k, philox_seed, philox_offset)
+        ctx.group, ctx.scale, ctx.is_causal, ctx.max_q, ctx.max_k = group, scale, is_causal, max_q, max_k
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        from torch.distributed.tensor.experimental._attention import (
+            _templated_ring_attention_backward,
+        )
+
+        query, key, value, out, lse, cum_q, cum_k, philox_seed, philox_offset = ctx.saved_tensors
+        grad_q, grad_k, grad_v, *_ = _templated_ring_attention_backward(
+            ctx.group,
+            2,
+            torch.ops.aten._scaled_dot_product_flash_attention_backward.default,
+            grad_out=grad_out.contiguous(),
+            grad_out_name="grad_out",
+            query=query,
+            key=key,
+            value=value,
+            out=out,
+            logsumexp=lse,
+            is_causal=ctx.is_causal,
+            cum_seq_q=cum_q,
+            cum_seq_k=cum_k,
+            max_q=ctx.max_q,
+            max_k=ctx.max_k,
+            dropout_p=0.0,
+            philox_seed=philox_seed,
+            philox_offset=philox_offset,
+            scale=ctx.scale,
+        )
+        return grad_q, grad_k, grad_v, None, None, None
+
+
 def ring_attn(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -195,6 +282,12 @@ def ring_attn(
     query = torch.permute(query, [0, 2, 1, 3]).contiguous()
     key = torch.permute(key, [0, 2, 1, 3]).contiguous()
     value = torch.permute(value, [0, 2, 1, 3]).contiguous()
+
+    # Training: use the differentiable ring (correct reverse-ring dK/dV). Inference keeps the
+    # original forward-only path below unchanged.
+    if torch.is_grad_enabled() and (query.requires_grad or key.requires_grad or value.requires_grad):
+        out = _RingFlashAttention.apply(query, key, value, ring_pg, attn_impl.softmax_scale, is_causal)
+        return torch.permute(out, [0, 2, 1, 3])
 
     # Create an adapter function that matches the signature expected by
     # _templated_ring_attention. The `attn_impl` already has dropout and
