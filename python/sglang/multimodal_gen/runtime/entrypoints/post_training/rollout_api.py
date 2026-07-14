@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import torch
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import ORJSONResponse
@@ -191,12 +192,22 @@ def _serialize_rollout_trajectory(
     )
 
 
+def _normalize_output_layout(output):
+    """Enforce the decode contract (B, C, H, W) / (B, C, F, H, W); AV stages emit np (B, F, H, W, C)."""
+    if isinstance(output, np.ndarray):
+        output = torch.from_numpy(output)
+    if isinstance(output, torch.Tensor) and output.dim() == 5 and output.shape[-1] in (1, 3, 4):
+        output = output.permute(0, 4, 1, 2, 3).contiguous()
+    return output
+
+
 def _build_response(
     request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
 ) -> list[RolloutResponse]:
     """
     rollout: bool - set to False when evaluating the model
     """
+    result.output = _normalize_output_layout(result.output)
     batch_size = result.output.shape[0]
     inference_time_s = (
         result.metrics.total_duration_s
