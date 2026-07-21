@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from typing import Any
 
 import msgspec
@@ -332,11 +334,32 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
-    rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
+    # Serialization (safetensors save + msgpack encode) is CPU-bound and has no
+    # await; running it inline blocks this engine's event loop and serializes it
+    # against other in-flight requests' generation. Offload to a worker thread so
+    # one request's serialize overlaps other requests' (GPU-bound) generation.
+    content = await asyncio.to_thread(
+        _encode_rollout_payload,
+        request_id,
+        request.prompt,
+        request.seed,
+        request.rollout,
+        output_batch,
     )
+    return Response(content=content, media_type="application/msgpack")
+
+
+def _encode_rollout_payload(
+    request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
+) -> bytes:
+    t0 = time.perf_counter()
+    rollout_responses = _build_response(request_id, prompt, seed, rollout, result)
     payload = [r.model_dump() for r in rollout_responses]
-    return Response(
-        content=msgspec.msgpack.encode(payload),
-        media_type="application/msgpack",
+    content = msgspec.msgpack.encode(payload)
+    logger.info(
+        "rollout serialize (off-loop): bs=%d elapsed=%.1fms bytes=%d",
+        len(rollout_responses),
+        (time.perf_counter() - t0) * 1e3,
+        len(content),
     )
+    return content
