@@ -94,6 +94,12 @@ def _group_lora_ab_tensors(
 ) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
     """Group flattened IPC tensors into {layer_name: (lora_A, lora_B)} pairs."""
     partial: dict[str, dict[str, torch.Tensor]] = {}
+    try:
+        _dbg = {n: str(t.dtype) for n, t in named_tensors if ("blocks.17.attn2.to_k" in n or "blocks.34.ffn.net.2" in n)}
+        _dts = sorted({str(t.dtype) for _, t in named_tensors})
+        logger.warning("[LORA-DTYPE-PROBE] call: %d tensors dtypes=%s probe_layers=%s", len(named_tensors), _dts, _dbg)
+    except Exception as _e:
+        logger.warning("[LORA-DTYPE-PROBE] fail %s", _e)
     for name, tensor in named_tensors:
         if ".lora_A" in name:
             layer_name = name.split(".lora_A", 1)[0]

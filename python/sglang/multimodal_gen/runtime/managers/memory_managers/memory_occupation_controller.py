@@ -36,6 +36,13 @@ def _module_to_pinned_cpu(module: torch.nn.Module) -> None:
 
 def _get_module_device(module: torch.nn.Module) -> str:
     """Return best-effort device string for a module."""
+    # prefer a CUDA device if any param/buffer is on GPU (avoid first-param-on-CPU misdetection)
+    for _t in module.parameters():
+        if _t.device.type != "cpu":
+            return str(_t.device)
+    for _t in module.buffers():
+        if _t.device.type != "cpu":
+            return str(_t.device)
     param = next(module.parameters(), None)
     if param is not None:
         return str(param.device)
@@ -160,8 +167,16 @@ class MemoryOccupationController:
             if not device.startswith("cpu"):
                 restore_map[name] = device
 
+        logger.info("[SLEEP] offloading to CPU: %s", list(restore_map.keys()))
         self._move_modules(list(restore_map.keys()), "cpu")
         self._clear_torch_device_cache()
+        try:
+            _alloc = torch.cuda.memory_allocated() / 1e9
+            _resv = torch.cuda.memory_reserved() / 1e9
+            _devs = {n: _get_module_device(m) for n, m in get_updatable_modules(self.pipeline).items()}
+            logger.info("[SLEEP][PROBE] post-offload allocated=%.2fGB reserved=%.2fGB module_devices=%s", _alloc, _resv, _devs)
+        except Exception as _e:
+            logger.warning("[SLEEP][PROBE] failed: %s", _e)
         return restore_map
 
     def _restore_modules_to_original_devices(
