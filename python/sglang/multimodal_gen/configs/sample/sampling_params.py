@@ -379,9 +379,15 @@ class SamplingParams:
         del request
         return kwargs
 
-    def prepare_video_request_for_queue(self, req: Any) -> None:
-        """Resolve model-specific admission facts before a video job is queued."""
-        del req
+    def prepare_video_request_for_queue(
+        self, req: Any, *, require_file_delivery: bool = True
+    ) -> None:
+        """Resolve model-specific admission facts before a video job is queued.
+
+        ``require_file_delivery`` is False for the RL API, which answers with
+        tensors instead of files.
+        """
+        del req, require_file_delivery
 
     def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any] | None:
         """Return per-output requests when a model owns grouped execution.

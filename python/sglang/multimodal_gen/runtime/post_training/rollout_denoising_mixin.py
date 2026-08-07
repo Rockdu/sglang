@@ -140,6 +140,7 @@ class RolloutDenoisingMixin:
             "env": env,
             "step_latents": [],
             "step_timesteps": [],
+            "step_audio_latents": [],
             "pos_cond_kwargs_src": pos_src,
             "neg_cond_kwargs_src": neg_src,
         }
@@ -150,6 +151,7 @@ class RolloutDenoisingMixin:
         latents: torch.Tensor,
         timestep_value: torch.Tensor,
         step_index: int,
+        audio_latents: torch.Tensor | None = None,
     ) -> None:
         if not batch.rollout or not batch.rollout_return_dit_trajectory:
             return
@@ -163,6 +165,8 @@ class RolloutDenoisingMixin:
 
         state["step_latents"].append(latents.detach())
         state["step_timesteps"].append(timestep_value.detach().cpu())
+        if audio_latents is not None:
+            state["step_audio_latents"].append(audio_latents.detach())
 
     def _maybe_finalize_denoising_env_collection(self, batch, pipeline_config) -> None:
         state = getattr(batch, "_rollout_denoising_env_state", None)
@@ -183,10 +187,16 @@ class RolloutDenoisingMixin:
                 batch=batch,
                 stacked_latents=step_latents_tensor,
             )
+            step_audio_latents: list[torch.Tensor] = state["step_audio_latents"]
             batch.rollout_trajectory_data.dit_trajectory = RolloutDitTrajectory(
                 latents=step_latents_tensor.cpu(),
                 timesteps=torch.stack(step_timesteps, dim=0).cpu(),
                 sigmas=batch.scheduler.sigmas.detach().cpu().clone(),
+                audio_latents=(
+                    torch.stack(step_audio_latents, dim=1).cpu()
+                    if step_audio_latents
+                    else None
+                ),
             )
 
         if env is not None and batch.rollout_return_denoising_env:

@@ -33,18 +33,27 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
         """Release rollout-owned resources. Call when denoising ends or before a new rollout."""
         batch._rollout_session_data = None
 
-    def prepare_rollout(self, batch: Req, pipeline_config: Any = None) -> None:
-        """Enable rollout and set SDE/CPS params. Call once before the denoising loop."""
+    def prepare_rollout(
+        self,
+        batch: Req,
+        pipeline_config: Any = None,
+        latents_shape: tuple | None = None,
+    ) -> None:
+        """Enable rollout and set SDE/CPS params. Call once before the denoising loop.
+
+        ``latents_shape`` overrides the sampled shape for models whose denoise
+        state is not ``batch.latents`` (MiniMax H3 steps packed rows).
+        """
         if get_sp_world_size() > 1 and pipeline_config is None:
             raise RuntimeError(
                 "SP rollout requires pipeline_config to be passed to prepare_rollout()."
             )
+        if latents_shape is None and batch.latents is not None:
+            latents_shape = tuple(batch.latents.shape)
         batch._rollout_session_data = RolloutSessionData(
             pipeline_config=pipeline_config,
             sigma_max=self.sigmas[min(1, len(self.sigmas) - 1)].item(),
-            latents_shape=(
-                tuple(batch.latents.shape) if batch.latents is not None else None
-            ),
+            latents_shape=latents_shape,
         )
 
     def already_prepared_rollout(self, batch) -> bool:

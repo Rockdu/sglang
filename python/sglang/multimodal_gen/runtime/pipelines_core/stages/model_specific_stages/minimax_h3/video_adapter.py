@@ -220,7 +220,9 @@ class MiniMaxH3VideoModelAdapter:
                 "delivery contract is the resolved target canvas"
             )
 
-    def validate_sampling_params(self, sampling_params: SamplingParams) -> None:
+    def validate_sampling_params(
+        self, sampling_params: SamplingParams, *, require_file_delivery: bool = True
+    ) -> None:
         """Apply the HTTP task/delivery gate to offline requests as well."""
 
         task = getattr(sampling_params, "task", None)
@@ -236,8 +238,11 @@ class MiniMaxH3VideoModelAdapter:
                 "MiniMax H3 does not support enable_upscaling: the accepted "
                 "delivery contract is the resolved target canvas"
             )
-        if not bool(getattr(sampling_params, "save_output", False)) or not getattr(
-            sampling_params, "output_path", None
+        # The RL API answers with tensors, so file delivery does not apply --
+        # the same carve-out synthetic warmup gets.
+        if require_file_delivery and (
+            not bool(getattr(sampling_params, "save_output", False))
+            or not getattr(sampling_params, "output_path", None)
         ):
             raise ValueError(
                 "MiniMax H3 DiffGenerator requires save_output=True and a non-empty "

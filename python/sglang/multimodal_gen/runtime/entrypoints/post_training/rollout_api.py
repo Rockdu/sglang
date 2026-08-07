@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+from functools import partial
 from typing import Any
 
 import msgspec
@@ -18,7 +20,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_serialize,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
-from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
     RolloutDenoisingEnv,
@@ -131,6 +133,9 @@ def _slice_rollout_trajectory_for_sample(
             latents=_extract_single_sample_tensor(dit.latents, sample_idx, batch_size),
             timesteps=dit.timesteps,
             sigmas=dit.sigmas,
+            audio_latents=_extract_single_sample_tensor(
+                dit.audio_latents, sample_idx, batch_size
+            ),
         )
     return RolloutTrajectoryData(
         rollout_log_probs=log_probs,
@@ -185,6 +190,11 @@ def _serialize_rollout_trajectory(
             ),
             "timesteps": serialized_dit_timesteps,
             "sigmas": serialized_dit_sigmas,
+            "audio_latents": (
+                _maybe_serialize(dit.audio_latents)
+                if dit.audio_latents is not None
+                else None
+            ),
         }
     return (
         serialized_log_probs,
@@ -306,6 +316,34 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     return {k: v for k, v in sampling_kwargs.items() if v is not None}
 
 
+async def _forward_with_prequeue_admission(
+    sampling_params: Any, pipeline_request: Req
+) -> list[tuple[Req, OutputBatch]]:
+    """Run the video API's pre-queue admission, then forward every output.
+
+    Both hooks are no-ops for models that resolve everything from sampling
+    params. MiniMax H3 needs them: it probes its reference media into
+    request-scoped shape facts, and it owns independent-seed expansion, so
+    ``num_outputs_per_prompt`` becomes one forward per seed rather than a batch
+    dimension.
+    """
+    await asyncio.to_thread(
+        partial(
+            sampling_params.prepare_video_request_for_queue,
+            require_file_delivery=False,
+        ),
+        pipeline_request,
+    )
+    expanded = sampling_params.expand_video_request_outputs_for_queue(pipeline_request)
+    completed: list[tuple[Req, OutputBatch]] = []
+    for req in expanded or [pipeline_request]:
+        output_batch: OutputBatch = await async_scheduler_client.forward(req)
+        if output_batch.error:
+            raise HTTPException(status_code=500, detail=output_batch.error)
+        completed.append((req, output_batch))
+    return completed
+
+
 @router.post(
     "/generate",
     response_class=Response,
@@ -330,19 +368,25 @@ async def rollout_generate(request: RolloutRequest):
         server_args=server_args, sampling_params=sampling_params
     )
     try:
-        output_batch: OutputBatch = await async_scheduler_client.forward(
-            pipeline_request
+        completed = await _forward_with_prequeue_admission(
+            sampling_params, pipeline_request
         )
+    except HTTPException:
+        raise
     except Exception as exc:
         logger.error("Rollout generation failed: %s", exc, exc_info=True)
         raise HTTPException(
             status_code=500, detail=f"Generation failed: {exc}"
         ) from exc
-    if output_batch.error:
-        raise HTTPException(status_code=500, detail=output_batch.error)
-    rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
-    )
+    finally:
+        await asyncio.to_thread(sampling_params.cleanup_video_request, pipeline_request)
+    rollout_responses = [
+        response
+        for req, output_batch in completed
+        for response in _build_response(
+            request_id, request.prompt, req.seed, request.rollout, output_batch
+        )
+    ]
     payload = [r.model_dump() for r in rollout_responses]
     return Response(
         content=msgspec.msgpack.encode(payload),

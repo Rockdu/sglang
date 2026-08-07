@@ -5,7 +5,7 @@ single-branch execution, and payload validation.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from functools import partial
 from typing import Any
@@ -31,6 +31,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
+)
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     VerificationResult,
@@ -380,6 +383,20 @@ def _precompute_rope_cache(
     return True
 
 
+class MiniMaxH3RolloutScheduler(SchedulerRLMixin):
+    """RL state holder for H3, which serves with ``scheduler=null``.
+
+    The shared rollout hooks dispatch on ``batch.scheduler`` and read its
+    ``sigmas``; H3 has no scheduler object and inlines its euler math in the
+    denoise loop. This carries the VIDEO schedule -- rollout samples video, and
+    it is the schedule H3 already publishes as ``batch.sigmas`` -- and nothing
+    else. Installed for rollout requests only, so serving keeps its ``None``.
+    """
+
+    def __init__(self, sigmas: torch.Tensor) -> None:
+        self.sigmas = sigmas
+
+
 class MiniMaxH3DenoisingStage(DenoisingStage):
     def __init__(self, transformer, pipeline=None) -> None:
         super().__init__(
@@ -568,6 +585,21 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                 device=device,
             )
             initial_video, initial_audio = _expand_initial_rows(ctx, positive)
+            rollout_step = None
+            if batch.rollout:
+                rollout_step = self._prepare_rollout_step(
+                    batch=batch,
+                    positive=positive,
+                    initial_video_rows=initial_video,
+                    initial_audio_rows=initial_audio,
+                    raw_prompt_embeds=emb["hidden_states"],
+                    token_tags=tags,
+                    sigmas_video=sigmas_video,
+                    sigmas_audio=[float(v) for v in ctx.sigmas["audio"]],
+                    imgvid_cond_timestep=float(imgvid_noise_aug),
+                    audio_ref_cond_timestep=float(audio_noise_aug),
+                    server_args=server_args,
+                )
             with (
                 maybe_nvtx_range("denoising_loop", self.current_use_nvtx),
                 self.progress_bar(
@@ -600,9 +632,18 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         self._profile_denoising_step,
                         batch=batch,
                     ),
+                    rollout_step=rollout_step,
                 )
         finally:
             self._finish_active_component_use()
+        if batch.rollout:
+            self._postprocess_rollout_outputs(
+                batch,
+                video_rows[positive.video_target_slice].unsqueeze(0).clone(),
+                len(sigmas_video) - 1,
+                torch.zeros((), dtype=torch.float32),
+                server_args,
+            )
         _publish_full_loop_outputs(
             ctx,
             batch=batch,
@@ -610,6 +651,107 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
             video_rows=video_rows,
             audio_rows=audio_rows,
         )
+
+    def _prepare_rollout_step(
+        self,
+        *,
+        batch: Req,
+        positive: Any,
+        initial_video_rows: torch.Tensor,
+        initial_audio_rows: torch.Tensor,
+        raw_prompt_embeds: torch.Tensor,
+        token_tags: torch.Tensor,
+        sigmas_video: list[float],
+        sigmas_audio: list[float],
+        imgvid_cond_timestep: float,
+        audio_ref_cond_timestep: float,
+        server_args: ServerArgs,
+    ) -> Callable[[int, torch.Tensor, torch.Tensor, torch.Tensor], None]:
+        """Arm rollout collection and return the loop's per-step video hook.
+
+        The RL session keys off the video target rows rather than
+        ``batch.latents``, which H3 only publishes after the loop, and installs
+        the rollout scheduler the shared hooks dispatch on.
+
+        The denoising env carries everything request-static the training-side
+        forward needs to replay a step. Beyond the packed layout that means the
+        pinned condition rows (the trajectory only records target rows, but
+        ``x`` / ``audio_x`` span both), the audio schedule plus condition
+        timesteps, without which ``unique_timesteps`` cannot be rebuilt (audio
+        denoises on its own shifted sigmas), and full-sequence ``token_tags``.
+
+        Entries ``static_kwargs`` builds per Ulysses rank -- ``rope_cache``,
+        ``block_token_tags``, ``local_embedding_layout`` -- are recorded as-is
+        and only valid at this request's SP degree; a trainer sharding
+        differently re-derives them from the full-sequence sources here.
+        """
+        video_target_shape = tuple(
+            initial_video_rows[positive.video_target_slice].unsqueeze(0).shape
+        )
+        batch.scheduler = MiniMaxH3RolloutScheduler(
+            torch.tensor(sigmas_video, dtype=torch.float32)
+        )
+        batch.scheduler.prepare_rollout(
+            batch=batch,
+            pipeline_config=server_args.pipeline_config,
+            latents_shape=video_target_shape,
+        )
+        self._maybe_init_denoising_env_collection(
+            batch=batch,
+            pipeline_config=server_args.pipeline_config,
+            image_kwargs={},
+            pos_cond_kwargs={
+                **positive.static_kwargs,
+                "audio_sigmas": sigmas_audio,
+                "video_cond_rows": initial_video_rows[: positive.video_target_start],
+                "audio_cond_rows": initial_audio_rows[: positive.audio_target_start],
+                "imgvid_cond_timestep": imgvid_cond_timestep,
+                "audio_ref_cond_timestep": audio_ref_cond_timestep,
+                "token_tags": token_tags,
+                # Text encoder output before the DiT's token refiner. Lets the
+                # trainer refine with its own weights, and separates encoder
+                # drift from refiner drift when checking multi-GPU parity.
+                "raw_prompt_embeds": raw_prompt_embeds,
+            },
+            neg_cond_kwargs={},
+            guidance=None,
+        )
+        return partial(self._rollout_video_step, batch=batch, sigmas_video=sigmas_video)
+
+    def _rollout_video_step(
+        self,
+        step: int,
+        video_target: torch.Tensor,
+        audio_target: torch.Tensor,
+        video_velocity: torch.Tensor,
+        *,
+        batch: Req,
+        sigmas_video: list[float],
+    ) -> None:
+        """SDE-sample the video rows; audio is only recorded, never sampled.
+
+        Two things the shared RL step does not know about H3:
+        rows are updated in place, so the snapshots must be cloned before the
+        step; and H3 solves ``x0 = x + sigma * v`` while the shared flow-match
+        step expects ``x' = x + dt * v``, so the velocity sign flips.
+        """
+        batch._rollout_loop_step_index = step
+        self._maybe_append_dit_trajectory_step(
+            batch=batch,
+            latents=video_target.unsqueeze(0).clone(),
+            timestep_value=batch.timesteps[step],
+            step_index=step,
+            audio_latents=audio_target.unsqueeze(0).clone(),
+        )
+        prev_sample = batch.scheduler.flow_sde_sampling(
+            batch,
+            model_output=-video_velocity.unsqueeze(0),
+            sample=video_target.unsqueeze(0),
+            current_sigma=video_velocity.new_tensor(sigmas_video[step]),
+            next_sigma=video_velocity.new_tensor(sigmas_video[step + 1]),
+            generator=batch.generator,
+        )
+        video_target.copy_(prev_sample.squeeze(0))
 
     @contextmanager
     def _profile_denoising_step(self, step_index: int, *, batch: Req):
