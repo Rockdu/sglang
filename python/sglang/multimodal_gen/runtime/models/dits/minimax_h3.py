@@ -1148,11 +1148,23 @@ class MiniMaxH3DiTModel(BaseDiT, LayerwiseOffloadableModuleMixin):
             prefix="time_embedder",
         )
         self.rope = MiniMaxH3Rope(arch.rope_inv_freq_len)
-        self.token_refiner = MiniMaxH3TokenRefiner(
-            arch,
-            quant_config,
-            prefix="token_refiner",
+        import os as _os
+        from contextlib import nullcontext as _nc
+        from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+            get_encoder_replica_group as _erg,
+            patch_tensor_parallel_group as _ptp,
         )
+        _rf_ctx = (
+            _ptp(_erg())
+            if _os.environ.get("H3_REFINER_UNSHARDED") == "1" and get_tp_world_size() > 1
+            else _nc()
+        )
+        with _rf_ctx:
+            self.token_refiner = MiniMaxH3TokenRefiner(
+                arch,
+                quant_config,
+                prefix="token_refiner",
+            )
         self.blocks = nn.ModuleList(
             [
                 MiniMaxH3DiTBlock(
