@@ -54,6 +54,12 @@ class RolloutDitTrajectory:
     timesteps: torch.Tensor | None = None  # [T]
     # [T+1] scheduler.sigmas snapshot (post-shift, includes terminal 0).
     sigmas: torch.Tensor | None = None
+    # [B, T, ...]: audio rows as fed to the DiT at each step. Only models that
+    # denoise a second, untrained modality set this (MiniMax H3): its packed
+    # sequence couples video and audio, so recomputing a video step at train
+    # time needs that step's audio rows as a forward input. T, not T+1 -- these
+    # are inputs, never a trained trajectory.
+    audio_latents: torch.Tensor | None = None
 
 
 @dataclass

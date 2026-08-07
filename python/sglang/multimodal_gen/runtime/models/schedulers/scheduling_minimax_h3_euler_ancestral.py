@@ -6,6 +6,10 @@ from typing import Any
 
 import torch
 
+from sglang.multimodal_gen.runtime.post_training.scheduler_rl_mixin import (
+    SchedulerRLMixin,
+)
+
 
 def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
     if not bool(torch.isfinite(tensor).all().item()):
@@ -134,13 +138,23 @@ def _minimax_h3_euler_eta0_step(
     return out.to(dtype=state.dtype)
 
 
-class MiniMaxH3EulerAncestralEta0SchedulerAdapter:
-    def __init__(self, **config: Any) -> None:
+class MiniMaxH3EulerAncestralEta0SchedulerAdapter(SchedulerRLMixin):
+    """H3 scheduler math, plus the rollout contract RolloutDenoisingMixin gates on.
+
+    ``sigmas`` is the VIDEO schedule: H3 drives video and audio on separate
+    shifted schedules, and rollout only samples video, so the RL state that
+    keys off ``self.sigmas`` (``prepare_rollout``, the returned sigma snapshot)
+    is video's. This matches ``batch.sigmas``, which H3 already publishes as
+    the video schedule.
+    """
+
+    def __init__(self, *, sigmas: torch.Tensor, **config: Any) -> None:
         if config:
             raise ValueError(
                 f"{type(self).__name__} does not accept config fields: "
                 f"{sorted(config)}"
             )
+        self.sigmas = sigmas
 
     def set_shift(self, _flow_shift: float) -> None:
         """Ignore flow shift, matching the previous loader-specific path."""

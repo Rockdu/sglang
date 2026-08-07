@@ -6,6 +6,9 @@ from collections.abc import Mapping
 
 import torch
 
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_minimax_h3_euler_ancestral import (
+    MiniMaxH3EulerAncestralEta0SchedulerAdapter,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
@@ -85,6 +88,9 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
         batch.timesteps = torch.tensor(
             [1.0 - float(sigma) for sigma in video_sigmas[:-1]],
             dtype=torch.float32,
+        )
+        batch.scheduler = MiniMaxH3EulerAncestralEta0SchedulerAdapter(
+            sigmas=torch.tensor(video_sigmas, dtype=torch.float32)
         )
 
     def _generate_sigmas_from_plan(self, batch: Req, plan) -> None:

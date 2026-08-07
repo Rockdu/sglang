@@ -90,9 +90,13 @@ class MiniMaxH3SamplingParams(SamplingParams):
     ) -> dict[str, Any]:
         return cls._video_hooks().lower_video_request_kwargs(request, kwargs)
 
-    def prepare_video_request_for_queue(self, req: Any) -> None:
+    def prepare_video_request_for_queue(
+        self, req: Any, *, require_file_delivery: bool = True
+    ) -> None:
         hooks = self._video_hooks()
-        hooks.validate_sampling_params(self)
+        hooks.validate_sampling_params(
+            self, require_file_delivery=require_file_delivery
+        )
         hooks.prepare_for_queue_sync(req)
 
     def expand_video_request_outputs_for_queue(self, req: Any) -> list[Any]:
@@ -213,11 +217,6 @@ class MiniMaxH3SamplingParams(SamplingParams):
             raise ValueError(
                 "MiniMax H3 does not support enable_teacache: its packed "
                 "video/audio denoise loop has no lossless TeaCache contract"
-            )
-        if self.rollout:
-            raise ValueError(
-                "MiniMax H3 does not support rollout: its coupled video/audio "
-                "scheduler has no SchedulerRLMixin contract"
             )
         if self.return_trajectory_latents or self.return_trajectory_decoded:
             raise ValueError(
