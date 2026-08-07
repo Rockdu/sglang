@@ -22,6 +22,7 @@ from sglang.multimodal_gen.runtime.distributed import (
 )
 from sglang.multimodal_gen.runtime.distributed.group_coordinator import GroupCoordinator
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_encoder_replica_group,
     patch_tensor_parallel_group,
 )
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
@@ -435,7 +436,9 @@ class TextEncoderLoader(ComponentLoader):
         # idle DiT replica during the encoding stage) instead of the default TP
         # group, so every encoder folds without threading the group through each layer.
         fold_ctx = nullcontext()
-        if getattr(model_config, "parallel_folding_mode", None) is not None:
+        if server_args.encoder_parallel == "replicate" and get_tp_group().world_size > 1:
+            fold_ctx = patch_tensor_parallel_group(get_encoder_replica_group())
+        elif getattr(model_config, "parallel_folding_mode", None) is not None:
             folding_group = get_folding_tp_group(model_config)
             if (
                 isinstance(folding_group, GroupCoordinator)

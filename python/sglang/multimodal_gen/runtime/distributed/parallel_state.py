@@ -301,6 +301,29 @@ def get_sp_group() -> SequenceParallelGroupCoordinator:
     return _SP
 
 
+_ENCODER_REPLICA: GroupCoordinator | None = None
+
+
+def get_encoder_replica_group() -> GroupCoordinator:
+    """A group of one rank: a module built under it stays unsharded.
+
+    ``--encoder-parallel replicate`` promises an unsharded encoder, but with no
+    single-rank group to build under, the loader falls back to the TP group and
+    tensor-parallels the encoder anyway.
+    """
+    global _ENCODER_REPLICA
+    if _ENCODER_REPLICA is None:
+        world = get_world_group()
+        _ENCODER_REPLICA = GroupCoordinator(
+            group_ranks=[[rank] for rank in range(world.world_size)],
+            local_rank=world.local_rank,
+            torch_distributed_backend=torch.distributed.get_backend(),
+            use_device_communicator=True,
+            group_name="encoder_replica",
+        )
+    return _ENCODER_REPLICA
+
+
 def get_dp_group() -> GroupCoordinator:
     assert _DP is not None, "data parallel group is not initialized"
     return _DP
