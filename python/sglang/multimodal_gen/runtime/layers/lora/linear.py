@@ -604,8 +604,17 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
                 input_, num_partitions=self.base_layer.tp_size
             )
             input_parallel = splitted_input[tp_rank].contiguous()
+        # Fuse bias into the GEMM exactly like RowParallelLinear.forward (rank 0
+        # only, so TP>1 still adds it once after the all-reduce). The unfused
+        # mm-then-add variant rounds the GEMM output to bf16 before the bias
+        # add and lands 1 ulp off the merged/base path on ~a third of elements.
+        bias_ = (
+            None
+            if (self.base_layer.tp_rank > 0 or self.base_layer.skip_bias_add)
+            else self.base_layer.bias
+        )
         output_parallel = self.base_layer.quant_method.apply(
-            self.base_layer, input_parallel
+            self.base_layer, input_parallel, bias=bias_
         )
         if not self.merged and not self.disable_lora:
             lora_dtype = lora_A.dtype
@@ -631,17 +640,10 @@ class RowParallelLinearWithLoRA(BaseLayerWithLoRA):
         else:
             output_ = output_parallel
 
-        if not self.base_layer.skip_bias_add:
-            output = (
-                output_ + self.base_layer.bias
-                if self.base_layer.bias is not None
-                else output_
-            )
-            output_bias = None
-        else:
-            output = output_
-            output_bias = self.base_layer.bias
-        return output, output_bias
+        # Bias is already in the GEMM epilogue (rank 0); adding it here again
+        # would double-count it.
+        output_bias = self.base_layer.bias if self.base_layer.skip_bias_add else None
+        return output_, output_bias
 
     def slice_lora_a_weights(self, A: torch.Tensor) -> torch.Tensor:
         tp_rank = get_tp_rank()
