@@ -578,5 +578,50 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         )
 
 
+class TestRolloutVarianceNoiseBufferUnit(unittest.TestCase):
+    """The per-sample draw must not over-allocate the shared noise buffer.
+
+        buffer  [ s0 ][ s1 ][ s2 ][ s3 ]        <- storage is exactly B samples
+        drawing the whole batch shape into a
+        one-sample slice grows it instead:
+                [ s0 ][ s1 ][ s2 ][ s3 ][ ][ ][ ]
+    """
+
+    def setUp(self):
+        self._orig_get_sp_world_size = rl_mixin_module.get_sp_world_size
+        rl_mixin_module.get_sp_world_size = lambda: 1
+
+    def tearDown(self):
+        rl_mixin_module.get_sp_world_size = self._orig_get_sp_world_size
+
+    def test_noise_buffer_storage_is_not_grown(self):
+        batch_size, sample_shape = 4, (4, 8, 8)
+        scheduler = _DummyScheduler()
+        batch = types.SimpleNamespace(
+            rollout_log_prob_no_const=True,
+            rollout_noise_level=0.5,
+            rollout_sde_type="sde",
+            rollout_debug_mode=False,
+            latents=torch.zeros(batch_size, *sample_shape, dtype=torch.float32),
+            _rollout_session_data=None,
+        )
+        scheduler.prepare_rollout(batch)
+        session = scheduler._get_rollout_session_data(batch)
+        session.pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda batch, latents: (latents, None)
+        )
+
+        scheduler._rollout_variance_noise(
+            batch,
+            torch.zeros(batch_size, *sample_shape, dtype=torch.float32),
+            [torch.Generator().manual_seed(100 + i) for i in range(batch_size)],
+        )
+
+        buffer = session.noise_buffer
+        self.assertEqual(
+            buffer.untyped_storage().size() // buffer.element_size(), buffer.numel()
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

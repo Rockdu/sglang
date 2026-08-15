@@ -96,9 +96,10 @@ class SchedulerRLMixin(SchedulerRLDebugMixin):
             rollout_session_data, rollout_session_data.latents_shape, device, dtype
         )
         for i in range(B):
+            sample = buffer[i : i + 1]
             torch.randn(
-                rollout_session_data.latents_shape,
-                out=buffer[i : i + 1],
+                sample.shape,
+                out=sample,
                 generator=generator[i],
             )
 
