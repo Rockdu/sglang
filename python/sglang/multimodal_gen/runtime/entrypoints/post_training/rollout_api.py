@@ -5,9 +5,9 @@ from __future__ import annotations
 import asyncio
 from typing import Any
 
-import msgspec
 import torch
 from fastapi import APIRouter, HTTPException, Response
+from fastapi.responses import StreamingResponse
 
 from sglang.multimodal_gen.configs.sample.sampling_params import generate_request_id
 from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_sampling_params
@@ -17,6 +17,7 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_serialize,
+    msgpack_encode_spliced,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -342,13 +343,24 @@ async def rollout_generate(request: RolloutRequest):
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
 
-    def _serialize_response() -> bytes:
+    def _serialize_response() -> list[bytes]:
         rollout_responses = _build_response(
             request_id, request.prompt, request.seed, request.rollout, output_batch
         )
-        return msgspec.msgpack.encode([r.model_dump() for r in rollout_responses])
+        return msgpack_encode_spliced([r.model_dump() for r in rollout_responses])
 
     # Trajectory serialization copies hundreds of MB (safetensors save releases
     # the GIL); off the event loop it overlaps across concurrent requests.
-    content = await asyncio.to_thread(_serialize_response)
-    return Response(content=content, media_type="application/msgpack")
+    parts = await asyncio.to_thread(_serialize_response)
+
+    async def _iter_parts():
+        for part in parts:
+            yield part
+
+    # Fixed-length response assembled from spliced parts; the explicit
+    # content-length keeps uvicorn on identity framing, not chunked encoding.
+    return StreamingResponse(
+        _iter_parts(),
+        media_type="application/msgpack",
+        headers={"content-length": str(sum(len(p) for p in parts))},
+    )
