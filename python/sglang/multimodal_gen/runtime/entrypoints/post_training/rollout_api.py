@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
 import msgspec
@@ -340,11 +341,14 @@ async def rollout_generate(request: RolloutRequest):
         ) from exc
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
-    rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
-    )
-    payload = [r.model_dump() for r in rollout_responses]
-    return Response(
-        content=msgspec.msgpack.encode(payload),
-        media_type="application/msgpack",
-    )
+
+    def _serialize_response() -> bytes:
+        rollout_responses = _build_response(
+            request_id, request.prompt, request.seed, request.rollout, output_batch
+        )
+        return msgspec.msgpack.encode([r.model_dump() for r in rollout_responses])
+
+    # Trajectory serialization copies hundreds of MB (safetensors save releases
+    # the GIL); off the event loop it overlaps across concurrent requests.
+    content = await asyncio.to_thread(_serialize_response)
+    return Response(content=content, media_type="application/msgpack")
