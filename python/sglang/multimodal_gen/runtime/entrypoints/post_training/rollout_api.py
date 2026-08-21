@@ -200,8 +200,21 @@ def _serialize_rollout_trajectory(
     )
 
 
+def _quantize_video_uint8(video: torch.Tensor) -> torch.Tensor:
+    """Same formula the training-side reward path applies before scoring."""
+    out = video.float()
+    if float(out.max()) <= 1.0 + 1e-3:
+        out = out * 255.0
+    return out.clamp(0, 255).to(torch.uint8)
+
+
 def _build_response(
-    request_id: str, prompt: str, seed: int, rollout: bool, result: OutputBatch
+    request_id: str,
+    prompt: str,
+    seed: int,
+    rollout: bool,
+    result: OutputBatch,
+    video_dtype: str = "keep",
 ) -> list[RolloutResponse]:
     """
     rollout: bool - set to False when evaluating the model
@@ -233,6 +246,8 @@ def _build_response(
     for sample_idx in range(batch_size):
         out_i = result.output[sample_idx]
         if isinstance(out_i, torch.Tensor):
+            if video_dtype == "uint8" and out_i.is_floating_point():
+                out_i = _quantize_video_uint8(out_i)
             out_i = out_i.contiguous()
         serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
@@ -353,7 +368,12 @@ async def rollout_generate(request: RolloutRequest):
         raise HTTPException(status_code=500, detail=output_batch.error)
     stamps.mark("build_start")
     rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
+        request_id,
+        request.prompt,
+        request.seed,
+        request.rollout,
+        output_batch,
+        video_dtype=request.rollout_video_dtype,
     )
     stamps.mark("build_end")
     payload = [r.model_dump() for r in rollout_responses]
