@@ -83,6 +83,9 @@ class RolloutRequest(BaseModel):
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False
     rollout_debug_mode: bool = True
+    # "keep" returns the decoded video as-is; "uint8" quantises it engine-side
+    # with the reward path's own formula, cutting the response body ~4x.
+    rollout_video_dtype: str = "keep"
 
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
