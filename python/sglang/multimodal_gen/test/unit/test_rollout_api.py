@@ -1,10 +1,16 @@
 """Unit tests for the rollout generate API (serialization, io_struct, rollout_api)."""
 
+import json
+import time
 import types
 import unittest
 
 import torch
 
+from sglang.multimodal_gen.runtime.entrypoints.post_training.timing import (
+    WIRE_KEYS,
+    RequestStamps,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_deserialize,
     _maybe_serialize,
@@ -415,6 +421,37 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         req = Req(sampling_params=sp)
         self.assertEqual(req.rollout_sde_step_indices, [0, 2])
         self.assertEqual(req.rollout_return_step_indices, [1, 3])
+
+
+class TestRequestStamps(unittest.TestCase):
+    """The client joins these marks with its own, so what matters is that the
+    header decodes, keeps wall-clock order, and stays readable when a request
+    returned early with only some marks taken."""
+
+    def _decode(self, stamps: RequestStamps) -> dict:
+        header = stamps.to_header()
+        self.assertEqual(header, header.encode("ascii").decode())
+        return json.loads(header)
+
+    def test_marks_decode_in_wall_clock_order(self):
+        before = time.time()
+        stamps = RequestStamps("req-1")
+        for name in WIRE_KEYS:
+            stamps.mark(name)
+        decoded = self._decode(stamps)
+        self.assertEqual(decoded["rid"], "req-1")
+        values = [decoded[WIRE_KEYS[name]] for name in WIRE_KEYS]
+        self.assertEqual(values, sorted(values))
+        self.assertGreaterEqual(values[0], round(before, 6) - 1e-6)
+
+    def test_partial_marks_only_report_what_was_taken(self):
+        stamps = RequestStamps("req-2")
+        stamps.mark("srv_recv")
+        self.assertEqual(set(self._decode(stamps)), {WIRE_KEYS["srv_recv"], "rid"})
+
+    def test_unknown_mark_is_rejected(self):
+        with self.assertRaises(AssertionError):
+            RequestStamps().mark("no_such_mark")
 
 
 if __name__ == "__main__":

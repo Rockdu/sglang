@@ -14,6 +14,10 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutRequest,
     RolloutResponse,
 )
+from sglang.multimodal_gen.runtime.entrypoints.post_training.timing import (
+    TIMING_HEADER,
+    RequestStamps,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
     _maybe_serialize,
 )
@@ -317,7 +321,10 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
     },
 )
 async def rollout_generate(request: RolloutRequest):
+    stamps = RequestStamps()
+    stamps.mark("srv_recv")
     request_id = generate_request_id()
+    stamps.request_id = request_id
     server_args = get_global_server_args()
     sampling_kwargs = _build_sampling_kwargs(request)
     try:
@@ -329,6 +336,7 @@ async def rollout_generate(request: RolloutRequest):
     pipeline_request = prepare_request(
         server_args=server_args, sampling_params=sampling_params
     )
+    stamps.mark("forward_start")
     try:
         output_batch: OutputBatch = await async_scheduler_client.forward(
             pipeline_request
@@ -338,13 +346,20 @@ async def rollout_generate(request: RolloutRequest):
         raise HTTPException(
             status_code=500, detail=f"Generation failed: {exc}"
         ) from exc
+    stamps.mark("forward_end")
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
+    stamps.mark("build_start")
     rollout_responses = _build_response(
         request_id, request.prompt, request.seed, request.rollout, output_batch
     )
+    stamps.mark("build_end")
     payload = [r.model_dump() for r in rollout_responses]
+    stamps.mark("dump_end")
+    content = msgspec.msgpack.encode(payload)
+    stamps.mark("msgpack_end")
     return Response(
-        content=msgspec.msgpack.encode(payload),
+        content=content,
         media_type="application/msgpack",
+        headers={TIMING_HEADER: stamps.to_header()},
     )
