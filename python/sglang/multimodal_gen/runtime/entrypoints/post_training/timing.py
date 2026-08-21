@@ -12,6 +12,7 @@ import json
 import time
 
 TIMING_HEADER = "x-sgld-timing"
+STAGES_HEADER = "x-sgld-stages"
 
 # Abbreviated because the whole map travels in one HTTP header.
 WIRE_KEYS = {
@@ -45,3 +46,18 @@ class RequestStamps:
         if self.request_id:
             payload["rid"] = self.request_id
         return json.dumps(payload, separators=(",", ":"))
+
+
+def stages_header(metrics) -> str:
+    """The per-stage milliseconds the engine already recorded, verbatim.
+
+    The client sees the whole forward as one number, so without these it cannot
+    tell a slow denoise from a slow VAE decode. Only ``stages`` travels, never
+    the per-step list, which would grow the header with the step count.
+    """
+    if metrics is None or not metrics.stages:
+        return ""
+    return json.dumps(
+        {name: round(ms, 3) for name, ms in metrics.stages.items()},
+        separators=(",", ":"),
+    )
