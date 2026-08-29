@@ -28,6 +28,13 @@ def _effective_sde_type(batch, loop_step_index: int) -> str:
     return sde_type
 
 
+def rollout_sigma_max(sigmas: list[float]) -> float:
+    """Largest sigma strictly below 1, standing in for sigma=1 in the SDE noise
+    scale sqrt(sigma / (1 - sigma)) (mirrors SchedulerRLMixin). The schedule's
+    own max is 1.0, which would leave that division at zero."""
+    return float(sigmas[min(1, len(sigmas) - 1)])
+
+
 def minimax_h3_rollout_update_video_target(
     video_target: torch.Tensor,
     velocity: torch.Tensor,
@@ -219,6 +226,7 @@ class MiniMaxH3RolloutCollector:
 
 
 __all__ = [
+    "rollout_sigma_max",
     "MiniMaxH3RolloutCollector",
     "MiniMaxH3RolloutCtx",
     "minimax_h3_rollout_update_video_target",

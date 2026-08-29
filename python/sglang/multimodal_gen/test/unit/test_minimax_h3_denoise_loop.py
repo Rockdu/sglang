@@ -193,3 +193,37 @@ def test_rank_local_token_tags_match_reference_slice():
                 torch.testing.assert_close(
                     branch.static_kwargs["block_token_tags"], expected, rtol=0, atol=0
                 )
+
+
+def test_rollout_sde_stays_finite_at_sigma_one():
+    """The first denoising step sits at sigma=1, where the SDE noise scale
+    sqrt(sigma / (1 - sigma)) divides by zero unless the schedule's second
+    sigma stands in for it."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+        minimax_h3_rollout_update_video_target,
+        rollout_sigma_max,
+    )
+
+    sigmas = [1.0, 0.9908, 0.9796, 0.0]
+    assert rollout_sigma_max(sigmas) == sigmas[1]
+    batch = SimpleNamespace(
+        rollout_noise_level=0.7,
+        rollout_sde_type="sde",
+        rollout_log_prob_no_const=False,
+        rollout_sde_step_indices=None,
+        _h3_rollout_sigma_max=rollout_sigma_max(sigmas),
+    )
+    updated, log_prob_sum, _, _ = minimax_h3_rollout_update_video_target(
+        torch.ones(1, 4, 8),
+        torch.full((1, 4, 8), 0.5),
+        sigma_curr=sigmas[0],
+        sigma_next=sigmas[1],
+        batch=batch,
+        generator=torch.Generator().manual_seed(0),
+        loop_step_index=0,
+        noise_buffer=None,
+    )
+    assert torch.isfinite(updated).all()
+    assert torch.isfinite(log_prob_sum).all()

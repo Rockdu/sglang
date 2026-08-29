@@ -470,9 +470,10 @@ def minimax_h3_denoise_loop(
     if rollout_ctx is not None:
         from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
             minimax_h3_rollout_update_video_target,
+            rollout_sigma_max,
         )
 
-        rollout_ctx.batch._h3_rollout_sigma_max = float(max(sigmas_video))
+        rollout_ctx.batch._h3_rollout_sigma_max = rollout_sigma_max(sigmas_video)
         video_target = video_rows[video_target_slice]
         rollout_ctx.collector.record_initial(video_target.detach().clone())
     for step in range(num_steps):
