@@ -1,21 +1,15 @@
-"""E2E test for SGLANG_MM_AVOID_RETOKENIZE on the pre-tokenized VLM path.
+"""Qwen token-ID preservation through a real /generate server.
 
-A client may send a multimodal request as input_ids (list[int]) instead of text.
-On that path the server decodes the ids back to text and the HF processor
-re-tokenizes them. If the original ids were non-canonical (decode -> re-encode is
-not identity), that re-tokenization drifts: the reported prompt_tokens changes.
+    [D][escribe] + [image] -> Qwen2.5-VL server -> prompt_tokens
+                                 |                    |
+                 SGLANG_MM_AVOID_RETOKENIZE=0 or 1      |
+                                 +--------------------+
+                                   both equal len(ids) - 1 + image_tokens
 
-With SGLANG_MM_AVOID_RETOKENIZE ON (default), the server keeps the user's
-original tokens verbatim and only expands the image placeholder, so prompt_tokens
-stays faithful to what the client sent.
-
-For each model we launch a real server twice with the same predefined,
-non-canonical prompt ("Describe" split into "D"+"escribe") plus one image:
-
-  * flag OFF -> the prompt re-tokenizes (drift): prompt_tokens shrinks by the
-    drift delta.
-  * flag ON  -> no drift: prompt_tokens equals the original length (with the
-    image placeholder expanded).
+The client confirms decode/encode would merge [D][escribe] into [Describe].
+Both servers must preserve the original IDs and only expand the image token.
+This test loads model weights; CPU component coverage lives in
+unit/multimodal/test_qwen_tokenized_media.py.
 """
 
 import base64
@@ -46,21 +40,14 @@ def _data_uri():
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
 
 
-def _build_drift_prompt(model, image_token):
-    """Return (input_ids, drift_delta).
-
-    input_ids is a predefined non-canonical prompt: "Describe" is split into
-    "D"+"escribe" (decodes to the same text but re-encodes to the single merged
-    token), followed by one image placeholder. drift_delta is how many extra
-    tokens the non-canonical form carries vs. the canonical re-tokenization.
-    """
-    tok = AutoProcessor.from_pretrained(model, trust_remote_code=True).tokenizer
+def _build_drift_prompt(tokenizer, image_token):
+    """Return original IDs and the token count lost by decode/encode."""
 
     def enc(text):
-        return tok.encode(text, add_special_tokens=False)
+        return tokenizer.encode(text, add_special_tokens=False)
 
     input_ids = enc("D") + enc("escribe") + enc(" the picture: ") + enc(image_token)
-    canonical = enc(tok.decode(input_ids))
+    canonical = enc(tokenizer.decode(input_ids))
     drift_delta = len(input_ids) - len(canonical)
     return input_ids, drift_delta
 
@@ -84,12 +71,16 @@ class TestQwenVLTokenIdRetokenize(CustomTestCase):
     image_token = "<|vision_start|><|image_pad|><|vision_end|>"
     other_args = ["--trust-remote-code", "--mem-fraction-static", "0.7"]
 
-    def test_flag_off_drifts_flag_on_does_not(self):
-        input_ids, drift_delta = _build_drift_prompt(self.model, self.image_token)
+    def test_input_ids_are_preserved_under_both_legacy_flag_values(self):
+        processor = AutoProcessor.from_pretrained(self.model, trust_remote_code=True)
+        input_ids, drift_delta = _build_drift_prompt(
+            processor.tokenizer, self.image_token
+        )
         self.assertGreater(drift_delta, 0, "prompt is canonical; no drift to exercise")
         image = _data_uri()
+        counts = processor._get_num_multimodal_tokens(image_sizes=[(64, 64)])
+        expected = len(input_ids) - 1 + int(counts.num_image_tokens[0])
 
-        prompt_tokens = {}
         for flag in ("0", "1"):
             process = popen_launch_server(
                 self.model,
@@ -99,15 +90,10 @@ class TestQwenVLTokenIdRetokenize(CustomTestCase):
                 env={"SGLANG_MM_AVOID_RETOKENIZE": flag},
             )
             try:
-                prompt_tokens[flag] = _prompt_tokens(
-                    DEFAULT_URL_FOR_TEST, input_ids, image
-                )
+                prompt_tokens = _prompt_tokens(DEFAULT_URL_FOR_TEST, input_ids, image)
             finally:
                 kill_process_tree(process.pid)
-
-        # ON keeps the user's original tokens; OFF loses the drift_delta tokens.
-        pt_off, pt_on = prompt_tokens["0"], prompt_tokens["1"]
-        self.assertEqual(pt_on - pt_off, drift_delta, f"on={pt_on}, off={pt_off}")
+            self.assertEqual(prompt_tokens, expected, f"legacy flag={flag}")
 
 
 if __name__ == "__main__":

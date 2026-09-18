@@ -1,4 +1,8 @@
-"""Regression tests for Qwen3-VL multimodal feature materialization."""
+"""Regression tests for Qwen3-VL multimodal feature materialization.
+
+processor runtime + IPC/VMM -> defer visual feature reconstruction
+packed features + grids -> encoder device/dtype -> visual forward
+"""
 
 import unittest
 from types import SimpleNamespace
@@ -53,14 +57,12 @@ class TestQwen3VLFeatureMaterialization(CustomTestCase):
 
     def test_processor_defers_gpu_transport_for_encoder_dp(self):
         for transport in ("cuda_ipc", "cuda_vmm"):
-            # `mm_enable_dp_encoder` is read through `get_mm()` now, so stating
-            # it on the processor's own `server_args` no longer reaches the
-            # code under test.
             with (
                 self.subTest(transport=transport),
                 get_context().override_server_args(mm_enable_dp_encoder=True),
             ):
                 processor = QwenVLImageProcessor.__new__(QwenVLImageProcessor)
+                processor.runtime_context = get_context()
                 processor.mm_feature_transport = transport
                 processor.model_type = "qwen3_vl"
                 items = [

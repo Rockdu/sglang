@@ -2,6 +2,8 @@ import math
 import os
 import re
 import time
+from dataclasses import replace
+from functools import partial
 from typing import List, Optional, Union
 
 import numpy as np
@@ -9,9 +11,13 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
+    Qwen3OmniMoeProcessorKwargs,
+)
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.schedule_batch import (
     Modality,
     MultimodalDataItem,
@@ -29,10 +35,18 @@ from sglang.srt.models.qwen3_5 import (
     Qwen3_5MoeForConditionalGeneration,
 )
 from sglang.srt.models.qwen3_5_mtp import Qwen3_5ForCausalLMMTP
-from sglang.srt.models.qwen3_omni_moe import Qwen3OmniMoeForConditionalGeneration
+from sglang.srt.models.qwen3_omni_moe import (
+    Qwen3OmniMoeForConditionalGeneration,
+    _get_feat_extract_output_lengths,
+)
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
+from sglang.srt.multimodal.media_processing import (
+    MediaProcessOutput,
+    ProcessedMediaItem,
+    process_media_groups,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -42,7 +56,6 @@ from sglang.srt.multimodal.processors.base_processor import (
 from sglang.srt.multimodal.transport.cuda_ipc import (
     DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
 )
-from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
@@ -204,30 +217,23 @@ def smart_nframes(
     return nframes
 
 
-# process video, qwen-specific
-async def preprocess_video(
-    vr,
-    image_factor: int = IMAGE_FACTOR,
-    video_config: dict = {},
-) -> torch.Tensor:
-    # preprocessed video
-    is_video_obj = isinstance(vr, VideoDecoderWrapper)
-    if not is_video_obj:
+def preprocess_video_sync(
+    vr, *, image_factor=IMAGE_FACTOR, video_config=None
+):
+    if not isinstance(vr, VideoDecoderWrapper):
         return vr, None
-    entry_time = time.perf_counter()
-
+    video_config = video_config or {}
     total_frames, video_fps = len(vr), vr.avg_fps
-
-    nframes = smart_nframes(
-        video_config, total_frames=total_frames, video_fps=video_fps
-    )
-    idx = np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
-    idx = np.unique(idx)
-
-    video = vr.get_frames_as_tensor(idx.tolist())
-
-    video = video.permute(0, 3, 1, 2)  # NHWC -> TCHW
-
+    if "frame_indices" in video_config:
+        indices = np.asarray(video_config["frame_indices"], dtype=np.int64)
+    else:
+        nframes = smart_nframes(
+            video_config, total_frames=total_frames, video_fps=video_fps
+        )
+        indices = np.unique(
+            np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
+        )
+    video = vr.get_frames_as_tensor(indices.tolist()).permute(0, 3, 1, 2)
     nframes, _, height, width = video.shape
     min_pixels = video_config.get("min_pixels", VIDEO_MIN_PIXELS)
     total_pixels = video_config.get("total_pixels", VIDEO_TOTAL_PIXELS)
@@ -238,8 +244,6 @@ async def preprocess_video(
         ),
         int(min_pixels * 1.05),
     )
-
-    get_batch_time = time.perf_counter()
 
     max_pixels_supposed = video_config.get("max_pixels", max_pixels)
 
@@ -262,7 +266,6 @@ async def preprocess_video(
             min_pixels=min_pixels,
             max_pixels=max_pixels,
         )
-    smart_resize_time = time.perf_counter()
     video = torchvision.transforms.functional.resize(
         video,
         [resized_height, resized_width],
@@ -270,27 +273,39 @@ async def preprocess_video(
     )
     if not is_cpu():
         video = video.pin_memory()
-    video_metadata = {
+    return video, {
         "fps": video_fps,
         "duration": total_frames / video_fps,
         "total_num_frames": total_frames,
-        "frames_indices": idx,
+        "frames_indices": indices,
         "video_backend": "torchvision",
     }
-    torchvision_resize_time = time.perf_counter()
-    logger.debug(
-        f"[preprocess_video Perf], "
-        f"get_batch_time: {(get_batch_time - entry_time) * 1000:.2f} ms, "
-        f"smart_resize_time: {(smart_resize_time - get_batch_time) * 1000:.2f} ms, "
-        f"torchvision_resize_time: {(torchvision_resize_time - smart_resize_time) * 1000:.2f} ms, "
-        f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
+
+
+async def preprocess_video(vr, image_factor=IMAGE_FACTOR, video_config=None):
+    return preprocess_video_sync(
+        vr, image_factor=image_factor, video_config=video_config
     )
-    return video, video_metadata
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(SGLangBaseProcessor):
+    supports_token_expansion = True
     supports_transformers_backend = True
+    position_encoding = "qwen"
+    # Non-Qwen subclasses retain their existing token layouts.
+    _TOKENIZED_MEDIA_MODEL_TYPES = frozenset(
+        {
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_omni_moe",
+            "qwen4_exp",
+        }
+    )
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -308,6 +323,11 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
+        self.supports_token_expansion = (
+            self.supports_token_expansion
+            and self.model_type in self._TOKENIZED_MEDIA_MODEL_TYPES
+        )
+        self.prefer_tokenized_input = self.supports_token_expansion
         if self.model_type in (
             "qwen2_vl",
             "qwen2_5_vl",
@@ -327,6 +347,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             self.auto_mm_io_worker_num = 16
             self.supports_mm_processor_concurrency = True
         if hf_config.model_type == "qwen3_omni_moe":
+            self.media_processor_kwargs_type = Qwen3OmniMoeProcessorKwargs
             hf_config = hf_config.thinker_config
 
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
@@ -732,35 +753,300 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
+    def process_videos(
+        self, videos, processor, *, process_options=None, source_configs=None, **kwargs
+    ):
+        if kwargs.pop("use_audio_in_video", False):
+            raise ValueError("Qwen token expansion does not support use_audio_in_video")
+        kwargs.pop("seconds_per_chunk", None)
+        kwargs.pop("position_id_per_seconds", None)
+        supplied_metadata = kwargs.pop("video_metadata", None)
+        recipes = process_options or [None] * len(videos)
+        prepared, groups = [], []
+        for index, video in enumerate(videos):
+            config = {
+                **self.video_config,
+                **{
+                    key: value
+                    for key, value in kwargs.items()
+                    if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+                },
+            }
+            if source_configs:
+                config.update(source_configs[index])
+            processor_kwargs = dict(kwargs)
+            recipe = recipes[index]
+            if recipe:
+                config = dict(recipe["video_config"])
+                processor_kwargs = dict(recipe["processor_kwargs"])
+            try:
+                frames, metadata = preprocess_video_sync(video, video_config=config)
+            finally:
+                if isinstance(video, VideoDecoderWrapper):
+                    video.close()
+            if metadata is None:
+                if recipe:
+                    metadata = recipe["video_metadata"]
+                elif supplied_metadata is not None:
+                    metadata = supplied_metadata[index]
+            if metadata is not None:
+                processor_kwargs = {
+                    key: value
+                    for key, value in processor_kwargs.items()
+                    if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS - {"fps"}
+                }
+                processor_kwargs["do_sample_frames"] = False
+            processor_kwargs["return_metadata"] = True
+            prepared.append((frames, metadata, config, processor_kwargs))
+            for group_kwargs, indices in groups:
+                if group_kwargs == processor_kwargs:
+                    indices.append(index)
+                    break
+            else:
+                groups.append((processor_kwargs, [index]))
+        items = [None] * len(videos)
+        video_features = [None] * len(videos)
+        for processor_kwargs, indices in groups:
+            metadata = [prepared[index][1] for index in indices]
+            output = dict(
+                processor.video_processor(
+                    [prepared[index][0] for index in indices],
+                    video_metadata=metadata
+                    if all(item is not None for item in metadata)
+                    else None,
+                    **processor_kwargs,
+                )
+            )
+            if self.model_type == "qwen2_5_vl":
+                output["second_per_grid_ts"] = [
+                    processor.video_processor.temporal_patch_size / item.sampled_fps
+                    for item in output["video_metadata"]
+                ]
+            elif self.model_type == "qwen3_omni_moe":
+                output["video_second_per_grid"] = [
+                    processor.video_processor.temporal_patch_size
+                    / processor_kwargs.get("fps", 1.0)
+                ] * len(indices)
+            elif self.model_type != "qwen2_vl":
+                output["video_metadata"] = [
+                    replace(item, fps=24) if item.fps is None else item
+                    for item in output["video_metadata"]
+                ]
+            for group_index, index in enumerate(indices):
+                items[index] = ProcessedMediaItem(
+                    media_id=("video", index),
+                    metadata={
+                        name: output[name][group_index]
+                        for name in (
+                            "video_grid_thw",
+                            "video_metadata",
+                            "second_per_grid_ts",
+                            "video_second_per_grid",
+                        )
+                        if name in output
+                    },
+                )
+            if len(groups) > 1:
+                group_items = get_new_expanded_mm_items(
+                    self.collect_mm_items_from_processor_output(output)
+                )
+                for index, item in zip(indices, group_items):
+                    video_features[index] = item.feature
+        for index, item in enumerate(items):
+            frames, _, config, processor_kwargs = prepared[index]
+            metadata = item.metadata["video_metadata"]
+            config["frame_indices"] = [int(frame) for frame in metadata.frames_indices]
+            if isinstance(videos[index], VideoDecoderWrapper):
+                config.update(
+                    resized_height=int(frames.shape[-2]),
+                    resized_width=int(frames.shape[-1]),
+                )
+            item.effective_options = {
+                "video_config": config,
+                "processor_kwargs": {
+                    key: str(value) if key == "device" else value
+                    for key, value in processor_kwargs.items()
+                },
+                "video_metadata": {
+                    "fps": metadata.fps,
+                    "total_num_frames": metadata.total_num_frames,
+                    "frames_indices": config["frame_indices"],
+                },
+            }
+        if len(groups) > 1:
+            output = {
+                "pixel_values_videos": torch.cat(video_features),
+                "video_grid_thw": torch.stack(
+                    [item.metadata["video_grid_thw"] for item in items]
+                ),
+                "video_metadata": [item.metadata["video_metadata"] for item in items],
+            }
+            for name in ("second_per_grid_ts", "video_second_per_grid"):
+                if name in items[0].metadata:
+                    output[name] = [item.metadata[name] for item in items]
+        return MediaProcessOutput(encoder_inputs=output, items=items)
+
+    def process_audio(self, audios, processor, **kwargs):
+        grouped = process_media_groups(audios, processor, self.process_audio, kwargs)
+        if grouped is not None:
+            features = grouped.encoder_inputs["input_features"]
+            if isinstance(features, list):
+                grouped.encoder_inputs["input_features"] = (
+                    torch.nn.utils.rnn.pad_sequence(
+                        [feature.T for feature in features], batch_first=True
+                    ).transpose(1, 2)
+                )
+                grouped.encoder_inputs["feature_attention_mask"] = (
+                    torch.nn.utils.rnn.pad_sequence(
+                        grouped.encoder_inputs["feature_attention_mask"],
+                        batch_first=True,
+                    )
+                )
+                for index, item in enumerate(grouped.items):
+                    for name in ("input_features", "feature_attention_mask"):
+                        item.encoder_inputs[name] = grouped.encoder_inputs[name][
+                            index : index + 1
+                        ]
+            return grouped
+        output = dict(processor.feature_extractor(audios, **kwargs))
+        output["feature_attention_mask"] = output.pop("attention_mask")
+        audio_token_counts = _get_feat_extract_output_lengths(
+            output["feature_attention_mask"].sum(-1)
+        )
+        return MediaProcessOutput(
+            output,
+            [
+                ProcessedMediaItem(
+                    media_id=("audio", index),
+                    encoder_inputs={
+                        key: value[index : index + 1] for key, value in output.items()
+                    },
+                    metadata={"token_count": int(token_count)},
+                    effective_options={
+                        key: str(value) if key == "device" else value
+                        for key, value in kwargs.items()
+                    },
+                    feature_name="input_features",
+                )
+                for index, token_count in enumerate(audio_token_counts)
+            ],
+        )
+
+    def get_mm_token_replacements(self, processor, processed_media):
+        image_fragments, video_fragments, audio_fragments = [], [], []
+        if "image" in processed_media:
+            merge_length = processor.image_processor.merge_size**2
+            image_fragments = [
+                [
+                    (
+                        [self.mm_tokens.image_token_id]
+                        * (int(item.metadata["image_grid_thw"].prod()) // merge_length),
+                        item.media_id,
+                    )
+                ]
+                for item in processed_media["image"].items
+            ]
+        if "video" in processed_media:
+            merge_length = processor.video_processor.merge_size**2
+            for item in processed_media["video"].items:
+                grid = item.metadata["video_grid_thw"]
+                if self.model_type in {"qwen2_vl", "qwen2_5_vl", "qwen3_omni_moe"}:
+                    video_fragments.append(
+                        [
+                            (
+                                [self.mm_tokens.video_token_id]
+                                * (int(grid.prod()) // merge_length),
+                                item.media_id,
+                            )
+                        ]
+                    )
+                    continue
+                metadata = item.metadata["video_metadata"]
+                frame_count, height, width = grid.tolist()
+                timestamps = processor._calculate_timestamps(
+                    list(metadata.frames_indices),
+                    metadata.fps,
+                    processor.video_processor.temporal_patch_size,
+                )
+                fragment = []
+                for timestamp in timestamps[:frame_count]:
+                    fragment.extend(
+                        [
+                            (
+                                processor.tokenizer.encode(
+                                    f"<{timestamp:.1f} seconds>",
+                                    add_special_tokens=False,
+                                ),
+                                None,
+                            ),
+                            ([self.vision_start_token_id], None),
+                            (
+                                [self.mm_tokens.video_token_id]
+                                * (height * width // merge_length),
+                                item.media_id,
+                            ),
+                            ([self.vision_end_token_id], None),
+                        ]
+                    )
+                video_fragments.append(fragment)
+        if "audio" in processed_media:
+            audio_fragments = [
+                [
+                    (
+                        [self.mm_tokens.audio_token_id] * item.metadata["token_count"],
+                        item.media_id,
+                    )
+                ]
+                for item in processed_media["audio"].items
+            ]
+        replacements = [
+            ([self.mm_tokens.image_token_id], image_fragments),
+            ([self.mm_tokens.video_token_id], video_fragments),
+        ]
+        if self.mm_tokens.audio_token_id is not None:
+            replacements.append(([self.mm_tokens.audio_token_id], audio_fragments))
+        return replacements
+
     async def process_mm_data_async(
         self,
         image_data: List[Union[str, bytes]],
         input_text,
         request_obj,
         *args,
+        video_data=None,
+        audio_data=None,
+        input_ids=None,
         **kwargs,
     ):
+        if video_data is None and request_obj is not None:
+            video_data = request_obj.video_data
+        if self.supports_token_expansion:
+            return await super().process_mm_data_async(
+                image_data=image_data,
+                input_text=input_text,
+                input_ids=input_ids,
+                request_obj=request_obj,
+                video_data=video_data,
+                audio_data=audio_data,
+                **kwargs,
+            )
+        if input_ids is not None:
+            input_text = input_ids
         entry_time = time.perf_counter()
         base_output = await self.load_mm_data(
             prompt=input_text,
-            image_data=image_data,
-            video_data=request_obj.video_data,
-            audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
-        video_metadata = None
-        if base_output.videos and not isinstance(base_output.videos[0], dict):
-            videos_processed = [
-                await preprocess_video(video, video_config=self.video_config)
-                for video in base_output.videos
-            ]
-            base_output.videos, video_metadata = map(list, zip(*videos_processed))
-
-        preprocess_time = time.perf_counter()
-
+        base_output.videos, video_metadata = await self.process_video_data_async(
+            base_output.videos,
+            partial(preprocess_video_sync, video_config=self.video_config),
+        )
         processor_kwargs = {}
         processor_video_config = _get_processor_video_config(
             self.video_config, video_metadata
@@ -768,7 +1054,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         if processor_video_config is not None:
             processor_kwargs["processor_video_config"] = processor_video_config
 
-        # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
         if self.hf_config.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
@@ -838,7 +1123,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mm_items,
             "video_grid_thw",
             Modality.VIDEO,
-            request_obj.video_data,
+            video_data,
         )
 
         mrope_result = self._get_precomputed_mrope_from_output(ret)
@@ -883,8 +1168,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         logger.debug(
             f"[QwenVLProcessor Perf] {rid=}, "
             f"load_time: {(load_time - entry_time) * 1000:.2f} ms, "
-            f"preprocess_time: {(preprocess_time - load_time) * 1000:.2f} ms, "
-            f"process_time: {(process_time - preprocess_time) * 1000:.2f} ms, "
+            f"process_time: {(process_time - load_time) * 1000:.2f} ms, "
             f"get_rope_index_time: {(get_rope_index_time - process_time) * 1000:.2f} ms, "
             f"total_time: {(get_rope_index_time - entry_time) * 1000:.2f} ms"
         )
@@ -905,7 +1189,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
     def _mark_dp_encoder_features_for_deferred_reconstruction(self, mm_items):
         if not (
             self.keep_mm_features_on_device
-            and get_mm().mm_enable_dp_encoder
+            and self.runtime_context.config_bag("mm").mm_enable_dp_encoder
             and self.model_type
             in ("qwen3_vl", "qwen3_vl_moe", "qwen3_5", "qwen3_5_moe")
         ):
