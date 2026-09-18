@@ -1,15 +1,22 @@
 import asyncio
 import json
 import math
+from dataclasses import replace
 from typing import List, Tuple, Union
 
 import numpy as np
 import torch
+from transformers.models.glm46v.processing_glm46v import Glm46VProcessor
 
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
+from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
 from sglang.srt.managers.schedule_batch import Modality, MultimodalProcessorOutput
 from sglang.srt.models.glm4v import Glm4vForConditionalGeneration
 from sglang.srt.models.glm4v_moe import Glm4vMoeForConditionalGeneration
+from sglang.srt.multimodal.media_processing import (
+    MediaProcessOutput,
+    ProcessedMediaItem,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -411,9 +418,11 @@ def glm_sample_and_decode_sync(vr, video_config=None, video_processor=None):
     if not fps or fps <= 0:
         raise ValueError(f"Cannot determine video fps (avg_fps={fps!r})")
     duration = len(vr) / fps
-    indices = _hf_sample_frame_indices(
-        video_processor, len(vr), fps, duration, video_config
-    )
+    indices = video_config.get("frame_indices")
+    if indices is None:
+        indices = _hf_sample_frame_indices(
+            video_processor, len(vr), fps, duration, video_config
+        )
     if indices is None:
         indices = glm_sample_frame_indices(
             len(vr),
@@ -437,6 +446,8 @@ def _passthrough_video_metadata(video, video_config):
 class Glm4vImageProcessor(SGLangBaseProcessor):
     smart_rgb_conversion = True
     video_preprocessing_device = "cpu"
+    supports_token_expansion = True
+    position_encoding = "glm"
     models = [
         m
         for m in [
@@ -449,6 +460,7 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
     ]
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        self.prefer_tokenized_input = self.supports_token_expansion
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         # GLM-V specific tokens
@@ -541,10 +553,27 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         input_text,
         request_obj,
         *args,
+        video_data=None,
+        audio_data=None,
+        input_ids=None,
         **kwargs,
     ):
+        if video_data is None and request_obj is not None:
+            video_data = request_obj.video_data
+        if self.supports_token_expansion:
+            return await super().process_mm_data_async(
+                image_data=image_data,
+                audio_data=audio_data,
+                input_text=input_text,
+                input_ids=input_ids,
+                request_obj=request_obj,
+                video_data=video_data,
+                **kwargs,
+            )
+        if input_ids is not None:
+            input_text = input_ids
         # Bare base64 video must use SGLang's decoder because HF treats it as a path-like string.
-        video_urls, video_configs = split_glm_video_items(request_obj.video_data)
+        video_urls, video_configs = split_glm_video_items(video_data)
         video_processor = getattr(self._processor, "video_processor", None)
         default_video_config = glm_processor_video_config(video_processor)
         default_video_config.update(self.video_config)
@@ -650,3 +679,217 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
             mrope_positions=mrope_positions,
             mrope_position_delta=mrope_position_delta,
         )
+
+    def process_videos(
+        self, videos, processor, *, process_options=None, source_configs=None, **kwargs
+    ):
+        video_processor = processor.video_processor
+        process_options = process_options or [None] * len(videos)
+        source_configs = source_configs or [{} for _ in videos]
+        default_config = glm_processor_video_config(video_processor)
+        default_config.update(self.video_config)
+        source_configs = _merge_glm_video_configs(default_config, source_configs)
+        total_budget = kwargs.get("max_image_tokens")
+        if total_budget is None:
+            budget_kwargs = glm_budget_kwargs(
+                video_processor,
+                user_max_image_tokens=glm_max_image_tokens_from_configs(source_configs),
+                split=True,
+            )
+            total_budget = budget_kwargs["max_image_tokens"] if budget_kwargs else None
+        remaining_budget = total_budget
+        if remaining_budget is not None:
+            remaining_budget -= sum(
+                recipe["token_count"] for recipe in process_options if recipe
+            )
+            if remaining_budget < 0:
+                raise ValueError(
+                    "Historical video tokens exceed the video token budget"
+                )
+        new_video_count = sum(recipe is None for recipe in process_options)
+        new_video_budget = (
+            remaining_budget // new_video_count
+            if remaining_budget is not None and new_video_count
+            else None
+        )
+        if new_video_budget is not None and new_video_budget <= 0:
+            raise ValueError("No token budget remains for new videos")
+
+        supplied_metadata = kwargs.pop("video_metadata", None)
+        prepared, groups = [], []
+        for index, (video, frozen_recipe) in enumerate(zip(videos, process_options)):
+            config = dict(source_configs[index])
+            processor_kwargs = {
+                key: value
+                for key, value in kwargs.items()
+                if key not in {"fps", "max_frames", "max_tokens_per_frame"}
+            }
+            if frozen_recipe:
+                config = dict(frozen_recipe["video_config"])
+                processor_kwargs = dict(frozen_recipe["processor_kwargs"])
+            elif new_video_budget is not None:
+                processor_kwargs["max_image_tokens"] = new_video_budget
+            config = _glm_effective_presize_budget(
+                config, processor_kwargs.get("max_image_tokens")
+            )
+            try:
+                if isinstance(video, VideoDecoderWrapper):
+                    frames, metadata = glm_sample_and_decode_sync(
+                        video, config, video_processor
+                    )
+                elif isinstance(video, list) and (
+                    not video or isinstance(video[0], dict)
+                ):
+                    frames, metadata = preprocess_video_frames_sync(video)
+                else:
+                    frames, metadata = video, _passthrough_video_metadata(video, config)
+            finally:
+                if isinstance(video, VideoDecoderWrapper):
+                    video.close()
+            if not isinstance(video, VideoDecoderWrapper):
+                if frozen_recipe:
+                    metadata = frozen_recipe["video_metadata"]
+                elif supplied_metadata is not None:
+                    metadata = supplied_metadata[index]
+            processor_kwargs.update(do_sample_frames=False, return_metadata=True)
+            prepared.append((frames, metadata, config, processor_kwargs))
+            for group_options, indices in groups:
+                if group_options == processor_kwargs:
+                    indices.append(index)
+                    break
+            else:
+                groups.append((processor_kwargs, [index]))
+
+        items = [None] * len(videos)
+        video_features = [None] * len(videos)
+        for processor_kwargs, indices in groups:
+            group_output = dict(
+                video_processor(
+                    [prepared[index][0] for index in indices],
+                    video_metadata=[prepared[index][1] for index in indices],
+                    **processor_kwargs,
+                )
+            )
+            group_output["video_metadata"] = [
+                replace(metadata, fps=24) if metadata.fps is None else metadata
+                for metadata in group_output["video_metadata"]
+            ]
+            for group_index, index in enumerate(indices):
+                items[index] = ProcessedMediaItem(
+                    media_id=("video", index),
+                    metadata={
+                        "video_grid_thw": group_output["video_grid_thw"][group_index],
+                        "video_metadata": group_output["video_metadata"][group_index],
+                    },
+                )
+            if len(groups) > 1:
+                group_items = get_new_expanded_mm_items(
+                    self.collect_mm_items_from_processor_output(group_output)
+                )
+                for index, item in zip(indices, group_items):
+                    video_features[index] = item.feature
+        for index, (item, frozen_recipe) in enumerate(zip(items, process_options)):
+            token_count = (
+                int(item.metadata["video_grid_thw"].prod())
+                // video_processor.merge_size**2
+            )
+            if frozen_recipe and token_count != frozen_recipe["token_count"]:
+                raise ValueError(
+                    "Historical video preprocessing changed its token count"
+                )
+            if (
+                not frozen_recipe
+                and new_video_budget is not None
+                and token_count > new_video_budget
+            ):
+                raise ValueError("Processed video exceeds its available token budget")
+            config, processor_kwargs = prepared[index][2:]
+            metadata = item.metadata["video_metadata"]
+            config["frame_indices"] = [int(frame) for frame in metadata.frames_indices]
+            item.effective_options = {
+                "video_config": config,
+                "processor_kwargs": {
+                    key: str(value) if key == "device" else value
+                    for key, value in processor_kwargs.items()
+                },
+                "token_count": token_count,
+                "video_metadata": {
+                    "fps": metadata.fps,
+                    "total_num_frames": metadata.total_num_frames,
+                    "frames_indices": config["frame_indices"],
+                },
+            }
+        output = (
+            group_output
+            if len(groups) == 1
+            else {
+                "pixel_values_videos": torch.cat(video_features),
+                "video_grid_thw": torch.stack(
+                    [item.metadata["video_grid_thw"] for item in items]
+                ),
+                "video_metadata": [item.metadata["video_metadata"] for item in items],
+            }
+        )
+        return MediaProcessOutput(encoder_inputs=output, items=items)
+
+    def get_mm_token_replacements(self, processor, processed_media):
+        image_fragments, video_fragments = [], []
+        if "image" in processed_media:
+            merge_length = processor.image_processor.merge_size**2
+            image_fragments = [
+                [
+                    (
+                        [self.IM_TOKEN_ID]
+                        * (int(item.metadata["image_grid_thw"].prod()) // merge_length),
+                        item.media_id,
+                    )
+                ]
+                for item in processed_media["image"].items
+            ]
+        if "video" in processed_media:
+            merge_length = processor.video_processor.merge_size**2
+            for item in processed_media["video"].items:
+                num_frames, height, width = item.metadata["video_grid_thw"].tolist()
+                metadata = item.metadata["video_metadata"]
+                timestamps = [
+                    frame / metadata.fps for frame in metadata.frames_indices
+                ][::2][:num_frames]
+                timestamps += [timestamps[-1] if timestamps else 0] * (
+                    num_frames - len(timestamps)
+                )
+                fragment = [([self.VIDEO_START_TOKEN_ID], None)]
+                for timestamp in timestamps:
+                    timestamp_text = (
+                        f"{timestamp:.1f} seconds"
+                        if isinstance(processor, Glm46VProcessor)
+                        else str(int(timestamp))
+                    )
+                    fragment.extend(
+                        [
+                            ([self.IMAGE_START_TOKEN_ID], None),
+                            (
+                                [self.IM_TOKEN_ID] * (height * width // merge_length),
+                                item.media_id,
+                            ),
+                            ([self.IMAGE_END_TOKEN_ID], None),
+                            (
+                                processor.tokenizer.encode(
+                                    timestamp_text, add_special_tokens=False
+                                ),
+                                None,
+                            ),
+                        ]
+                    )
+                fragment.append(([self.VIDEO_END_TOKEN_ID], None))
+                video_fragments.append(fragment)
+        return [
+            ([self.IM_TOKEN_ID], image_fragments),
+            (
+                [
+                    self.VIDEO_START_TOKEN_ID,
+                    self.VIDEO_TOKEN_ID,
+                    self.VIDEO_END_TOKEN_ID,
+                ],
+                video_fragments,
+            ),
+        ]
