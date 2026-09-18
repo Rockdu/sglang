@@ -1108,13 +1108,23 @@ def _try_simple_split(item, num_items, expanded_mm_items):
 
 
 def get_new_expanded_mm_items(original_mm_items):
+    """Split media by offsets, or by source grids before offsets are bound."""
     expanded_mm_items = []
     for item in original_mm_items:
-        is_bundled = item.offsets is not None and len(item.offsets) > 1
+        num_items = len(item.offsets) if item.offsets is not None else 0
+        if item.offsets is None:
+            source_grid = None
+            if item.is_image():
+                source_grid = item.model_specific_data.get("image_grid_thw")
+                if source_grid is None:
+                    source_grid = item.model_specific_data.get("image_grid_hws")
+            elif item.is_video():
+                source_grid = item.model_specific_data.get("video_grid_thw")
+            if _is_rank2_grid(source_grid):
+                num_items = _get_length(source_grid)
+        is_bundled = num_items > 1
 
         if is_bundled:
-            num_items = len(item.offsets)
-
             if item.is_image():
                 # MoonViT-style models (e.g. LocateAnything) carry per-image
                 # grids under `image_grid_hws` ([h, w]) rather than
@@ -1173,7 +1183,8 @@ def get_new_expanded_mm_items(original_mm_items):
                         new_item.precomputed_embeddings = _slice_value(
                             item.precomputed_embeddings, start, end
                         )
-                    new_item.offsets = [item.offsets[i]]
+                    if item.offsets is not None:
+                        new_item.offsets = [item.offsets[i]]
                     new_item.model_specific_data = _slice_model_data(
                         item.model_specific_data,
                         index=i,
@@ -1206,7 +1217,7 @@ def get_new_expanded_mm_items(original_mm_items):
                 total_frames = sum(frames_per_video)
 
                 # num_items should equal total_frames when T > 1
-                if num_items != total_frames:
+                if item.offsets is not None and num_items != total_frames:
                     expanded_mm_items.append(item)
                     continue
 
@@ -1258,7 +1269,8 @@ def get_new_expanded_mm_items(original_mm_items):
                             item.precomputed_embeddings, start, end
                         )
                     # Group offsets for this video (all frames of this video)
-                    new_item.offsets = item.offsets[frame_start:frame_end]
+                    if item.offsets is not None:
+                        new_item.offsets = item.offsets[frame_start:frame_end]
                     # For video_grid_thw, slice the corresponding row [T, H, W] for this video
                     new_item.model_specific_data = _slice_model_data(
                         item.model_specific_data,

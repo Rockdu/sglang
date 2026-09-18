@@ -6,12 +6,16 @@ import pkgutil
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
 PROCESSOR_MAPPING = {}
+
+
+def _architecture_name(model):
+    return model if isinstance(model, str) else model.__name__
 
 
 def import_processors(package_name: str, overwrite: bool = False):
@@ -36,16 +40,19 @@ def import_processors(package_name: str, overwrite: bool = False):
                 for arch in getattr(cls, "models"):
                     if overwrite:
                         for model_cls, processor_cls in PROCESSOR_MAPPING.items():
-                            if model_cls.__name__ == arch.__name__:
+                            if _architecture_name(model_cls) == _architecture_name(
+                                arch
+                            ):
                                 del PROCESSOR_MAPPING[model_cls]
                                 break
                     PROCESSOR_MAPPING[arch] = cls
 
 
-def get_mm_processor_cls(hf_config, model_config=None):
+def get_mm_processor_cls(hf_config, model_config=None, *, runtime_context=None):
     """The class :func:`get_mm_processor` would instantiate, or ``None`` when the
     architecture has no registered processor."""
-    model_impl = str(get_model().model_impl).lower()
+    runtime_context = runtime_context or get_context()
+    model_impl = str(runtime_context.config_bag("model").model_impl).lower()
     uses_transformers_backend = model_impl == "transformers"
     if model_impl == "auto" and model_config is not None:
         from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -55,7 +62,8 @@ def get_mm_processor_cls(hf_config, model_config=None):
         )
 
     for model_cls, processor_cls in PROCESSOR_MAPPING.items():
-        if model_cls.__name__ not in hf_config.architectures:
+        architecture = _architecture_name(model_cls)
+        if architecture not in hf_config.architectures:
             continue
         if not uses_transformers_backend or getattr(
             processor_cls, "supports_transformers_backend", False
@@ -78,12 +86,18 @@ def get_mm_processor(
     processor,
     transport_mode,
     model_config=None,
+    *,
+    runtime_context=None,
     **kwargs,
 ) -> BaseMultimodalProcessor:
-    processor_cls = get_mm_processor_cls(hf_config, model_config)
+    processor_cls = get_mm_processor_cls(
+        hf_config, model_config, runtime_context=runtime_context
+    )
     if processor_cls is None:
         raise ValueError(
             f"No processor registered for architecture: {hf_config.architectures}.\n"
-            f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
+            f"Registered architectures: {[_architecture_name(model_cls) for model_cls in PROCESSOR_MAPPING]}"
         )
+    if runtime_context is not None:
+        kwargs["runtime_context"] = runtime_context
     return processor_cls(hf_config, server_args, processor, transport_mode, **kwargs)

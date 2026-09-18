@@ -600,12 +600,15 @@ class MultimodalProcessorOutput(
     # for transformers-compatibility
     token_type_ids: Optional[torch.Tensor] = None
 
+    media_process_options: Optional[List[Dict[str, Any]]] = None
+
     @staticmethod
     def from_dict(d: dict) -> MultimodalProcessorOutput:
         return MultimodalProcessorOutput(
             mm_items=d["mm_items"],
             input_ids=d.get("input_ids"),
             padded_input_ids=d.get("padded_input_ids"),
+            media_process_options=d.get("media_process_options"),
             im_token_id=d.get("im_token_id"),
             im_start_id=d.get("im_start_id"),
             im_end_id=d.get("im_end_id"),

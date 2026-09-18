@@ -349,10 +349,8 @@ class InternVLProcessor(BaseMultimodalProcessor):
         )
 
     async def process_mm_data_async(
-        self, image_data, input_text, request_obj, **kwargs
+        self, image_data, input_text, request_obj, *, video_data=None, **kwargs
     ):
-        video_data = getattr(request_obj, "video_data", None) or []
-
         # Handle processor_output and precomputed_embedding formats
         if isinstance(input_text, list) or self._has_special_format(
             image_data, video_data
@@ -370,6 +368,7 @@ class InternVLProcessor(BaseMultimodalProcessor):
         if is_internlm2:
             return await self.process_internlm2_mm_data_async(
                 image_data=image_data,
+                video_data=video_data,
                 input_text=input_text,
                 request_obj=request_obj,
                 **kwargs,
@@ -378,13 +377,14 @@ class InternVLProcessor(BaseMultimodalProcessor):
             # Default branch uses OpenAI-style placeholders
             return await self.process_qwen_mm_data_async(
                 image_data=image_data,
+                video_data=video_data,
                 input_text=input_text,
                 request_obj=request_obj,
                 **kwargs,
             )
 
     async def process_qwen_mm_data_async(
-        self, image_data, input_text, request_obj, **kwargs
+        self, image_data, input_text, request_obj, *, video_data=None, **kwargs
     ):
 
         img_max_num = (
@@ -407,7 +407,6 @@ class InternVLProcessor(BaseMultimodalProcessor):
 
         # Qwen/Qwen3 branch: OpenAI-style placeholders <image>/<video>
         prompt = input_text or ""
-        video_data = getattr(request_obj, "video_data", None) or []
 
         if image_data:
             prompt = self._ensure_placeholders_before_assistant(
@@ -622,11 +621,10 @@ class InternVLProcessor(BaseMultimodalProcessor):
         )
 
     async def process_internlm2_mm_data_async(
-        self, image_data, input_text, request_obj, **kwargs
+        self, image_data, input_text, request_obj, *, video_data=None, **kwargs
     ):
         # InternLM2 branch: legacy placeholder <IMG_CONTEXT> (stable for InternLM2 prompt behavior)
         prompt = input_text or ""
-        video_data = getattr(request_obj, "video_data", None) or []
         if video_data:
             logger.warning(
                 "[internvl][internlm2] video input ignored for InternLM2 branch"
