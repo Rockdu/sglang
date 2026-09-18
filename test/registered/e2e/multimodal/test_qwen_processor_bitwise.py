@@ -1,0 +1,503 @@
+"""Compare the original and refactored Qwen async processor boundaries bit for bit.
+
+    pinned benchmark rows + rendered prompts + SHA-256 checked local media
+                     |                         |
+        baseline checkout subprocess   candidate checkout subprocess
+        full input_text every turn     input_ids; expanded prefix + new suffix
+                     |                         |
+              real process_mm_data_async in both checkouts
+                     |                         |
+           final IDs + every output/item field + tensor shape/dtype/raw bytes
+                     +---------- exact comparison ----------+
+
+The same Python environment and checkpoint processor files serve both captures.
+Only media_process_options is excluded from model-input parity: it is new session
+bookkeeping, retained in the artifact and reused to freeze historical media.
+Item grouping and all other fields are compared unchanged, including offsets and
+mRoPE. No model weights or generation are needed. CPU tests exercise the strict
+comparator; CUDA CI also runs a pinned public benchmark sample through both real
+routes with two questions/images joined at an explicit assistant end token.
+A manifest override supplies the complete model/benchmark/turn matrix.
+"""
+
+import argparse
+import asyncio
+import hashlib
+import importlib.metadata
+import json
+import os
+import pickle
+import random
+import struct
+import subprocess
+import sys
+import tarfile
+from enum import Enum
+from pathlib import Path
+
+import msgspec
+import numpy as np
+import pytest
+import torch
+
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
+
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cuda_ci(est_time=120, stage="base-b", runner_config="1-gpu-large")
+
+BASELINE_REVISION = "a63efd9056b33a3d4a32dfba6262fac1d62b959a"
+
+
+def _snapshot(value):
+    if isinstance(value, torch.Tensor):
+        tensor = value.detach().cpu().contiguous()
+        return {
+            "type": "torch.Tensor",
+            "shape": tuple(tensor.shape),
+            "dtype": str(tensor.dtype),
+            "bytes": tensor.reshape(-1).view(torch.uint8).numpy().tobytes(),
+        }
+    if isinstance(value, np.ndarray):
+        return {
+            "type": "numpy.ndarray",
+            "shape": value.shape,
+            "dtype": value.dtype.str,
+            "bytes": value.tobytes(order="C"),
+        }
+    if isinstance(value, msgspec.Struct):
+        return _snapshot(msgspec.structs.asdict(value))
+    if isinstance(value, Enum):
+        return (type(value).__name__, value.name)
+    if isinstance(value, dict):
+        return {key: _snapshot(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return type(value)(_snapshot(item) for item in value)
+    if isinstance(value, np.generic):
+        return ("numpy.scalar", value.dtype.str, value.tobytes())
+    if isinstance(value, float):
+        return ("float64", struct.pack("!d", value))
+    if value is None or isinstance(value, (bool, int, str, bytes)):
+        return value
+    raise TypeError(f"Uncaptured processor output type: {type(value).__qualname__}")
+
+
+def _assert_identical(reference, candidate, field="output"):
+    assert type(reference) is type(candidate), f"{field}: types differ"
+    if isinstance(reference, dict):
+        assert reference.keys() == candidate.keys(), (
+            f"{field}: fields differ: "
+            f"reference-only={reference.keys() - candidate.keys()}, "
+            f"candidate-only={candidate.keys() - reference.keys()}"
+        )
+        for key in reference:
+            _assert_identical(reference[key], candidate[key], f"{field}.{key}")
+    elif isinstance(reference, (list, tuple)):
+        assert len(reference) == len(candidate), f"{field}: lengths differ"
+        for index, (old, new) in enumerate(zip(reference, candidate)):
+            _assert_identical(old, new, f"{field}[{index}]")
+    elif isinstance(reference, bytes):
+        assert reference == candidate, f"{field}: raw bytes differ"
+    else:
+        assert reference == candidate, f"{field}: {reference!r} != {candidate!r}"
+
+
+def _sha256(path):
+    with Path(path).open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def _checkpoint_files(checkpoint):
+    weight_suffixes = {".safetensors", ".bin", ".pt", ".pth", ".onnx", ".gguf"}
+    return {
+        str(path.relative_to(checkpoint)): _sha256(path)
+        for path in sorted(checkpoint.rglob("*"))
+        if path.is_file()
+        and path.suffix not in weight_suffixes
+        and ".cache" not in path.parts
+        and ".git" not in path.parts
+    }
+
+
+def _checkout_identity(checkout):
+    exported_revision = checkout / ".bitwise-reference-revision"
+    if exported_revision.exists():
+        return {"revision": exported_revision.read_text().strip(), "diff": ""}
+    return {
+        "revision": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=checkout, text=True
+        ).strip(),
+        "diff": subprocess.check_output(
+            ["git", "diff", "HEAD", "--", "python"], cwd=checkout, text=True
+        ),
+    }
+
+
+async def _capture(checkout, manifest_path, route):
+    import sglang
+    from sglang.srt.managers.io_struct import GenerateReqInput
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+    from sglang.srt.runtime_context import publish, reset_context
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.utils.hf_transformers import get_config, get_processor
+
+    assert Path(sglang.__file__).resolve().is_relative_to(checkout / "python")
+    source = _checkout_identity(checkout)
+    if route == "baseline":
+        assert source == {"revision": BASELINE_REVISION, "diff": ""}
+    manifest = json.loads(manifest_path.read_text())
+    checkpoint = (manifest_path.parent / manifest["checkpoint"]["path"]).resolve()
+    seed = manifest["seed"]
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.set_num_threads(1)
+    torch.use_deterministic_algorithms(True)
+    backend = manifest["image_processor_backend"]
+    server_args = ServerArgs(
+        model_path=str(checkpoint),
+        model_impl="sglang",
+        trust_remote_code=manifest.get("trust_remote_code", False),
+        image_processor_backend=backend,
+        disable_fast_image_processor=backend == "pil",
+        mm_feature_transport="cpu",
+        mm_preprocess_cache_size_mb=0,
+        mm_io_worker_num=1,
+        mm_processor_worker_num=1,
+        mm_process_config=manifest["mm_process_config"],
+    )
+    publish(server_args, role="tokenizer")
+    hf_config = get_config(
+        str(checkpoint),
+        trust_remote_code=server_args.trust_remote_code,
+        local_files_only=True,
+    )
+    hf_processor = get_processor(
+        str(checkpoint),
+        trust_remote_code=server_args.trust_remote_code,
+        image_processor_backend=backend,
+        local_files_only=True,
+    )
+    processor = QwenVLImageProcessor(
+        hf_config, server_args, hf_processor, None, skip_mm_pool=True
+    )
+    captures = {}
+    bookkeeping = {}
+    try:
+        for sample in manifest["samples"]:
+            previous_ids, previous_expanded_ids = [], []
+            previous_media = {modality: [] for modality in ("image", "video", "audio")}
+            recipes = []
+            for turn_index, turn in enumerate(sample["turns"]):
+                case_id = f"{sample['id']}/turn-{turn_index}"
+                assert case_id not in captures, f"Duplicate fixture: {case_id}"
+                sources = {}
+                for modality in previous_media:
+                    files = turn["media"][modality]
+                    assert (
+                        files[: len(previous_media[modality])]
+                        == previous_media[modality]
+                    )
+                    sources[modality] = []
+                    for entry in files:
+                        path = (manifest_path.parent / entry["path"]).resolve()
+                        assert _sha256(path) == entry["sha256"], (
+                            f"Changed media: {path}"
+                        )
+                        sources[modality].append(str(path))
+                prompt = turn["prompt"]
+                add_special_tokens = not (
+                    hf_processor.tokenizer.bos_token
+                    and prompt.startswith(hf_processor.tokenizer.bos_token)
+                )
+                input_ids = hf_processor.tokenizer.encode(
+                    prompt, add_special_tokens=add_special_tokens
+                )
+                assert input_ids[: len(previous_ids)] == previous_ids, (
+                    f"{case_id}: cumulative prompt does not preserve the prior token prefix"
+                )
+                if route == "baseline":
+                    request = GenerateReqInput(
+                        text=prompt,
+                        image_data=sources["image"],
+                        video_data=sources["video"],
+                        audio_data=sources["audio"],
+                    )
+                    output = await processor.process_mm_data_async(
+                        image_data=request.image_data,
+                        input_text=prompt,
+                        request_obj=request,
+                    )
+                else:
+                    for recipe in recipes:
+                        modality, index = recipe["modality"], recipe["index"]
+                        sources[modality][index] = {
+                            "url": sources[modality][index],
+                            "process_options": recipe["options"],
+                        }
+                    boundary = len(previous_expanded_ids)
+                    partial_ids = previous_expanded_ids + input_ids[len(previous_ids) :]
+                    request = GenerateReqInput(
+                        input_ids=partial_ids,
+                        mm_token_expansion_start_len=boundary,
+                        image_data=sources["image"],
+                        video_data=sources["video"],
+                        audio_data=sources["audio"],
+                    )
+                    output = await processor.process_mm_data_async(
+                        image_data=request.image_data,
+                        video_data=request.video_data,
+                        audio_data=request.audio_data,
+                        input_text="",
+                        input_ids=partial_ids,
+                        request_obj=request,
+                    )
+                    assert output.input_ids[:boundary] == previous_expanded_ids
+                    recipes = output.media_process_options
+                model_inputs = msgspec.structs.asdict(output)
+                bookkeeping[case_id] = _snapshot(
+                    model_inputs.pop("media_process_options", None)
+                )
+                captures[case_id] = {
+                    "unexpanded_input_ids": input_ids,
+                    "model_inputs": _snapshot(model_inputs),
+                }
+                previous_ids = input_ids
+                previous_expanded_ids = list(output.input_ids)
+                previous_media = turn["media"]
+    finally:
+        processor.shutdown()
+        reset_context()
+    return {
+        "source": source,
+        "manifest": manifest,
+        "checkpoint_files": _checkpoint_files(checkpoint),
+        "dependencies": {
+            distribution.metadata["Name"]: distribution.version
+            for distribution in importlib.metadata.distributions()
+        },
+        "python": sys.version,
+        "cases": captures,
+        "bookkeeping": bookkeeping,
+    }
+
+
+def compare_checkouts(reference, candidate, manifest_path, artifacts):
+    artifacts.mkdir(parents=True, exist_ok=True)
+    snapshots = []
+    seed = json.loads(manifest_path.read_text())["seed"]
+    for route, checkout in (("baseline", reference), ("candidate", candidate)):
+        output_path = artifacts / f"{route}.pickle"
+        subprocess.run(
+            [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                "--capture",
+                route,
+                "--checkout",
+                str(checkout),
+                "--manifest",
+                str(manifest_path),
+                "--output",
+                str(output_path),
+            ],
+            cwd=checkout,
+            env={
+                **os.environ,
+                "PYTHONPATH": str(checkout / "python"),
+                "PYTHONHASHSEED": str(seed),
+                "HF_HUB_OFFLINE": "1",
+                "TRANSFORMERS_OFFLINE": "1",
+            },
+            check=True,
+        )
+        with output_path.open("rb") as stream:
+            snapshots.append(pickle.load(stream))
+    for field in ("manifest", "checkpoint_files", "dependencies", "python", "cases"):
+        _assert_identical(snapshots[0][field], snapshots[1][field], field)
+    print(f"Bitwise identical: {len(snapshots[0]['cases'])} benchmark turns")
+
+
+def _export_baseline(candidate, reference):
+    if subprocess.run(
+        ["git", "cat-file", "-e", BASELINE_REVISION], cwd=candidate
+    ).returncode:
+        subprocess.run(
+            ["git", "fetch", "origin", BASELINE_REVISION], cwd=candidate, check=True
+        )
+    archive_path = reference.parent / "baseline.tar"
+    with archive_path.open("wb") as archive:
+        subprocess.run(
+            ["git", "archive", BASELINE_REVISION, "python"],
+            cwd=candidate,
+            stdout=archive,
+            check=True,
+        )
+    reference.mkdir()
+    with tarfile.open(archive_path) as archive:
+        archive.extractall(reference, filter="data")
+    (reference / ".bitwise-reference-revision").write_text(BASELINE_REVISION)
+
+
+def _default_benchmark_manifest(directory):
+    from datasets import Image, load_dataset
+    from huggingface_hub import snapshot_download
+
+    from sglang.srt.utils.hf_transformers import get_processor
+
+    checkpoint_id = "Qwen/Qwen3.5-27B"
+    checkpoint_revision = "fc05daec18b0a78c049392ed2e771dde82bdf654"
+    dataset_id = "xai-org/RealworldQA"
+    dataset_revision = "17e7f75e092e47169732462ea3cdfebe911105dd"
+    seed = 20260918
+    row_indices = random.Random(seed).sample(range(765), 16)[:2]
+    checkpoint = snapshot_download(
+        checkpoint_id,
+        revision=checkpoint_revision,
+        allow_patterns=["*.json", "*.txt", "*.model", "*.jinja", "*.py"],
+    )
+    rows = load_dataset(
+        dataset_id,
+        "default",
+        revision=dataset_revision,
+        split="test",
+        streaming=True,
+    )
+    rows = rows.cast_column("image", Image(decode=False))
+    sampled_rows = {
+        index: row
+        for index, row in enumerate(rows.take(max(row_indices) + 1))
+        if index in row_indices
+    }
+    processor = get_processor(
+        checkpoint, image_processor_backend="pil", local_files_only=True
+    )
+    prompt, images, turns = "", [], []
+    for row_index in row_indices:
+        row = sampled_rows[row_index]
+        image_path = directory / f"realworldqa-{row_index}.image"
+        image_path.write_bytes(row["image"]["bytes"])
+        if prompt:
+            prompt += processor.tokenizer.eos_token + "\n"
+        prompt += processor.apply_chat_template(
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "image"},
+                        {"type": "text", "text": row["question"]},
+                    ],
+                }
+            ],
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+        images.append({"path": image_path.name, "sha256": _sha256(image_path)})
+        turns.append(
+            {
+                "prompt": prompt,
+                "media": {"image": list(images), "video": [], "audio": []},
+            }
+        )
+    manifest = {
+        "checkpoint": {
+            "path": checkpoint,
+            "repo_id": checkpoint_id,
+            "revision": checkpoint_revision,
+        },
+        "seed": seed,
+        "image_processor_backend": "pil",
+        "mm_process_config": {},
+        "samples": [
+            {
+                "id": "realworldqa-multiturn",
+                "dataset": {
+                    "repo_id": dataset_id,
+                    "revision": dataset_revision,
+                    "config": "default",
+                    "split": "test",
+                    "row_ids": row_indices,
+                },
+                "turns": turns,
+            }
+        ],
+    }
+    manifest_path = directory / "manifest.json"
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    return manifest_path
+
+
+@pytest.mark.parametrize(
+    "change", ["signed_zero", "dtype", "shape", "metadata", "numpy_scalar_dtype"]
+)
+def test_bitwise_comparison_rejects_numerically_equal_or_metadata_changed_outputs(
+    change,
+):
+    reference = {"feature": torch.tensor([0.0, 1.0]), "offsets": [(1, 2)]}
+    candidate = dict(reference)
+    if change == "signed_zero":
+        candidate["feature"] = torch.tensor([-0.0, 1.0])
+        assert torch.equal(reference["feature"], candidate["feature"])
+    elif change == "dtype":
+        candidate["feature"] = reference["feature"].to(torch.float64)
+    elif change == "shape":
+        candidate["feature"] = reference["feature"].reshape(1, 2)
+    elif change == "metadata":
+        candidate["offsets"] = [(1, 3)]
+    else:
+        reference["scalar"] = np.float32(1)
+        candidate["scalar"] = np.float64(1)
+    with pytest.raises(AssertionError, match="output\\."):
+        _assert_identical(_snapshot(reference), _snapshot(candidate))
+    _assert_identical(_snapshot(reference), _snapshot(reference))
+
+
+def test_benchmark_prompts_match_original_async_boundary(tmp_path):
+    if not torch.cuda.is_available():
+        pytest.skip("Real async benchmark parity runs on the registered CUDA CI runner")
+    candidate = Path(__file__).resolve().parents[4]
+    manifest_override = os.environ.get("SGLANG_MM_BITWISE_MANIFEST")
+    reference_override = os.environ.get("SGLANG_MM_BITWISE_REFERENCE")
+    manifest = (
+        Path(manifest_override).resolve()
+        if manifest_override
+        else _default_benchmark_manifest(tmp_path)
+    )
+    reference = (
+        Path(reference_override).resolve()
+        if reference_override
+        else tmp_path / "baseline"
+    )
+    if not reference_override:
+        _export_baseline(candidate, reference)
+    compare_checkouts(reference, candidate, manifest, tmp_path / "captures")
+
+
+def _main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--capture", choices=("baseline", "candidate"))
+    parser.add_argument("--checkout", type=Path)
+    parser.add_argument("--reference", type=Path)
+    parser.add_argument("--candidate", type=Path)
+    parser.add_argument("--manifest", type=Path, required=True)
+    parser.add_argument("--output", type=Path, required=True)
+    args = parser.parse_args()
+    if args.capture:
+        captured = asyncio.run(
+            _capture(args.checkout.resolve(), args.manifest.resolve(), args.capture)
+        )
+        with args.output.open("wb") as stream:
+            pickle.dump(captured, stream, protocol=pickle.HIGHEST_PROTOCOL)
+    else:
+        compare_checkouts(
+            args.reference.resolve(),
+            args.candidate.resolve(),
+            args.manifest.resolve(),
+            args.output.resolve(),
+        )
+
+
+if __name__ == "__main__":
+    if "--manifest" in sys.argv:
+        _main()
+    else:
+        raise SystemExit(pytest.main([__file__, "-v"]))
