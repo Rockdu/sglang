@@ -1,15 +1,10 @@
-"""Unit tests for ``get_new_expanded_mm_items`` per-image splitting.
+"""Media splitting preserves source boundaries and tensor views."""
 
-This is the load-bearing behavioral path for multi-image requests: a bundled
-``MultimodalDataItem`` (one item carrying N image offsets + a concatenated
-feature) must be split back into N per-image items so RadixAttention can cache
-each image independently and chunked-prefill can encode them one at a time.
-
-The MoonViT-style models (e.g. nvidia/LocateAnything-3B) carry their per-image
-grids under ``image_grid_hws`` rather than ``image_grid_thw``; the splitter must
-recognize both keys, fall back cleanly when no usable grid is present, and not
-mis-split a degenerate flat grid. No server / GPU / weight loading involved.
-"""
+# Packed feature: [source A patches | source B patches]
+#                  + grids + offsets=None -> source views, offsets remain None
+#                  + image offsets        -> one offset per source
+#                  + video frame offsets  -> all frame offsets per source
+# Missing/malformed grids cannot establish source boundaries without offsets.
 
 import unittest
 
@@ -41,6 +36,98 @@ def _bundled_item(grid_key=None, grid=None, feature_len=10, num_images=2):
 
 
 class TestGetNewExpandedMMItems(CustomTestCase):
+    def test_grids_split_source_views_without_offsets(self):
+        for modality, grid_key, grid in (
+            (Modality.IMAGE, "image_grid_thw", [[1, 2, 3], [1, 4, 1]]),
+            (Modality.IMAGE, "image_grid_hws", [[2, 3], [4, 1]]),
+            (Modality.VIDEO, "video_grid_thw", [[2, 1, 3], [1, 2, 2]]),
+        ):
+            with self.subTest(grid_key=grid_key):
+                feature = torch.arange(30, dtype=torch.float32).reshape(10, 3)
+                grids = torch.tensor(grid)
+                patch_mask = torch.arange(10)
+                bundled = MultimodalDataItem(
+                    modality=modality,
+                    feature=feature,
+                    hash=123,
+                    model_specific_data={grid_key: grids, "patch_mask": patch_mask},
+                )
+                sources = get_new_expanded_mm_items([bundled])
+
+                self.assertEqual(len(sources), 2)
+                for index, (source, start, end) in enumerate(
+                    zip(sources, (0, 6), (6, 10))
+                ):
+                    self.assertIsNone(source.offsets)
+                    self.assertIsNone(source.hash)
+                    for view, tensor, expected in (
+                        (source.feature, feature, feature[start:end]),
+                        (
+                            source.model_specific_data[grid_key],
+                            grids,
+                            grids[index : index + 1],
+                        ),
+                        (
+                            source.model_specific_data["patch_mask"],
+                            patch_mask,
+                            patch_mask[start:end],
+                        ),
+                    ):
+                        self.assertTrue(torch.equal(view, expected))
+                        self.assertEqual(
+                            view.untyped_storage().data_ptr(),
+                            tensor.untyped_storage().data_ptr(),
+                        )
+                self.assertIsNone(bundled.offsets)
+                self.assertEqual(bundled.hash, 123)
+
+    def test_offsetless_features_do_not_establish_source_boundaries(self):
+        for modality, model_specific_data in (
+            (Modality.IMAGE, {}),
+            (Modality.AUDIO, {}),
+            (Modality.IMAGE, {"image_grid_thw": torch.tensor([2, 2])}),
+            (Modality.VIDEO, {"video_grid_thw": torch.tensor([2, 2, 2])}),
+            (
+                Modality.IMAGE,
+                {"image_grid_thw": torch.tensor([[1, 2, 3], [1, 4, 1]])},
+            ),
+        ):
+            with self.subTest(
+                modality=modality, model_specific_data=model_specific_data
+            ):
+                bundled = MultimodalDataItem(
+                    modality=modality,
+                    feature=torch.ones(2, 3),
+                    model_specific_data=model_specific_data,
+                )
+                sources = get_new_expanded_mm_items([bundled])
+                self.assertEqual(len(sources), 1)
+                self.assertIs(sources[0], bundled)
+
+    def test_bound_video_offsets_keep_legacy_frame_grouping(self):
+        feature = torch.arange(30, dtype=torch.float32).reshape(10, 3)
+        frame_offsets = [(1, 3), (5, 7), (9, 12)]
+        bundled = MultimodalDataItem(
+            modality=Modality.VIDEO,
+            feature=feature,
+            offsets=frame_offsets,
+            model_specific_data={
+                "video_grid_thw": torch.tensor([[2, 1, 3], [1, 2, 2]])
+            },
+        )
+        sources = get_new_expanded_mm_items([bundled])
+        self.assertEqual(
+            [source.offsets for source in sources],
+            [frame_offsets[:2], frame_offsets[2:]],
+        )
+        self.assertTrue(torch.equal(sources[0].feature, feature[:6]))
+        self.assertTrue(torch.equal(sources[1].feature, feature[6:]))
+
+        bundled.offsets = [(1, 6), (8, 11)]
+        sources = get_new_expanded_mm_items([bundled])
+        self.assertEqual(len(sources), 1)
+        self.assertIs(sources[0], bundled)
+
     def test_image_grid_hws_splits_per_image(self):
         # grid rows [[2,3],[4,1]] -> prod = [6, 4] patches -> feature_len 10.
         item = _bundled_item(

@@ -6,7 +6,7 @@
                                                |
     original IDs -> mm_token_expansion <--- grid / timestamp / audio-length rules
                          |
-             build -> per-source offsets + Qwen MRoPE
+             final IDs -> build -> per-source offsets + Qwen MRoPE
 
 Real HF processors provide independent feature/token references for PIL and NumPy
 images. Caller IDs are never decoded, media is processed once, and only timestamp
@@ -15,7 +15,9 @@ Mixed image/video/audio fields stay isolated. Partial expansion takes trailing
 media items, preserves noncanonical history and retains each source tensor view.
 Reader tests check process-stage sampling/resize, sampled indices and closure.
 Frozen recipes preserve image resize, audio truncation and video frame layout;
-grouped image and padded audio items share their final batched tensor storage.
+Grid media stay batched until serving build reuses the existing item splitter;
+grouped image and padded audio serving items share their final tensor storage.
+Video option groups [A, B, A] restore source order before serving splits the batch.
 Audio source tensors retain common padded widths for serving concatenation;
 zero masks exclude added padding before audio encoding.
 HF VideoMetadata remains processor metadata and never enters serving media fields.
@@ -43,6 +45,9 @@ from transformers import (
     Qwen3VLProcessor,
     Qwen3VLVideoProcessor,
     WhisperFeatureExtractor,
+)
+from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
+    Qwen3OmniMoeProcessorKwargs,
 )
 
 from sglang.srt.managers.schedule_batch import Modality
@@ -117,6 +122,8 @@ def _ban_text_processing(processor):
 def _make_processor(model_type="qwen3_vl"):
     processor = object.__new__(QwenVLImageProcessor)
     processor.model_type = model_type
+    if model_type == "qwen3_omni_moe":
+        processor.media_processor_kwargs_type = Qwen3OmniMoeProcessorKwargs
     processor.supports_token_expansion = (
         model_type in QwenVLImageProcessor._TOKENIZED_MEDIA_MODEL_TYPES
     )
@@ -299,28 +306,28 @@ class TestQwenTokenizedMedia(CustomTestCase):
                         expanded, media, consumer="training"
                     )
                     serving = processor.build_multimodal_inputs(expanded, media)
-                    first_end = expanded.new_media_bindings[("image", 0)][0][1] + 1
-                    history = expanded.input_ids[:first_end]
+                    first_end = serving.mm_items[0].offsets[0][1] + 2
+                    history = expanded[:first_end]
                     partial = processor.mm_token_expansion(
                         history + [START, IMAGE, END], media, len(history)
                     )
+                    partial_serving = processor.build_multimodal_inputs(partial, media)
                 self.assertEqual(
                     actual["input_ids"].tolist(),
                     [original[:4] + reference["input_ids"][0].tolist()],
                 )
-                self.assertEqual(partial.input_ids, expanded.input_ids)
-                self.assertEqual(set(partial.new_media_bindings), {("image", 1)})
+                self.assertEqual(partial, expanded)
+                self.assertEqual(
+                    [item.offsets for item in partial_serving.mm_items],
+                    [item.offsets for item in serving.mm_items],
+                )
                 torch.testing.assert_close(
                     actual["pixel_values"], reference["pixel_values"]
                 )
-                self.assertEqual(
-                    serving.mrope_positions.shape, (3, len(expanded.input_ids))
-                )
-                for item in media["image"].items:
+                self.assertEqual(serving.mrope_positions.shape, (3, len(expanded)))
+                for item in serving.mm_items:
                     self.assertEqual(
-                        item.encoder_inputs["pixel_values"]
-                        .untyped_storage()
-                        .data_ptr(),
+                        item.feature.untyped_storage().data_ptr(),
                         media["image"]
                         .encoder_inputs["pixel_values"]
                         .untyped_storage()
@@ -376,13 +383,61 @@ class TestQwenTokenizedMedia(CustomTestCase):
                         torch.testing.assert_close(
                             torch.as_tensor(actual[key]), reference[key]
                         )
-                if hf_class is Qwen3VLProcessor:
-                    self.assertEqual(len(expanded.new_media_bindings[("video", 0)]), 2)
                 processor.position_encoding = None
                 serving = processor.build_multimodal_inputs(expanded, media)
+                if hf_class is Qwen3VLProcessor:
+                    self.assertEqual(len(serving.mm_items[0].offsets), 2)
                 for item in serving.mm_items:
                     self.assertNotIn("video_metadata", item.model_specific_data)
                     self.assertIsInstance(item.video_grid_thw, torch.Tensor)
+
+    def test_video_option_groups_preserve_source_order_and_serving_views(self):
+        processor = _make_hf_processor(Qwen3VLProcessor, 16)
+        processor.position_encoding = None
+        videos = [
+            torch.full((frames, 3, 64, 64), value, dtype=torch.uint8)
+            for frames, value in ((2, 31), (4, 127), (2, 223))
+        ]
+        references = [
+            processor.process_videos(
+                [video],
+                processor._processor,
+                do_resize=False,
+                do_sample_frames=False,
+                do_normalize=normalize,
+                return_tensors="pt",
+            )
+            for video, normalize in zip(videos, (True, False, True))
+        ]
+        grouped = processor.process_videos(
+            videos,
+            processor._processor,
+            process_options=[
+                source.items[0].effective_options for source in references
+            ],
+        )
+        for name in ("pixel_values_videos", "video_grid_thw"):
+            self.assert_tensor_bytes_equal(
+                grouped.encoder_inputs[name],
+                torch.cat([source.encoder_inputs[name] for source in references]),
+            )
+        media = {"video": grouped}
+        expanded = processor.mm_token_expansion([VIDEO, EOS, VIDEO, EOS, VIDEO], media)
+        serving = processor.build_multimodal_inputs(expanded, media)
+        self.assertEqual([len(item.offsets) for item in serving.mm_items], [1, 2, 1])
+        for item, source in zip(serving.mm_items, references):
+            self.assert_tensor_bytes_equal(
+                item.feature, source.encoder_inputs["pixel_values_videos"]
+            )
+            self.assert_tensor_bytes_equal(
+                item.video_grid_thw, source.encoder_inputs["video_grid_thw"]
+            )
+            self.assertEqual(
+                item.feature.untyped_storage().data_ptr(),
+                grouped.encoder_inputs["pixel_values_videos"]
+                .untyped_storage()
+                .data_ptr(),
+            )
 
     def test_omni_audio_mask_and_cnn_chunk_lengths(self):
         processor = _make_hf_processor(
@@ -446,14 +501,17 @@ class TestQwenTokenizedMedia(CustomTestCase):
             ],
             size={"shortest_edge": 128**2, "longest_edge": 128**2},
         )["image"]
+        expanded = processor.mm_token_expansion(
+            [START, IMAGE, END] * 2, {"image": second}
+        )
+        serving = processor.build_multimodal_inputs(expanded, {"image": second})
         torch.testing.assert_close(
-            first.items[0].encoder_inputs["pixel_values"],
-            second.items[0].encoder_inputs["pixel_values"],
+            first.encoder_inputs["pixel_values"], serving.mm_items[0].feature
         )
         self.assertEqual(second.items[1].metadata["image_grid_thw"].tolist(), [1, 8, 8])
-        for item in second.items:
+        for item in serving.mm_items:
             self.assertEqual(
-                item.encoder_inputs["pixel_values"].untyped_storage().data_ptr(),
+                item.feature.untyped_storage().data_ptr(),
                 second.encoder_inputs["pixel_values"].untyped_storage().data_ptr(),
             )
 

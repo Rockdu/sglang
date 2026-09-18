@@ -4,7 +4,7 @@
     encoded image bytes/path -> native image component -> patch views + counts
     encoded audio bytes      -> native feature extractor -> dMel + valid length
                                   |
-    two adjacent image pads ------+-> separate source bindings
+    two adjacent image pads ------+-> separate source offsets
     expanded history | new pad ---+-> untouched prefix, suffix-only expansion
 
 Real CPU components verify byte/path parity, including escaped file URLs.
@@ -32,8 +32,6 @@ from sglang.srt.multimodal.inkling import (
     InklingImageProcessor,
     InklingProcessor,
 )
-from sglang.srt.multimodal.media_processing import collect_media_bindings
-from sglang.srt.multimodal.mm_token_expansion import expand_mm_tokens
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.inkling import InklingMultimodalProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -69,7 +67,7 @@ def _make_processor():
     return processor
 
 
-def test_native_encoded_media_features_and_adjacent_source_bindings(tmp_path):
+def test_native_encoded_media_features_and_adjacent_source_offsets(tmp_path):
     processor = _make_processor()
     image_buffer = io.BytesIO()
     Image.new("RGB", (7, 5), (30, 40, 50)).save(image_buffer, format="PNG")
@@ -115,37 +113,35 @@ def test_native_encoded_media_features_and_adjacent_source_bindings(tmp_path):
         native_audio_output["dmel_bins"][0],
     )
     media = {"image": image_output, "audio": audio_output}
-    rules = processor.get_mm_token_replacements(None, media)
     original = [80, 101, 101, 81, 102, 82]
-    expanded = expand_mm_tokens(original, rules)
-    bindings = collect_media_bindings(
-        expanded.input_ids, rules, expanded.new_media_bindings
-    )
+    expanded = processor.mm_token_expansion(original, media)
     image_length = image_output.items[0].metadata["num_tokens"]
-    assert bindings[("image", 0)] == [(1, 1 + image_length)]
-    assert bindings[("image", 1)] == [(1 + image_length, 1 + 2 * image_length)]
     assert original == [80, 101, 101, 81, 102, 82]
     output = processor.assemble(original, [image_bytes, str(image_path)], [audio_bytes])
-    assert output.input_ids == expanded.input_ids
+    assert output.input_ids == expanded
     assert output.audio_end_id == 103
     assert [item.offsets for item in output.mm_items] == [
-        [(start, end - 1) for start, end in bindings[media_id]]
-        for media_id in (("image", 0), ("image", 1), ("audio", 0))
+        [(1, image_length)],
+        [(1 + image_length, 2 * image_length)],
+        [(2 + 2 * image_length, len(expanded) - 2)],
     ]
 
     next_media = dict(media)
     next_media["image"] = processor.process_images(
         [image_bytes] * 3, processor._processor
     )
-    next_rules = processor.get_mm_token_replacements(None, next_media)
-    history = expanded.input_ids
-    partial = expand_mm_tokens(history + [83, 101, 84], next_rules, len(history))
-    assert partial.input_ids == history + [83] + [101] * image_length + [84]
-    next_bindings = collect_media_bindings(
-        partial.input_ids, next_rules, partial.new_media_bindings
+    history = expanded
+    partial = processor.mm_token_expansion(
+        history + [83, 101, 84], next_media, len(history)
     )
-    for media_id, spans in bindings.items():
-        assert next_bindings[media_id] == spans
+    assert partial == history + [83] + [101] * image_length + [84]
+    next_output = processor.build_multimodal_inputs(partial, next_media)
+    assert [next_output.mm_items[i].offsets for i in (0, 1, 3)] == [
+        item.offsets for item in output.mm_items
+    ]
+    assert next_output.mm_items[2].offsets == [
+        (len(history) + 1, len(history) + image_length)
+    ]
 
 
 def test_worker_components_keep_rust_hashes_and_audio_isolated_from_shared_processor():

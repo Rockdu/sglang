@@ -3,13 +3,17 @@
   async processor entry
     -> await process_and_combine_mm_data_async
       -> worker pool (or direct fallback when no executor exists)
-        -> sync process_and_combine_mm_data override
-          -> super().process_and_combine_mm_data is allowed here only
+        -> sync process_and_combine_mm_data
 
-Direct sync calls from other processor functions bypass workers and are rejected.
-Migrated processors, including Inkling, inherit the Base worker dispatch.
-The exemption test distinguishes worker delegation from async/self/other calls;
-the source-tree checks require every remaining call to use the async helper.
+Direct sync calls from processors bypass workers and are rejected.
+  model supports_token_expansion
+    True  -> Base async dispatch (media and token boundary intact)
+    False -> original async route -> original HF/native media processor
+                                    (never process_media or token expansion)
+  Inkling class opt-out -> manager keeps text -> legacy tokenizer + assembly
+
+Migrated processors delegate to the Base worker dispatch only when enabled.
+The source-tree checks require every processor call to use the async helper.
 
   explicit video_data -> InternVL special-format dispatch -> video item offsets
                        (no duplicate keyword through **kwargs)
@@ -72,46 +76,7 @@ def _call_sites():
                 and func.attr.startswith("process_and_combine_mm_data")
             ):
                 continue
-            enclosing = _enclosing_function(node, parents)
-            if _is_sync_super_delegation(func, enclosing):
-                continue
-            yield path, node.lineno, func.attr, enclosing
-
-
-def _is_sync_super_delegation(func, enclosing):
-    return (
-        isinstance(enclosing, ast.FunctionDef)
-        and enclosing.name == "process_and_combine_mm_data"
-        and func.attr == enclosing.name
-        and isinstance(func.value, ast.Call)
-        and isinstance(func.value.func, ast.Name)
-        and func.value.func.id == "super"
-        and not func.value.args
-        and not func.value.keywords
-    )
-
-
-@pytest.mark.parametrize(
-    "definition,call,allowed",
-    [
-        (
-            "def process_and_combine_mm_data",
-            "super().process_and_combine_mm_data",
-            True,
-        ),
-        ("def process_and_combine_mm_data", "self.process_and_combine_mm_data", False),
-        (
-            "async def process_mm_data_async",
-            "super().process_and_combine_mm_data",
-            False,
-        ),
-        ("def other", "super().process_and_combine_mm_data", False),
-    ],
-    ids=["worker-super", "worker-self", "async-super", "unrelated-super"],
-)
-def test_only_worker_body_super_delegation_is_exempt(definition, call, allowed):
-    function = ast.parse(f"{definition}(self):\n    return {call}()").body[0]
-    assert _is_sync_super_delegation(function.body[0].value.func, function) is allowed
+            yield path, node.lineno, func.attr, _enclosing_function(node, parents)
 
 
 def test_no_processor_bypasses_the_worker_pool():
@@ -196,6 +161,169 @@ def test_default_worker_count_follows_the_preprocessing_path():
     assert BaseMultimodalProcessor.auto_mm_processor_worker_num is None
 
 
+@pytest.fixture(params=["qwen", "glm", "gemma", "gemma_unified", "inkling"])
+def migrated_processor(request):
+    from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
+    from sglang.srt.multimodal.processors.gemma4_unified import (
+        Gemma4UnifiedSGLangProcessor,
+    )
+    from sglang.srt.multimodal.processors.glm4v import Glm4vImageProcessor
+    from sglang.srt.multimodal.processors.inkling import InklingMultimodalProcessor
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+    processor_class = {
+        "qwen": QwenVLImageProcessor,
+        "glm": Glm4vImageProcessor,
+        "gemma": Gemma4SGLangProcessor,
+        "gemma_unified": Gemma4UnifiedSGLangProcessor,
+        "inkling": InklingMultimodalProcessor,
+    }[request.param]
+    return object.__new__(processor_class)
+
+
+def test_supported_models_delegate_the_complete_request(
+    migrated_processor, monkeypatch
+):
+    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+
+    migrated_processor.supports_token_expansion = True
+    base_entry = AsyncMock(return_value=object())
+    monkeypatch.setattr(BaseMultimodalProcessor, "process_mm_data_async", base_entry)
+    request_kwargs = {
+        "image_data": ["image"],
+        "video_data": ["video"],
+        "audio_data": ["audio"],
+        "input_text": "",
+        "input_ids": [1, 101, 2],
+        "request_obj": SimpleNamespace(video_data=None),
+        "mm_token_expansion_start_len": 1,
+    }
+
+    output = asyncio.run(migrated_processor.process_mm_data_async(**request_kwargs))
+
+    assert output is base_entry.return_value
+    base_entry.assert_awaited_once_with(**request_kwargs)
+
+
+def test_disabled_models_reach_original_media_processing(migrated_processor):
+    """Follow the old entry through synchronous preprocessing, not just loading."""
+    from sglang.srt.multimodal.processors.inkling import InklingMultimodalProcessor
+
+    class LegacyProcessingReached(Exception):
+        pass
+
+    calls = []
+
+    def legacy_component(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise LegacyProcessingReached
+
+    def reject_shared_pipeline(**kwargs):
+        pytest.fail("supports_token_expansion=False entered process_media")
+
+    processor = migrated_processor
+    processor.supports_token_expansion = False
+    processor.process_media = reject_shared_pipeline
+    processor._processor = legacy_component
+    processor._tokenizer = None
+    processor._tokenizer_auto_adds_specials = False
+    processor.hf_config = SimpleNamespace(model_type="qwen3_5")
+    processor.image_config = {}
+    processor.video_config = {}
+    processor.audio_config = {}
+    processor.mm_tokens = SimpleNamespace(image_token_id=101)
+    processor.IMAGE_TOKEN_ID = 101
+    processor.AUDIO_TOKEN_ID = None
+    processor.inkling_processor = SimpleNamespace(process_images=legacy_component)
+    loaded = SimpleNamespace(input_text="image prompt", images=[b"loaded image"])
+    loaded.videos = loaded.audios = []
+    processor.load_mm_data = AsyncMock(return_value=loaded)
+    processor.process_video_data_async = AsyncMock(return_value=([], None))
+
+    async def combine_in_worker(base_output, mm_tokens, **kwargs):
+        return processor.process_mm_data(
+            input_text=base_output.input_text, images=base_output.images
+        )
+
+    processor.process_and_combine_mm_data_async = combine_in_worker
+    with pytest.raises(LegacyProcessingReached):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[b"encoded image"],
+                input_text="image prompt",
+                request_obj=SimpleNamespace(input_ids=[1, 101, 2], video_data=None),
+            )
+        )
+
+    if isinstance(processor, InklingMultimodalProcessor):
+        assert calls == [(([b"encoded image"],), {})]
+    else:
+        assert processor.load_mm_data.call_args.kwargs["prompt"] == "image prompt"
+        assert calls == [
+            (
+                (),
+                {
+                    "text": ["image prompt"],
+                    "images": loaded.images,
+                    "padding": True,
+                    "return_tensors": "pt",
+                },
+            )
+        ]
+
+
+def test_inkling_class_opt_out_preserves_text_requests(monkeypatch):
+    """A disabled processor must not receive token IDs as legacy tokenizer text."""
+    import torch
+
+    from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+    from sglang.srt.multimodal.processors.inkling import InklingMultimodalProcessor
+
+    tokenized_texts = []
+
+    def tokenizer(text):
+        assert isinstance(text, str)
+        tokenized_texts.append(text)
+        return SimpleNamespace(input_ids=[1, 101, 2])
+
+    def initialize_base(processor, *args, **kwargs):
+        processor._tokenizer = tokenizer
+
+    monkeypatch.setattr(BaseMultimodalProcessor, "__init__", initialize_base)
+    monkeypatch.setattr(InklingMultimodalProcessor, "supports_token_expansion", False)
+    monkeypatch.setenv("SGLANG_INKLING_RS_MM_PREPROCESS", "0")
+    processor = InklingMultimodalProcessor(
+        SimpleNamespace(
+            vision_config=SimpleNamespace(decoder_dmodel=None),
+            audio_config=SimpleNamespace(decoder_dmodel=None),
+            image_token_id=101,
+            audio_token_id=None,
+            audio_end_token_id=None,
+        ),
+        None,
+        None,
+    )
+    processor.inkling_processor.process_images = lambda images: {
+        "num_tokens": [2],
+        "num_patches": [2],
+        "vision_patches_bthwc": torch.zeros(2, 1, 1, 1, 3),
+    }
+    prompt = "describe this image"
+    # TokenizerManager selects the processor input before calling its async entry.
+    processor_input = [1, 101, 2] if processor.prefer_tokenized_input else prompt
+    output = asyncio.run(
+        processor.process_mm_data_async(
+            image_data=[b"encoded image"],
+            input_text=processor_input,
+            request_obj=SimpleNamespace(input_ids=None),
+        )
+    )
+
+    assert tokenized_texts == [prompt]
+    assert output.input_ids == [1, 101, 101, 2]
+    assert output.mm_items[0].offsets == [(1, 2)]
+
+
 def _process_mm_data_overrides():
     """Yield (path, node) for every subclass override of `process_mm_data`."""
     for path in sorted(_MULTIMODAL_ROOT.rglob("*.py")):
@@ -231,13 +359,11 @@ def test_overrides_take_the_worker_pools_processor_clone():
     )
 
 
-# Processors that build their whole preprocessing chain themselves and never
-# reach `process_and_combine_mm_data`, so the worker pool cannot help them. They
-# are not broken by concurrency either -- they simply do not participate. Listed
-# explicitly so that adding a processor forces a decision instead of silently
-# leaving it at one-worker speed.
+# These legacy routes bypass `process_and_combine_mm_data` and its worker pool.
+# Listing them makes worker delegation an explicit decision for new processors.
 _NO_WORKER_POOL_ROUTE = {
     "dots_note_omni.py",
+    "inkling.py",  # The disabled path keeps native assembly outside the shared worker.
     "lightonocr.py",
     "llava.py",
     "mimo_v2.py",

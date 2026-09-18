@@ -2,17 +2,18 @@
 
     load -> images / video decoder or frames
                          |
-                   process_media -> tensor views + grids + timestamps
+                   process_media -> native batches + grids + timestamps
                                                |
     original IDs -> mm_token_expansion <--- per-source token fragments
                          |
-                     shared build -> separate image / nested-video bindings
+                     shared build -> existing grid splitter + image / video offsets
 
 HF outputs provide independent numeric/token references. Partial expansion reads
-only the new suffix; build independently rejects changed historical layouts.
+only the new suffix; serving build checks historical media token counts.
 
     first video -> process -> frozen recipe
     old(recipe) + new -> retain old budget/frames -> budget only the new video
+    option groups [A, B, A] -> source-order patches -> per-source serving views
 
 Actual grids validate budgets. Reader tests check process-stage sampling and closure.
 Video processing preserves source pixels and resolves missing FPS before timestamp
@@ -30,8 +31,8 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.media_processing import (
-    collect_media_bindings,
-    pack_grid_media_output,
+    MediaProcessOutput,
+    ProcessedMediaItem,
 )
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultiModalProcessorOutput,
@@ -39,7 +40,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.glm4v import (
     Glm4vImageProcessor,
-    _process_glm_video,
+    preprocess_video_frames_sync,
 )
 from sglang.srt.multimodal.processors.glm_image import GlmImageProcessor
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
@@ -142,6 +143,7 @@ def _vision_processor():
     processor.mm_tokens = MultimodalSpecialTokens(
         image_token_id=IMAGE, video_token_id=IMAGE
     )
+    processor.position_encoding = None
     return processor
 
 
@@ -276,12 +278,8 @@ def test_real_hf_glm_image_and_video_preprocessing_preserves_arbitrary_tokens(
     processor_output = processor.build_multimodal_inputs(
         expanded, media, consumer="training", return_metadata=True
     )
-    bindings = collect_media_bindings(
-        expanded.input_ids,
-        processor.get_mm_token_replacements(hf, media),
-        expanded.new_media_bindings,
-    )
-    expanded_input_ids = expanded.input_ids
+    serving = processor.build_multimodal_inputs(expanded, media)
+    expanded_input_ids = expanded
     assert expanded_input_ids == [7, 8, 8] + reference["input_ids"][0].tolist() + [10]
     for key in (
         "pixel_values",
@@ -307,14 +305,18 @@ def test_real_hf_glm_image_and_video_preprocessing_preserves_arbitrary_tokens(
     video_end = expanded_input_ids.index(VIDEO_END)
     assert expanded_input_ids[video_end + 1 : video_end + 3] == [9, IMAGE_START]
     assert expanded_input_ids[video_end + 3 : -2] == [IMAGE] * 16
-    assert media["image"].items[0].encoder_inputs["pixel_values"].shape == (64, 1176)
-    assert media["video"].items[0].encoder_inputs["pixel_values_videos"].shape[0] == 128
-    assert len(bindings[("image", 0)]) == 1
-    assert len(bindings[("video", 0)]) == 2
+    assert serving.mm_items[0].feature.shape == (64, 1176)
+    assert serving.mm_items[1].feature.shape[0] == 128
+    assert [item.modality for item in serving.mm_items] == [
+        Modality.IMAGE,
+        Modality.VIDEO,
+    ]
+    assert serving.mm_items[0].offsets == [(video_end + 3, video_end + 18)]
+    assert len(serving.mm_items[1].offsets) == 2
     assert all(
-        expanded_input_ids[start:end] == [IMAGE] * (end - start)
-        for spans in bindings.values()
-        for start, end in spans
+        expanded_input_ids[start : end + 1] == [IMAGE] * (end - start + 1)
+        for item in serving.mm_items
+        for start, end in item.offsets
     )
     history = expanded_input_ids.copy()
     video_recipe = media["video"].items[0].effective_options
@@ -327,9 +329,58 @@ def test_real_hf_glm_image_and_video_preprocessing_preserves_arbitrary_tokens(
     partial = processor.mm_token_expansion(
         history + [7, IMAGE_START, IMAGE, IMAGE_END], media, len(history)
     )
-    assert partial.input_ids == history + [7, IMAGE_START] + [IMAGE] * 16 + [IMAGE_END]
-    assert set(partial.new_media_bindings) == {("image", 1)}
+    assert partial == history + [7, IMAGE_START] + [IMAGE] * 16 + [IMAGE_END]
+    partial_serving = processor.build_multimodal_inputs(partial, media)
+    assert partial_serving.mm_items[0].offsets == serving.mm_items[0].offsets
+    assert partial_serving.mm_items[2].offsets == serving.mm_items[1].offsets
+    assert partial_serving.mm_items[1].offsets == [
+        (len(history) + 2, len(history) + 17)
+    ]
     processor.build_multimodal_inputs(partial, media, consumer="training")
+
+
+def test_video_option_groups_preserve_source_order_and_serving_views():
+    from transformers.models.glm4v.video_processing_glm4v import Glm4vVideoProcessor
+
+    processor = _vision_processor()
+    processor._processor.video_processor = Glm4vVideoProcessor()
+    videos = [
+        torch.full((frames, 3, 112, 112), value, dtype=torch.uint8)
+        for frames, value in ((2, 31), (4, 127), (2, 223))
+    ]
+    references = [
+        processor.process_videos(
+            [video],
+            processor._processor,
+            do_resize=False,
+            do_normalize=normalize,
+            return_tensors="pt",
+        )
+        for video, normalize in zip(videos, (True, False, True))
+    ]
+    grouped = processor.process_videos(
+        videos,
+        processor._processor,
+        process_options=[source.items[0].effective_options for source in references],
+    )
+    for name in ("pixel_values_videos", "video_grid_thw"):
+        assert torch.equal(
+            grouped.encoder_inputs[name],
+            torch.cat([source.encoder_inputs[name] for source in references]),
+        )
+    media = {"video": grouped}
+    expanded = processor.mm_token_expansion([VIDEO_START, VIDEO, VIDEO_END] * 3, media)
+    serving = processor.build_multimodal_inputs(expanded, media)
+    assert [len(item.offsets) for item in serving.mm_items] == [1, 2, 1]
+    for item, source in zip(serving.mm_items, references):
+        assert torch.equal(item.feature, source.encoder_inputs["pixel_values_videos"])
+        assert torch.equal(item.video_grid_thw, source.encoder_inputs["video_grid_thw"])
+        assert (
+            item.feature.untyped_storage().data_ptr()
+            == grouped.encoder_inputs["pixel_values_videos"]
+            .untyped_storage()
+            .data_ptr()
+        )
 
 
 def test_glm_supplied_video_frame_dictionaries_preserve_pixels_and_timestamps():
@@ -342,7 +393,7 @@ def test_glm_supplied_video_frame_dictionaries_preserve_pixels_and_timestamps():
         }
         for index, image in enumerate(images)
     ]
-    loaded, metadata = _process_glm_video(frames, {}, video_processor=None)
+    loaded, metadata = preprocess_video_frames_sync(frames)
     assert torch.equal(loaded, images.permute(0, 2, 3, 1))
     assert metadata["frames_indices"] == [0, 1, 2, 3]
     assert metadata["fps"] == 2
@@ -411,8 +462,10 @@ def test_frozen_video_recipe_preserves_history_and_only_new_video_gets_budget():
         == second.items[0].metadata["video_grid_thw"].tolist()
     )
     torch.testing.assert_close(
-        first.items[0].encoder_inputs["pixel_values_videos"],
-        second.items[0].encoder_inputs["pixel_values_videos"],
+        first.encoder_inputs["pixel_values_videos"],
+        second.encoder_inputs["pixel_values_videos"][
+            : first.encoder_inputs["pixel_values_videos"].shape[0]
+        ],
     )
     assert [item.effective_options["token_count"] for item in second.items] == [16, 8]
     import json
@@ -444,21 +497,27 @@ def test_actual_grid_budget_is_checked_after_processing(monkeypatch):
         )
 
 
-def test_changed_historical_video_is_checked_by_build_not_expansion():
+def test_serving_rejects_changed_historical_video_token_count():
     processor = _vision_processor()
 
     def media(grid):
+        inputs = {
+            "pixel_values_videos": torch.zeros(grid[0] * grid[1] * grid[2], 1),
+            "video_grid_thw": torch.tensor([grid]),
+            "video_metadata": [SimpleNamespace(fps=2, frames_indices=[0, 1])],
+        }
         return {
-            "video": pack_grid_media_output(
-                "video",
-                {
-                    "pixel_values_videos": torch.zeros(grid[0] * grid[1] * grid[2], 1),
-                    "video_grid_thw": torch.tensor([grid]),
-                    "video_metadata": [SimpleNamespace(fps=2, frames_indices=[0, 1])],
-                },
-                "pixel_values_videos",
-                "video_grid_thw",
-                metadata_names=("video_metadata",),
+            "video": MediaProcessOutput(
+                inputs,
+                [
+                    ProcessedMediaItem(
+                        media_id=("video", 0),
+                        metadata={
+                            key: inputs[key][0]
+                            for key in ("video_grid_thw", "video_metadata")
+                        },
+                    )
+                ],
             )
         }
 
@@ -466,13 +525,14 @@ def test_changed_historical_video_is_checked_by_build_not_expansion():
         [VIDEO_START, VIDEO, VIDEO_END], media([1, 1, 2])
     )
     changed = media([1, 1, 3])
-    unchanged = processor.mm_token_expansion(
-        first.input_ids, changed, len(first.input_ids)
+    unchanged = processor.mm_token_expansion(first, changed, len(first))
+    assert unchanged == first
+    training = processor.build_multimodal_inputs(
+        unchanged, changed, consumer="training"
     )
-    assert unchanged.input_ids == first.input_ids
-    assert unchanged.new_media_bindings == {}
-    with pytest.raises(ValueError, match="Historical|historical"):
-        processor.build_multimodal_inputs(unchanged, changed, consumer="training")
+    assert training["input_ids"].tolist() == [first]
+    with pytest.raises(ValueError, match="video token count"):
+        processor.build_multimodal_inputs(unchanged, changed)
 
 
 def test_reader_sampling_is_in_process_and_closes_reader():

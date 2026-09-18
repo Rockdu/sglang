@@ -2,16 +2,18 @@
 
 sources -> fast loader (decode, no tokens) -> process_media -> tensors + metadata
                                                         |
-partly expanded IDs + A -> suffix matcher -> final IDs + new bindings
+partly expanded IDs + A -> suffix matcher -> final IDs
                                                         |
                            build -> training dict / serving items + full offsets
 
 Text tokenizes once before the same pipeline; IDs never decode. Both single
 worker and cloned workers run off the event loop. Adjacent media retain separate
-source bindings, and repeated build calls cannot mutate the media result.
+source offsets, empty sources consume no span, and segments cannot cross gaps.
+Repeated build calls cannot mutate the media result.
+Native training builds neither serving offsets nor replacement fragments.
 Loading reuses common decoders and preserves per-source processing options.
 Audio resampling precedes processing, including frozen per-source sample rates.
-Legacy IDs-only matching retains its tuple-list contract and rejects bad counts.
+IDs-only matching retains its tuple-list contract and rejects bad counts.
 """
 
 import base64
@@ -325,6 +327,19 @@ class TestBaseTokenExpansion(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output["input_ids"].tolist(), [[99] * 5])
         self.assertEqual(output["mm_token_type_ids"].tolist(), [[1] * 5])
 
+    def test_source_offsets_preserve_empty_items_and_reject_split_segments(self):
+        processor = self.make_processor()
+        media = processor.process_media(
+            images=[Image.new("RGB", (width, 1)) for width in (0, 2)]
+        )
+        # The first placeholder disappears; the second owns one two-token span.
+        expanded = processor.mm_token_expansion([99, 99], media)
+        serving = processor.build_multimodal_inputs(expanded, media)
+        self.assertEqual(expanded, [99, 99])
+        self.assertEqual([item.offsets for item in serving.mm_items], [[], [(0, 1)]])
+        with self.assertRaisesRegex(ValueError, "token span"):
+            processor.build_multimodal_inputs([99, 7, 99], media)
+
     def test_reusable_media_build_has_full_offsets_without_mutation(self):
         processor = self.make_processor()
         processor.image_config = {"crop": False}
@@ -338,9 +353,17 @@ class TestBaseTokenExpansion(unittest.IsolatedAsyncioTestCase):
         before = pixels.clone()
         for input_ids, boundary in (([99, 99], 0), ([99, 99, 99], 2), ([99] * 5, 5)):
             expanded = processor.mm_token_expansion(input_ids, media, boundary)
-            train = processor.build_multimodal_inputs(
-                expanded, media, consumer="training"
-            )
+            with (
+                patch.object(
+                    processor, "get_mm_item_offsets", side_effect=AssertionError
+                ),
+                patch.object(
+                    processor, "get_mm_token_replacements", side_effect=AssertionError
+                ),
+            ):
+                train = processor.build_multimodal_inputs(
+                    expanded, media, consumer="training"
+                )
             serving = processor.build_multimodal_inputs(expanded, media)
             self.assertIs(train["pixel_values"], pixels)
             self.assertEqual(train["input_ids"].tolist(), [[99] * 5])

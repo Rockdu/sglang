@@ -6,7 +6,7 @@
                          |
                     ProcessedMedia (reusable; no prompt IDs)
                          |
-    IDs + boundary ------+---> expansion ---> IDs + source bindings
+    IDs + boundary ------+---> expansion ---> final IDs -> serving offsets
     old expanded history | new image  ---> unchanged history + new image block
 
     frozen source options + new options -> native training tensors
@@ -15,7 +15,7 @@
         audios: feature/mask padding    -> original time-length serving views
 
 Both Gemma4 variants use real HF components for media parity and lightweight
-vision components for source bindings. Serving views share training storage.
+vision components for source offsets. Serving views share training storage.
 Video readers close after sampling; frame lists and tensor inputs preserve caller
 timelines, and frozen recipes hold detached JSON-compatible metadata.
 """
@@ -39,8 +39,6 @@ from transformers import (
 )
 from transformers.video_utils import VideoMetadata
 
-from sglang.srt.multimodal.media_processing import collect_media_bindings
-from sglang.srt.multimodal.mm_token_expansion import expand_mm_tokens
 from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
 from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
 from sglang.srt.multimodal.processors.gemma4_unified import Gemma4UnifiedSGLangProcessor
@@ -158,17 +156,13 @@ def test_media_outputs_keep_source_views_and_expand_only_the_new_suffix(unified)
 
     # Two adjacent equal-pad images must remain two independently owned sources.
     original = [903, 12, 12, 904, 13, 905, 22, 906]
-    replacements = processor.get_mm_token_replacements(processor._processor, media)
-    expanded = expand_mm_tokens(original, replacements)
-    bindings = collect_media_bindings(
-        expanded.input_ids, replacements, expanded.new_media_bindings
-    )
-    assert bindings[("image", 0)] == [(2, 4)]
-    assert bindings[("image", 1)] == [(6, 9)]
-    assert len(bindings[("video", 0)]) == 2
+    expanded = processor.mm_token_expansion(original, media)
     assert original == [903, 12, 12, 904, 13, 905, 22, 906]
     output = processor.build_multimodal_inputs(expanded, media)
-    assert output.input_ids == expanded.input_ids
+    assert output.input_ids == expanded
+    assert output.mm_items[0].offsets == [(2, 3)]
+    assert output.mm_items[1].offsets == [(6, 8)]
+    assert len(output.mm_items[2].offsets) == 2
     assert output.mm_items[0].image_position_ids.shape == (1, 4, 2)
     assert output.mm_items[2].video_position_ids.shape == (1, 2, 4, 2)
     assert output.mm_items[3].input_features_mask.shape[0] == 1
@@ -179,19 +173,20 @@ def test_media_outputs_keep_source_views_and_expand_only_the_new_suffix(unified)
         is media["audio"].encoder_inputs["input_features_mask"]
     )
 
-    history = expanded.input_ids
+    history = expanded
     next_media = dict(media)
     next_media["image"] = processor.process_images(
         [image0, image1, Image.new("RGB", (16, 4))], processor._processor
     )
-    next_rules = processor.get_mm_token_replacements(processor._processor, next_media)
-    partial = expand_mm_tokens(history + [907, 12, 908], next_rules, len(history))
-    assert partial.input_ids == history + [907, 10, 12, 12, 12, 12, 11, 908]
-    next_bindings = collect_media_bindings(
-        partial.input_ids, next_rules, partial.new_media_bindings
+    partial = processor.mm_token_expansion(
+        history + [907, 12, 908], next_media, len(history)
     )
-    for media_id, spans in bindings.items():
-        assert next_bindings[media_id] == spans
+    assert partial == history + [907, 10, 12, 12, 12, 12, 11, 908]
+    next_output = processor.build_multimodal_inputs(partial, next_media)
+    assert [next_output.mm_items[i].offsets for i in (0, 1, 3, 4)] == [
+        item.offsets for item in output.mm_items
+    ]
+    assert next_output.mm_items[2].offsets == [(len(history) + 2, len(history) + 5)]
     assert media["image"].items[0].metadata == {"num_soft_tokens": 2}
 
 
