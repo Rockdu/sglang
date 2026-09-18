@@ -25,7 +25,8 @@ from __future__ import annotations
 import base64
 import logging
 from collections.abc import Mapping
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
+from urllib.parse import unquote, urlparse
 
 import torch
 
@@ -35,14 +36,20 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalDataItem,
     MultimodalProcessorOutput,
 )
-from sglang.srt.models.inkling import InklingForConditionalGeneration
 from sglang.srt.multimodal.inkling import (
     InklingAudioFeatureExtractor,
     InklingImageProcessor,
     InklingProcessor,
 )
+from sglang.srt.multimodal.media_processing import (
+    MediaProcessOutput,
+    ProcessedMediaItem,
+)
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
+)
+from sglang.srt.multimodal.processors.base_processor import (
+    MultimodalSpecialTokens,
 )
 from sglang.srt.parser.inkling_tokenizer import (
     AUDIO_END,
@@ -52,6 +59,7 @@ from sglang.srt.parser.inkling_tokenizer import IMAGE_TOKEN_ID as INKLING_IMAGE_
 from sglang.srt.parser.inkling_tokenizer import (
     INKLING_SPECIAL_TOKEN_IDS,
 )
+from sglang.srt.utils import get_image_bytes
 from sglang.srt.utils.common import download_remote_media
 
 logger = logging.getLogger(__name__)
@@ -109,9 +117,12 @@ def _require(obj, name, *, where):
 class InklingMultimodalProcessor(SGLangBaseProcessor):
     # import_processors() registers this for the Inkling arch. Text-only checkpoints leave
     # both towers disabled (gated on *_config.decoder_dmodel), so it is a no-op there.
-    models: List[Type] = [InklingForConditionalGeneration]
+    models = ["InklingForConditionalGeneration"]
+    supports_token_expansion = True
+    uses_hf_processor_kwargs = False
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
+        self.prefer_tokenized_input = self.supports_token_expansion
         super().__init__(hf_config, server_args, _processor, *args, **kwargs)
 
         vision_config = _cfg(hf_config, "vision_config")
@@ -179,7 +190,99 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
             tokenizer=self._tokenizer,
         )
 
-    # ---- core (pure, testable) ------------------------------------------
+        self._processor = self.inkling_processor
+
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token_id=self.IMAGE_TOKEN_ID,
+            audio_token_id=self.AUDIO_TOKEN_ID,
+        )
+        self.audio_end_token_id = self.AUDIO_END_TOKEN_ID
+
+    @classmethod
+    def _load_single_item(
+        cls,
+        data,
+        modality: Modality,
+        frame_count_limit=None,
+        audio_sample_rate: Optional[int] = None,
+        discard_alpha_channel=True,
+    ):
+        # Native decoders preserve Inkling's audio numerics and encoded image hashes.
+        if isinstance(data, str) and data.startswith(("http://", "https://", "data:")):
+            return get_image_bytes(data)
+        if isinstance(data, str) and data.startswith("file://"):
+            return unquote(urlparse(data).path)
+        return data
+
+    def process_images(self, images, processor, **kwargs):
+        output = dict(processor.process_images(images))
+        items = []
+        patch_offset = 0
+        for index, (num_patches, num_tokens) in enumerate(
+            zip(output["num_patches"], output["num_tokens"])
+        ):
+            assert num_tokens == num_patches, (
+                f"num_tokens ({num_tokens}) != num_patches ({num_patches}); "
+                "the hMLP emits one token per patch."
+            )
+            patches = output["vision_patches_bthwc"][
+                patch_offset : patch_offset + num_patches
+            ]
+            metadata = {"num_tokens": num_tokens}
+            if "content_hashes" in output:
+                metadata["hash"] = output["content_hashes"][index]
+            items.append(
+                ProcessedMediaItem(
+                    media_id=("image", index),
+                    encoder_inputs={"vision_patches_bthwc": patches},
+                    metadata=metadata,
+                    feature_name="vision_patches_bthwc",
+                )
+            )
+            patch_offset += num_patches
+        return MediaProcessOutput(encoder_inputs=output, items=items)
+
+    def process_audio(self, audios, processor, **kwargs):
+        output = dict(processor.process_audios(audios))
+        return MediaProcessOutput(
+            encoder_inputs=output,
+            items=[
+                ProcessedMediaItem(
+                    media_id=("audio", index),
+                    encoder_inputs={"dmel_bins": dmel_bins},
+                    metadata={"num_tokens": num_tokens},
+                    feature_name="dmel_bins",
+                )
+                for index, (dmel_bins, num_tokens) in enumerate(
+                    zip(output["dmel_bins"], output["num_audio_tokens"])
+                )
+            ],
+        )
+
+    def get_mm_token_replacements(self, processor, processed_media):
+        replacements = []
+        for modality, token_id in (
+            ("image", self.IMAGE_TOKEN_ID),
+            ("audio", self.AUDIO_TOKEN_ID),
+        ):
+            media_output = processed_media.get(modality)
+            items = media_output.items if media_output is not None else []
+            if token_id is None:
+                if items:
+                    raise ValueError(
+                        f"Inkling {modality} input has no configured placeholder ID"
+                    )
+                continue
+            replacements.append(
+                (
+                    [token_id],
+                    [
+                        [([token_id] * item.metadata["num_tokens"], item.media_id)]
+                        for item in items
+                    ],
+                )
+            )
+        return replacements
 
     def assemble(
         self,
@@ -191,6 +294,14 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
         blocks and attach features. Walks ``input_ids`` left-to-right, consuming
         ``image_data`` / ``audio_data`` in encounter order.
         """
+        if self.supports_token_expansion:
+            return self.process_mm_data(
+                input_ids=input_ids,
+                images=image_data,
+                audios=audio_data,
+                consumer="sglang",
+            )
+
         image_data = image_data or []
         audio_data = audio_data or []
 
@@ -285,8 +396,6 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
             audio_end_id=self.AUDIO_END_TOKEN_ID,
         )
 
-    # ---- SGLang entrypoint ----------------------------------------------
-
     async def process_mm_data_async(
         self,
         image_data: Optional[List[Union[str, bytes, Dict]]] = None,
@@ -294,9 +403,22 @@ class InklingMultimodalProcessor(SGLangBaseProcessor):
         input_text: str = "",
         request_obj: Any = None,
         *args,
+        video_data=None,
+        input_ids=None,
         **kwargs,
     ) -> Optional[MultimodalProcessorOutput]:
-        input_ids = getattr(request_obj, "input_ids", None)
+        if self.supports_token_expansion:
+            return await super().process_mm_data_async(
+                image_data=image_data,
+                audio_data=audio_data,
+                input_text=input_text,
+                input_ids=input_ids,
+                request_obj=request_obj,
+                video_data=video_data,
+                **kwargs,
+            )
+        if input_ids is None:
+            input_ids = getattr(request_obj, "input_ids", None)
         if input_ids is None:
             if self._tokenizer is None:
                 raise ValueError(

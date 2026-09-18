@@ -1,18 +1,25 @@
-"""Every processor must reach preprocessing through the executor-backed helper.
+"""Check multimodal async dispatch and executor-backed preprocessing.
 
-`process_and_combine_mm_data` is the function the multimodal processor worker
-pool actually runs. A processor that calls it directly can never use those
-workers: it will build the thread pool and its processor clones on startup and
-then route every request past them. That failure is silent -- the model just
-serves at one-worker speed -- so pin the call site instead of the symptom.
+  async processor entry
+    -> await process_and_combine_mm_data_async
+      -> worker pool (or direct fallback when no executor exists)
+        -> sync process_and_combine_mm_data override
+          -> super().process_and_combine_mm_data is allowed here only
 
-`process_and_combine_mm_data_async` delegates straight to the sync function when
-no executor exists, so using it costs nothing until a model opts into
-concurrency.
+Direct sync calls from other processor functions bypass workers and are rejected.
+Migrated processors, including Inkling, inherit the Base worker dispatch.
+The exemption test distinguishes worker delegation from async/self/other calls;
+the source-tree checks require every remaining call to use the async helper.
+
+  explicit video_data -> InternVL special-format dispatch -> video item offsets
+                       (no duplicate keyword through **kwargs)
 """
 
 import ast
+import asyncio
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -65,7 +72,46 @@ def _call_sites():
                 and func.attr.startswith("process_and_combine_mm_data")
             ):
                 continue
-            yield path, node.lineno, func.attr, _enclosing_function(node, parents)
+            enclosing = _enclosing_function(node, parents)
+            if _is_sync_super_delegation(func, enclosing):
+                continue
+            yield path, node.lineno, func.attr, enclosing
+
+
+def _is_sync_super_delegation(func, enclosing):
+    return (
+        isinstance(enclosing, ast.FunctionDef)
+        and enclosing.name == "process_and_combine_mm_data"
+        and func.attr == enclosing.name
+        and isinstance(func.value, ast.Call)
+        and isinstance(func.value.func, ast.Name)
+        and func.value.func.id == "super"
+        and not func.value.args
+        and not func.value.keywords
+    )
+
+
+@pytest.mark.parametrize(
+    "definition,call,allowed",
+    [
+        (
+            "def process_and_combine_mm_data",
+            "super().process_and_combine_mm_data",
+            True,
+        ),
+        ("def process_and_combine_mm_data", "self.process_and_combine_mm_data", False),
+        (
+            "async def process_mm_data_async",
+            "super().process_and_combine_mm_data",
+            False,
+        ),
+        ("def other", "super().process_and_combine_mm_data", False),
+    ],
+    ids=["worker-super", "worker-self", "async-super", "unrelated-super"],
+)
+def test_only_worker_body_super_delegation_is_exempt(definition, call, allowed):
+    function = ast.parse(f"{definition}(self):\n    return {call}()").body[0]
+    assert _is_sync_super_delegation(function.body[0].value.func, function) is allowed
 
 
 def test_no_processor_bypasses_the_worker_pool():
@@ -91,6 +137,43 @@ def test_every_call_site_can_await():
         "preprocessing is reached from a non-async function, so it cannot go "
         "through the worker pool: " + ", ".join(offenders)
     )
+
+
+def test_internvl_explicit_video_reaches_special_format_dispatch():
+    import torch
+
+    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+    from sglang.srt.multimodal.processors.internvl import InternVLProcessor
+
+    processor = object.__new__(InternVLProcessor)
+    processor.img_start_token_id = 10
+    processor.img_end_token_id = 11
+    processor.img_context_token_id = 12
+    processor.video_token_id = 13
+    processor.mm_tokens = MultimodalSpecialTokens(video_token_id=13)
+    input_ids = [1, 13, 13, 2]
+    features = torch.zeros(2, 4)
+    video_data = [{"format": "processor_output", "pixel_values_videos": features}]
+    item = MultimodalDataItem(modality=Modality.VIDEO, feature=features)
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([item], torch.tensor(input_ids), {})
+    )
+
+    output = asyncio.run(
+        processor.process_mm_data_async(
+            image_data=None,
+            video_data=video_data,
+            input_text=input_ids,
+            request_obj=SimpleNamespace(),
+        )
+    )
+
+    loaded = processor.process_and_combine_mm_data_async.call_args.args[0]
+    assert loaded.videos == video_data
+    assert output.input_ids == input_ids
+    assert output.mm_items[0].feature is features
+    assert output.mm_items[0].offsets == [(1, 2)]
 
 
 def test_default_worker_count_follows_the_preprocessing_path():
@@ -155,7 +238,6 @@ def test_overrides_take_the_worker_pools_processor_clone():
 # leaving it at one-worker speed.
 _NO_WORKER_POOL_ROUTE = {
     "dots_note_omni.py",
-    "inkling.py",
     "lightonocr.py",
     "llava.py",
     "mimo_v2.py",
