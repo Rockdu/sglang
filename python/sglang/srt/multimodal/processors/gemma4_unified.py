@@ -19,7 +19,7 @@ from sglang.srt.multimodal.processors.gemma4 import Gemma4SGLangProcessor
 class Gemma4UnifiedSGLangProcessor(Gemma4SGLangProcessor):
     """Multimodal processor for the encoder-free unified Gemma4 (image/video/audio).
 
-    Identical to :class:`Gemma4SGLangProcessor` except for audio padding: the
+    Identical to :class:`Gemma4SGLangProcessor` except for audio framing: the
     unified model has no SSCP conformer, so the waveform is simply chunked into
     fixed ``audio_samples_per_token`` (640) frames.  Padding the waveform up to a
     multiple of that frame size keeps ``ceil(num_samples / spt)`` consistent with
@@ -28,6 +28,8 @@ class Gemma4UnifiedSGLangProcessor(Gemma4SGLangProcessor):
 
     models = [Gemma4UnifiedForConditionalGeneration]
 
-    def _get_audio_pad_multiple(self) -> int:
-        fe = getattr(self._processor, "feature_extractor", None)
-        return getattr(fe, "audio_samples_per_token", 640)
+    def _get_audio_pad_multiple(self, processor) -> int:
+        return processor.feature_extractor.audio_samples_per_token
+
+    def _get_audio_token_count(self, mask) -> int:
+        return int(mask.sum())
