@@ -38,7 +38,11 @@ from sglang.srt.multimodal.processors.glm4v import (
     preprocess_video_frames_sync,
     split_glm_video_items,
 )
-from sglang.srt.multimodal.processors.qwen_vl import preprocess_video
+from sglang.srt.multimodal.processors.qwen_vl import (
+    Qwen3VLVideoProcessor,
+    _get_processor_video_config,
+    preprocess_video,
+)
 from sglang.srt.runtime_context import (
     get_device,
     get_mm,
@@ -537,11 +541,23 @@ class EncoderPreprocessor:
         if "qwen" in self.model_type:
             video_processed = [
                 await preprocess_video(
-                    video, video_config=self.vision_config.get("video", {})
+                    video,
+                    video_config=self.vision_config.get("video", {}),
+                    video_processor=self.video_processor,
+                    resize_raw_frames=True,
                 )
                 for video in video_items
             ]
             videos, video_metadata = map(list, zip(*video_processed))
+            if isinstance(self.video_processor, Qwen3VLVideoProcessor):
+                video_processor_kwargs.update(
+                    _get_processor_video_config(
+                        self.vision_config.get("video", {}), video_metadata
+                    )
+                    or {}
+                )
+                video_processor_kwargs["do_resize"] = False
+                video_processor_kwargs["input_data_format"] = "channels_first"
             video_processor_kwargs["do_sample_frames"] = False
             if video_metadata:
                 video_processor_kwargs["video_metadata"] = video_metadata

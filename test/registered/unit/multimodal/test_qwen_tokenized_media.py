@@ -14,6 +14,10 @@ strings are encoded.
 Mixed image/video/audio fields stay isolated. Partial expansion takes trailing
 media items, preserves noncanonical history and retains each source tensor view.
 Reader tests check process-stage sampling/resize, sampled indices and closure.
+Qwen3 readers resize bounded chunks against raw-frame HF references; Qwen2 keeps
+its legacy resize. Decoded frames still receive native HF resize.
+Explicit channels-last inputs become channels-first before the final HF call.
+Mixed reader/frame batches cross the original HF boundary after exactly one resize.
 Frozen recipes preserve image resize, audio truncation and video frame layout;
 Grid media stay batched until serving build reuses the existing item splitter;
 grouped image and padded audio serving items share their final tensor storage.
@@ -35,6 +39,7 @@ import numpy as np
 import torch
 from PIL import Image
 from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+from torchvision.transforms.functional import InterpolationMode, resize
 from transformers import (
     PreTrainedTokenizerFast,
     Qwen2_5_VLProcessor,
@@ -58,6 +63,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
+    preprocess_video_sync,
 )
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -83,12 +89,18 @@ class _VideoDecoder(VideoDecoderWrapper):
         self.frames = frames
         self.avg_fps = fps
         self.close_count = 0
+        self.decode_requests = []
 
     def __len__(self):
         return len(self.frames)
 
     def get_frames_as_tensor(self, indices):
+        self.decode_requests.append(list(indices))
         return self.frames[indices]
+
+    @property
+    def frame_shape(self):
+        return tuple(self.frames.shape[1:3])
 
     def close(self):
         self.close_count += 1
@@ -225,6 +237,15 @@ def _make_hf_processor(processor_class, patch_size, *, model_type="qwen3_vl"):
 
 
 class TestQwenTokenizedMedia(CustomTestCase):
+    def assert_tensor_bytes_equal(self, actual, expected):
+        self.assertEqual(actual.dtype, expected.dtype)
+        self.assertEqual(actual.shape, expected.shape)
+        self.assertTrue(
+            actual.contiguous().view(torch.uint8).numpy().tobytes()
+            == expected.contiguous().view(torch.uint8).numpy().tobytes(),
+            "Tensor bytes differ",
+        )
+
     def test_non_qwen_subclass_keeps_legacy_token_processing(self):
         class OtherVLMProcessor(QwenVLImageProcessor):
             pass
@@ -340,6 +361,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
             ("qwen2_5_vl", Qwen2_5_VLProcessor),
             ("qwen3_vl", Qwen3VLProcessor),
             ("qwen3_5", Qwen3VLProcessor),
+            ("qwen4_exp", Qwen3VLProcessor),
             ("qwen3_omni_moe", Qwen3OmniMoeProcessor),
         ):
             with self.subTest(model_type=model_type):
@@ -350,7 +372,10 @@ class TestQwenTokenizedMedia(CustomTestCase):
                 )
                 processor.video_config = {"do_sample_frames": False}
                 videos = [
-                    torch.zeros(4, 3, 64, 64, dtype=torch.uint8),
+                    torch.arange(4 * 3 * 112 * 168)
+                    .remainder(251)
+                    .to(torch.uint8)
+                    .reshape(4, 3, 112, 168),
                     torch.ones(2, 3, 64, 128, dtype=torch.uint8),
                 ]
                 metadata = [
@@ -377,7 +402,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
                         expanded, media, consumer="training", return_metadata=True
                     )
                 for key in ("input_ids", "pixel_values_videos", "video_grid_thw"):
-                    torch.testing.assert_close(actual[key], reference[key])
+                    self.assert_tensor_bytes_equal(actual[key], reference[key])
                 for key in ("second_per_grid_ts", "video_second_per_grid"):
                     if key in reference:
                         torch.testing.assert_close(
@@ -465,23 +490,158 @@ class TestQwenTokenizedMedia(CustomTestCase):
             result["input_ids"].tolist(), [[AUDIO] * 3 + [EOS] + [AUDIO] * 16]
         )
 
+    def test_native_video_reader_matches_raw_frames_and_replays_recipe(self):
+        # Both source dimensions align to legacy factor 28, but not native factor 32.
+        frames = (
+            torch.arange(8 * 112 * 168 * 3)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(8, 112, 168, 3)
+        )
+        metadata = [{"fps": 8, "total_num_frames": 8, "frames_indices": [0, 2, 4, 7]}]
+        for model_type in ("qwen3_5", "qwen4_exp"):
+            with self.subTest(model_type=model_type):
+                processor = _make_hf_processor(
+                    Qwen3VLProcessor, 16, model_type=model_type
+                )
+                processor.video_config = {"nframes": 4}
+                reference = processor._processor(
+                    text="<|video_pad|>",
+                    videos=[frames[[0, 2, 4, 7]]],
+                    video_metadata=metadata,
+                    do_sample_frames=False,
+                    return_metadata=True,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                    input_data_format="channels_last",
+                )
+                decoder = _VideoDecoder(frames, fps=8)
+                with (
+                    patch(
+                        "sglang.srt.multimodal.processors.qwen_vl.MAX_VIDEO_DECODE_CHUNK_BYTES",
+                        2 * 112 * 168 * 3,
+                    ),
+                    _ban_text_processing(processor),
+                ):
+                    media = processor.process_media(
+                        videos=[decoder], input_data_format="channels_last"
+                    )
+                    expanded = processor.mm_token_expansion([VIDEO], media)
+                    actual = processor.build_multimodal_inputs(
+                        expanded, media, consumer="training", return_metadata=True
+                    )
+                self.assertEqual(decoder.decode_requests, [[0, 2], [4, 7]])
+                self.assertEqual(decoder.close_count, 1)
+                for key in ("input_ids", "pixel_values_videos", "video_grid_thw"):
+                    self.assert_tensor_bytes_equal(actual[key], reference[key])
+                item = media["video"].items[0]
+                self.assertEqual(
+                    list(item.metadata["video_metadata"].frames_indices), [0, 2, 4, 7]
+                )
+                self.assertEqual(item.metadata["video_metadata"].fps, 8)
+
+                processor.video_config = {
+                    "nframes": 2,
+                    "size": {"shortest_edge": 128**2, "longest_edge": 128**2},
+                }
+                replay_decoder = _VideoDecoder(frames, fps=8)
+                replayed = processor.process_media(
+                    videos=[
+                        {
+                            "url": replay_decoder,
+                            "process_options": item.effective_options,
+                        }
+                    ]
+                )
+                self.assertEqual(replay_decoder.decode_requests, [[0, 2, 4, 7]])
+                self.assertEqual(replay_decoder.close_count, 1)
+                for key in ("pixel_values_videos", "video_grid_thw"):
+                    self.assert_tensor_bytes_equal(
+                        replayed["video"].encoder_inputs[key], actual[key]
+                    )
+                self.assertEqual(
+                    processor.mm_token_expansion([VIDEO], replayed), expanded
+                )
+
+    def test_mixed_video_sources_reach_hf_after_one_native_resize(self):
+        # This aspect ratio shrinks again if native smart_resize runs twice.
+        frames = (
+            torch.arange(2 * 32 * 3840 * 3)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(2, 32, 3840, 3)
+        )
+        video_processor = Qwen3VLVideoProcessor(
+            size={"shortest_edge": 16384, "longest_edge": 131072}
+        )
+        decoder = _VideoDecoder(frames)
+        prepared, metadata = zip(
+            *[
+                preprocess_video_sync(
+                    source,
+                    video_config={"nframes": 2},
+                    video_processor=video_processor,
+                    processor_kwargs={"input_data_format": "channels_last"},
+                    resize_raw_frames=True,
+                )
+                for source in (decoder, frames)
+            ]
+        )
+        reference = video_processor(
+            [frames, frames],
+            input_data_format="channels_last",
+            do_sample_frames=False,
+            return_tensors="pt",
+        )
+        actual = video_processor(
+            list(prepared),
+            video_metadata=list(metadata),
+            input_data_format="channels_first",
+            do_sample_frames=False,
+            do_resize=False,
+            return_tensors="pt",
+        )
+        self.assertEqual(actual["video_grid_thw"].tolist(), [[1, 2, 174], [1, 2, 174]])
+        for key in ("pixel_values_videos", "video_grid_thw"):
+            self.assert_tensor_bytes_equal(actual[key], reference[key])
+
     @patch("sglang.srt.multimodal.processors.qwen_vl.is_cpu", return_value=True)
-    def test_video_reader_is_decoded_resized_and_closed_in_process(self, _is_cpu):
-        processor = _make_hf_processor(Qwen3VLProcessor, 16)
+    def test_qwen2_video_reader_keeps_legacy_resize(self, _is_cpu):
+        processor = _make_hf_processor(Qwen2VLProcessor, 14, model_type="qwen2_vl")
         processor.video_config = {
             "nframes": 2,
             "resized_height": 56,
             "resized_width": 56,
         }
-        decoder = _VideoDecoder(torch.zeros(8, 112, 112, 3, dtype=torch.uint8), fps=8)
+        frames = (
+            torch.arange(8 * 112 * 112 * 3)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(8, 112, 112, 3)
+        )
+        decoder = _VideoDecoder(frames, fps=8)
+        reference = processor._processor.video_processor(
+            [
+                resize(
+                    frames[[0, 7]].permute(0, 3, 1, 2),
+                    [56, 56],
+                    interpolation=InterpolationMode.BILINEAR,
+                )
+            ],
+            do_sample_frames=False,
+            return_tensors="pt",
+        )
         output = processor.process_videos(
             [decoder], processor._processor, return_tensors="pt"
         )
         self.assertEqual(decoder.close_count, 1)
+        self.assertEqual(decoder.decode_requests, [[0, 7]])
         self.assertEqual(
             output.items[0].metadata["video_metadata"].frames_indices.tolist(), [0, 7]
         )
         self.assertEqual(output.encoder_inputs["video_grid_thw"].tolist(), [[1, 4, 4]])
+        for key in ("pixel_values_videos", "video_grid_thw"):
+            self.assert_tensor_bytes_equal(output.encoder_inputs[key], reference[key])
 
     def test_omni_audio_in_video_is_not_implicitly_enabled(self):
         processor = _make_hf_processor(

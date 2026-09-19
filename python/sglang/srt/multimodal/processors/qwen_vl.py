@@ -2,7 +2,7 @@ import math
 import os
 import re
 import time
-from dataclasses import replace
+from dataclasses import asdict, replace
 from functools import partial
 from typing import List, Optional, Union
 
@@ -11,8 +11,16 @@ import torch
 import torchvision
 from PIL import Image
 from torchvision.transforms import InterpolationMode
+from transformers import BaseImageProcessor
+from transformers.image_utils import SizeDict
 from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
     Qwen3OmniMoeProcessorKwargs,
+)
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
+    Qwen3VLVideoProcessor,
+)
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
+    smart_resize as smart_resize_video,
 )
 
 from sglang.srt.environ import envs
@@ -80,6 +88,7 @@ FRAME_FACTOR = 2
 FPS = 2.0
 FPS_MIN_FRAMES = 4
 FPS_MAX_FRAMES = 768
+MAX_VIDEO_DECODE_CHUNK_BYTES = 512 * 1024 * 1024
 
 QWEN_VIDEO_PREPROCESS_CONFIG_KEYS = frozenset(
     {
@@ -217,12 +226,99 @@ def smart_nframes(
     return nframes
 
 
-def preprocess_video_sync(
-    vr, *, image_factor=IMAGE_FACTOR, video_config=None
+def _resize_native_video(
+    video, num_frames, video_processor, video_config, processor_kwargs
 ):
-    if not isinstance(vr, VideoDecoderWrapper):
-        return vr, None
+    device = processor_kwargs.get("device")
+    if device is not None:
+        video = video.to(device)
+    if processor_kwargs.get("do_convert_rgb", video_processor.do_convert_rgb):
+        video = video_processor.convert_to_rgb(video)
+    do_resize = video_config.get(
+        "do_resize", processor_kwargs.get("do_resize", video_processor.do_resize)
+    )
+    if do_resize:
+        if "resized_height" in video_config and "resized_width" in video_config:
+            resized_height = video_config["resized_height"]
+            resized_width = video_config["resized_width"]
+        else:
+            height, width = video.shape[-2:]
+            size = processor_kwargs.get("size", video_processor.size)
+            resized_height, resized_width = smart_resize_video(
+                num_frames=num_frames,
+                height=height,
+                width=width,
+                temporal_factor=processor_kwargs.get(
+                    "temporal_patch_size", video_processor.temporal_patch_size
+                ),
+                factor=processor_kwargs.get("patch_size", video_processor.patch_size)
+                * processor_kwargs.get("merge_size", video_processor.merge_size),
+                min_pixels=size["shortest_edge"],
+                max_pixels=size["longest_edge"],
+            )
+        video = video_processor.resize(
+            video,
+            size=SizeDict(height=resized_height, width=resized_width),
+            resample=processor_kwargs.get("resample", video_processor.resample),
+        )
+    return video
+
+
+def _decode_native_video(vr, indices, video_processor, video_config, processor_kwargs):
+    height, width = vr.frame_shape
+    frames_per_chunk = max(1, MAX_VIDEO_DECODE_CHUNK_BYTES // (height * width * 3))
+    video = None
+    for start in range(0, len(indices), frames_per_chunk):
+        chunk_indices = indices[start : start + frames_per_chunk].tolist()
+        chunk = vr.get_frames_as_tensor(chunk_indices).permute(0, 3, 1, 2).contiguous()
+        chunk = _resize_native_video(
+            chunk, len(indices), video_processor, video_config, processor_kwargs
+        )
+        if video is None:
+            video = chunk.new_empty((len(indices), *chunk.shape[1:]))
+        video[start : start + len(chunk_indices)].copy_(chunk)
+    return video
+
+
+def preprocess_video_sync(
+    vr,
+    *,
+    image_factor=IMAGE_FACTOR,
+    video_config=None,
+    video_processor=None,
+    processor_kwargs=None,
+    resize_raw_frames=False,
+):
     video_config = video_config or {}
+    processor_kwargs = processor_kwargs or {}
+    if isinstance(video_processor, Qwen3VLVideoProcessor):
+        legacy_size_keys = {
+            "min_pixels",
+            "max_pixels",
+            "total_pixels",
+        } & video_config.keys()
+        if legacy_size_keys:
+            raise ValueError(
+                f"Qwen3 video sizing does not support {sorted(legacy_size_keys)}; "
+                "use size with shortest_edge and longest_edge."
+            )
+    if not isinstance(vr, VideoDecoderWrapper):
+        if resize_raw_frames and isinstance(video_processor, Qwen3VLVideoProcessor):
+            videos, metadata = video_processor._decode_and_sample_videos(
+                vr, video_metadata=None, do_sample_frames=False
+            )
+            video = video_processor._prepare_input_videos(
+                videos,
+                input_data_format=processor_kwargs.get("input_data_format"),
+                device=processor_kwargs.get("device"),
+            )[0]
+            return (
+                _resize_native_video(
+                    video, len(video), video_processor, video_config, processor_kwargs
+                ),
+                asdict(metadata[0]),
+            )
+        return vr, None
     total_frames, video_fps = len(vr), vr.avg_fps
     if "frame_indices" in video_config:
         indices = np.asarray(video_config["frame_indices"], dtype=np.int64)
@@ -232,6 +328,20 @@ def preprocess_video_sync(
         )
         indices = np.unique(
             np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
+        )
+    metadata = {
+        "fps": video_fps,
+        "duration": total_frames / video_fps,
+        "total_num_frames": total_frames,
+        "frames_indices": indices,
+        "video_backend": "torchvision",
+    }
+    if isinstance(video_processor, Qwen3VLVideoProcessor):
+        return (
+            _decode_native_video(
+                vr, indices, video_processor, video_config, processor_kwargs
+            ),
+            metadata,
         )
     video = vr.get_frames_as_tensor(indices.tolist()).permute(0, 3, 1, 2)
     nframes, _, height, width = video.shape
@@ -273,18 +383,24 @@ def preprocess_video_sync(
     )
     if not is_cpu():
         video = video.pin_memory()
-    return video, {
-        "fps": video_fps,
-        "duration": total_frames / video_fps,
-        "total_num_frames": total_frames,
-        "frames_indices": indices,
-        "video_backend": "torchvision",
-    }
+    return video, metadata
 
 
-async def preprocess_video(vr, image_factor=IMAGE_FACTOR, video_config=None):
+async def preprocess_video(
+    vr,
+    image_factor=IMAGE_FACTOR,
+    video_config=None,
+    *,
+    video_processor=None,
+    resize_raw_frames=False,
+):
     return preprocess_video_sync(
-        vr, image_factor=image_factor, video_config=video_config
+        vr,
+        image_factor=image_factor,
+        video_config=video_config,
+        video_processor=video_processor,
+        processor_kwargs=video_config,
+        resize_raw_frames=resize_raw_frames,
     )
 
 
@@ -761,6 +877,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         kwargs.pop("seconds_per_chunk", None)
         kwargs.pop("position_id_per_seconds", None)
         supplied_metadata = kwargs.pop("video_metadata", None)
+        video_processor = processor.video_processor
+        native_video_resize = isinstance(video_processor, Qwen3VLVideoProcessor)
         recipes = process_options or [None] * len(videos)
         prepared, groups = [], []
         for index, video in enumerate(videos):
@@ -779,8 +897,32 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             if recipe:
                 config = dict(recipe["video_config"])
                 processor_kwargs = dict(recipe["processor_kwargs"])
+            elif native_video_resize:
+                processor_kwargs.update(
+                    {
+                        key: value
+                        for key, value in config.items()
+                        if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+                    }
+                )
+                for key, value in {
+                    "do_resize": video_processor.do_resize,
+                    "size": video_processor.size,
+                    "resample": video_processor.resample,
+                    "patch_size": video_processor.patch_size,
+                    "merge_size": video_processor.merge_size,
+                    "temporal_patch_size": video_processor.temporal_patch_size,
+                }.items():
+                    processor_kwargs.setdefault(key, value)
+                processor_kwargs["size"] = dict(processor_kwargs["size"])
+                config["do_resize"] = processor_kwargs["do_resize"]
             try:
-                frames, metadata = preprocess_video_sync(video, video_config=config)
+                frames, metadata = preprocess_video_sync(
+                    video,
+                    video_config=config,
+                    video_processor=video_processor,
+                    processor_kwargs=processor_kwargs,
+                )
             finally:
                 if isinstance(video, VideoDecoderWrapper):
                     video.close()
@@ -796,6 +938,9 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                     if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS - {"fps"}
                 }
                 processor_kwargs["do_sample_frames"] = False
+            if native_video_resize and isinstance(video, VideoDecoderWrapper):
+                processor_kwargs["do_resize"] = False
+                processor_kwargs["input_data_format"] = "channels_first"
             processor_kwargs["return_metadata"] = True
             prepared.append((frames, metadata, config, processor_kwargs))
             for group_kwargs, indices in groups:
@@ -1043,18 +1188,41 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
+        video_processor = getattr(self._processor, "video_processor", None)
+        video_processor_kwargs = dict(self.video_config)
+        if isinstance(video_processor, Qwen3VLVideoProcessor):
+            video_device = self.video_preprocessing_device
+            if (
+                video_device is None
+                and isinstance(self._processor.image_processor, BaseImageProcessor)
+                and not self.disable_fast_image_processor
+            ):
+                video_device = self._fast_image_processor_device(self._processor)
+            if video_device is not None:
+                video_processor_kwargs["device"] = video_device
         base_output.videos, video_metadata = await self.process_video_data_async(
             base_output.videos,
-            partial(preprocess_video_sync, video_config=self.video_config),
+            partial(
+                preprocess_video_sync,
+                video_config=self.video_config,
+                video_processor=video_processor,
+                processor_kwargs=video_processor_kwargs,
+                resize_raw_frames=True,
+            ),
         )
         processor_kwargs = {}
         processor_video_config = _get_processor_video_config(
             self.video_config, video_metadata
         )
         if processor_video_config is not None:
+            if isinstance(video_processor, Qwen3VLVideoProcessor):
+                processor_video_config["do_resize"] = False
+                processor_video_config["input_data_format"] = "channels_first"
             processor_kwargs["processor_video_config"] = processor_video_config
 
-        if self.hf_config.model_type in (
+        if isinstance(
+            video_processor, Qwen3VLVideoProcessor
+        ) or self.hf_config.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
             "qwen3_5",
