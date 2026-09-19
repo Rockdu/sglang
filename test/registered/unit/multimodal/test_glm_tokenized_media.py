@@ -11,11 +11,11 @@
 HF outputs provide independent numeric/token references. Partial expansion reads
 only the new suffix; serving build checks historical media token counts.
 
-    first video -> process -> frozen recipe
-    old(recipe) + new -> retain old budget/frames -> budget only the new video
-    option groups [A, B, A] -> source-order patches -> per-source serving views
+    all videos -> uniform request budget -> source-order patches / serving views
+    per-source FPS -> matching timeline metadata -> video timestamps
 
-Actual grids validate budgets. Reader tests check process-stage sampling and closure.
+The existing budget helper divides the full request budget across all videos.
+Reader tests check process-stage sampling and closure.
 Video processing preserves source pixels and resolves missing FPS before timestamp
 expansion. No text decoding occurs on the ID route.
 Historical layout fixtures retain the component's patch tensor contract.
@@ -319,11 +319,10 @@ def test_real_hf_glm_image_and_video_preprocessing_preserves_arbitrary_tokens(
         for start, end in item.offsets
     )
     history = expanded_input_ids.copy()
-    video_recipe = media["video"].items[0].effective_options
     media = processor.process_media(
         images=base.images + [Image.new("RGB", (112, 112), "white")],
-        videos=[{"url": base.videos[0], "process_options": video_recipe}],
-        fps=10,
+        videos=base.videos,
+        video_metadata=metadata,
         do_sample_frames=False,
     )
     partial = processor.mm_token_expansion(
@@ -339,7 +338,7 @@ def test_real_hf_glm_image_and_video_preprocessing_preserves_arbitrary_tokens(
     processor.build_multimodal_inputs(partial, media, consumer="training")
 
 
-def test_video_option_groups_preserve_source_order_and_serving_views():
+def test_video_batch_preserves_source_order_metadata_and_serving_views():
     from transformers.models.glm4v.video_processing_glm4v import Glm4vVideoProcessor
 
     processor = _vision_processor()
@@ -353,21 +352,28 @@ def test_video_option_groups_preserve_source_order_and_serving_views():
             [video],
             processor._processor,
             do_resize=False,
-            do_normalize=normalize,
+            source_configs=[{"fps": fps}],
             return_tensors="pt",
         )
-        for video, normalize in zip(videos, (True, False, True))
+        for video, fps in zip(videos, (1, 2, 3))
     ]
     grouped = processor.process_videos(
         videos,
         processor._processor,
-        process_options=[source.items[0].effective_options for source in references],
+        source_configs=[{"fps": fps} for fps in (1, 2, 3)],
+        do_resize=False,
+        return_tensors="pt",
     )
     for name in ("pixel_values_videos", "video_grid_thw"):
         assert torch.equal(
             grouped.encoder_inputs[name],
             torch.cat([source.encoder_inputs[name] for source in references]),
         )
+    assert [metadata.fps for metadata in grouped.encoder_inputs["video_metadata"]] == [
+        1,
+        2,
+        3,
+    ]
     media = {"video": grouped}
     expanded = processor.mm_token_expansion([VIDEO_START, VIDEO, VIDEO_END] * 3, media)
     serving = processor.build_multimodal_inputs(expanded, media)
@@ -445,56 +451,18 @@ class _BudgetVideoProcessor:
         }
 
 
-def test_frozen_video_recipe_preserves_history_and_only_new_video_gets_budget():
+@pytest.mark.parametrize("request_budget,per_video_budget", [(24, 12), (None, 16)])
+def test_full_video_batch_uses_uniform_request_budget(request_budget, per_video_budget):
     processor = _vision_processor()
     processor._processor.video_processor = _BudgetVideoProcessor()
     video = torch.zeros(2, 16, 16, 3, dtype=torch.uint8)
-    first = processor.process_videos([video], processor._processor, max_image_tokens=16)
-    recipe = first.items[0].effective_options
-    second = processor.process_videos(
-        [video, video],
-        processor._processor,
-        process_options=[recipe, None],
-        max_image_tokens=24,
-    )
-    assert (
-        first.items[0].metadata["video_grid_thw"].tolist()
-        == second.items[0].metadata["video_grid_thw"].tolist()
-    )
-    torch.testing.assert_close(
-        first.encoder_inputs["pixel_values_videos"],
-        second.encoder_inputs["pixel_values_videos"][
-            : first.encoder_inputs["pixel_values_videos"].shape[0]
-        ],
-    )
-    assert [item.effective_options["token_count"] for item in second.items] == [16, 8]
-    import json
-
-    json.dumps([item.effective_options for item in second.items])
-    with pytest.raises(ValueError, match="No token budget"):
-        processor.process_videos(
-            [video, video],
-            processor._processor,
-            process_options=[recipe, None],
-            max_image_tokens=16,
-        )
-
-
-def test_actual_grid_budget_is_checked_after_processing(monkeypatch):
-    processor = _vision_processor()
-    video_processor = _BudgetVideoProcessor()
-    call = _BudgetVideoProcessor.__call__
-
-    def exceed(self, videos, **kwargs):
-        kwargs["max_image_tokens"] += 1
-        return call(self, videos, **kwargs)
-
-    monkeypatch.setattr(_BudgetVideoProcessor, "__call__", exceed)
-    processor._processor.video_processor = video_processor
-    with pytest.raises(ValueError, match="exceeds its available token budget"):
-        processor.process_videos(
-            [torch.zeros(2, 16, 16, 3)], processor._processor, max_image_tokens=8
-        )
+    kwargs = {} if request_budget is None else {"max_image_tokens": request_budget}
+    output = processor.process_videos([video, video], processor._processor, **kwargs)
+    assert output.encoder_inputs["video_grid_thw"].tolist() == [
+        [1, 1, per_video_budget],
+        [1, 1, per_video_budget],
+    ]
+    assert output.encoder_inputs["pixel_values_videos"].shape[0] == per_video_budget * 2
 
 
 def test_serving_rejects_changed_historical_video_token_count():
@@ -546,7 +514,7 @@ def test_reader_sampling_is_in_process_and_closes_reader():
     assert decoder.closed
     assert decoder.decoded_frame_indices
     assert (
-        output.items[0].effective_options["video_config"]["frame_indices"]
+        output.items[0].metadata["video_metadata"].frames_indices
         == decoder.decoded_frame_indices[0]
     )
 

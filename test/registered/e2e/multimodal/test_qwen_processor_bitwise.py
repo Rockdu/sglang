@@ -11,9 +11,8 @@
                      +---------- exact comparison ----------+
 
 The same Python environment and checkpoint processor files serve both captures.
-Only media_process_options is excluded from model-input parity: it is new session
-bookkeeping, retained in the artifact and reused to freeze historical media.
-Item grouping and all other fields are compared unchanged, including offsets and
+Every turn supplies its full ordered media URL lists without session recipes.
+All output fields are compared unchanged, including item grouping, offsets and
 mRoPE. No model weights or generation are needed. CPU tests exercise the strict
 comparator; CUDA CI also runs a pinned public benchmark sample through both real
 routes with two questions/images joined at an explicit assistant end token.
@@ -187,12 +186,10 @@ async def _capture(checkout, manifest_path, route):
     if route == "corrected-legacy":
         processor.supports_token_expansion = False
     captures = {}
-    bookkeeping = {}
     try:
         for sample in manifest["samples"]:
             previous_ids, previous_expanded_ids = [], []
             previous_media = {modality: [] for modality in ("image", "video", "audio")}
-            recipes = []
             for turn_index, turn in enumerate(sample["turns"]):
                 case_id = f"{sample['id']}/turn-{turn_index}"
                 assert case_id not in captures, f"Duplicate fixture: {case_id}"
@@ -234,12 +231,6 @@ async def _capture(checkout, manifest_path, route):
                         request_obj=request,
                     )
                 else:
-                    for recipe in recipes:
-                        modality, index = recipe["modality"], recipe["index"]
-                        sources[modality][index] = {
-                            "url": sources[modality][index],
-                            "process_options": recipe["options"],
-                        }
                     boundary = len(previous_expanded_ids)
                     partial_ids = previous_expanded_ids + input_ids[len(previous_ids) :]
                     request = GenerateReqInput(
@@ -258,11 +249,7 @@ async def _capture(checkout, manifest_path, route):
                         request_obj=request,
                     )
                     assert output.input_ids[:boundary] == previous_expanded_ids
-                    recipes = output.media_process_options
                 model_inputs = msgspec.structs.asdict(output)
-                bookkeeping[case_id] = _snapshot(
-                    model_inputs.pop("media_process_options", None)
-                )
                 captures[case_id] = {
                     "unexpanded_input_ids": input_ids,
                     "model_inputs": _snapshot(model_inputs),
@@ -284,7 +271,6 @@ async def _capture(checkout, manifest_path, route):
         },
         "python": sys.version,
         "cases": captures,
-        "bookkeeping": bookkeeping,
     }
 
 

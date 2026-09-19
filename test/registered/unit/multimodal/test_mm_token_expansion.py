@@ -12,7 +12,7 @@ source offsets, empty sources consume no span, and segments cannot cross gaps.
 Repeated build calls cannot mutate the media result.
 Native training builds neither serving offsets nor replacement fragments.
 Loading reuses common decoders and preserves per-source processing options.
-Audio resampling precedes processing, including frozen per-source sample rates.
+Audio resampling precedes processing and honors per-source sample rates.
 IDs-only matching retains its tuple-list contract and rejects bad counts.
 """
 
@@ -261,13 +261,12 @@ class TestBaseTokenExpansion(unittest.IsolatedAsyncioTestCase):
                 {
                     "url": audio_bytes.getvalue(),
                     "preprocess_kwargs": {"sampling_rate": 32000},
-                    "process_options": {"sampling_rate": 24000},
                 },
             ],
             audio_sample_rate=16000,
         )
         self.assertEqual(loaded.audios[0].shape, (160,))
-        self.assertEqual(loaded.audios[1]["url"].shape, (240,))
+        self.assertEqual(loaded.audios[1]["url"].shape, (320,))
         processor._tokenizer.decode.assert_not_called()
 
     async def test_async_workers_preserve_history_and_do_not_block_event_loop(self):

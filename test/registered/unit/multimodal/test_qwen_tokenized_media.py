@@ -18,7 +18,7 @@ Qwen3 readers resize bounded chunks against raw-frame HF references; Qwen2 keeps
 its legacy resize. Decoded frames still receive native HF resize.
 Explicit channels-last inputs become channels-first before the final HF call.
 Mixed reader/frame batches cross the original HF boundary after exactly one resize.
-Frozen recipes preserve image resize, audio truncation and video frame layout;
+Per-source options control image resize, audio truncation and video preprocessing;
 Grid media stay batched until serving build reuses the existing item splitter;
 grouped image and padded audio serving items share their final tensor storage.
 Video option groups [A, B, A] restore source order before serving splits the batch.
@@ -437,9 +437,10 @@ class TestQwenTokenizedMedia(CustomTestCase):
         grouped = processor.process_videos(
             videos,
             processor._processor,
-            process_options=[
-                source.items[0].effective_options for source in references
-            ],
+            source_configs=[{"do_normalize": value} for value in (True, False, True)],
+            do_resize=False,
+            do_sample_frames=False,
+            return_tensors="pt",
         )
         for name in ("pixel_values_videos", "video_grid_thw"):
             self.assert_tensor_bytes_equal(
@@ -490,7 +491,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
             result["input_ids"].tolist(), [[AUDIO] * 3 + [EOS] + [AUDIO] * 16]
         )
 
-    def test_native_video_reader_matches_raw_frames_and_replays_recipe(self):
+    def test_native_video_reader_matches_raw_frames(self):
         # Both source dimensions align to legacy factor 28, but not native factor 32.
         frames = (
             torch.arange(8 * 112 * 168 * 3)
@@ -539,29 +540,6 @@ class TestQwenTokenizedMedia(CustomTestCase):
                     list(item.metadata["video_metadata"].frames_indices), [0, 2, 4, 7]
                 )
                 self.assertEqual(item.metadata["video_metadata"].fps, 8)
-
-                processor.video_config = {
-                    "nframes": 2,
-                    "size": {"shortest_edge": 128**2, "longest_edge": 128**2},
-                }
-                replay_decoder = _VideoDecoder(frames, fps=8)
-                replayed = processor.process_media(
-                    videos=[
-                        {
-                            "url": replay_decoder,
-                            "process_options": item.effective_options,
-                        }
-                    ]
-                )
-                self.assertEqual(replay_decoder.decode_requests, [[0, 2, 4, 7]])
-                self.assertEqual(replay_decoder.close_count, 1)
-                for key in ("pixel_values_videos", "video_grid_thw"):
-                    self.assert_tensor_bytes_equal(
-                        replayed["video"].encoder_inputs[key], actual[key]
-                    )
-                self.assertEqual(
-                    processor.mm_token_expansion([VIDEO], replayed), expanded
-                )
 
     def test_mixed_video_sources_reach_hf_after_one_native_resize(self):
         # This aspect ratio shrinks again if native smart_resize runs twice.
@@ -650,13 +628,14 @@ class TestQwenTokenizedMedia(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "use_audio_in_video"):
             processor.process_media(videos=[object()], use_audio_in_video=True)
 
-    def test_image_recipe_keeps_historical_resize_when_request_defaults_change(self):
+    def test_image_source_options_preserve_independent_resize_and_serving_views(self):
         processor = _make_hf_processor(Qwen3VLProcessor, 16)
         image = Image.new("RGB", (64, 64))
-        first = processor.process_media(images=[image])["image"]
+        image_options = {"size": {"shortest_edge": 64**2, "longest_edge": 64**2}}
+        first = processor.process_media(images=[image], **image_options)["image"]
         second = processor.process_media(
             images=[
-                {"url": image, "process_options": first.items[0].effective_options},
+                {"url": image, "preprocess_kwargs": image_options},
                 image,
             ],
             size={"shortest_edge": 128**2, "longest_edge": 128**2},
@@ -675,7 +654,7 @@ class TestQwenTokenizedMedia(CustomTestCase):
                 second.encoder_inputs["pixel_values"].untyped_storage().data_ptr(),
             )
 
-    def test_video_recipe_and_expansion_do_not_mutate_source_metadata(self):
+    def test_repeated_video_expansion_does_not_mutate_source_metadata(self):
         processor = _make_hf_processor(Qwen3VLProcessor, 16)
         video = torch.zeros(3, 3, 64, 64, dtype=torch.uint8)
         metadata = [{"fps": 3, "total_num_frames": 3, "frames_indices": [0, 1, 2]}]
@@ -688,30 +667,17 @@ class TestQwenTokenizedMedia(CustomTestCase):
         second_expansion = processor.mm_token_expansion([VIDEO], first)
         self.assertEqual(first_expansion, second_expansion)
         self.assertEqual(list(item.metadata["video_metadata"].frames_indices), indices)
-        replayed = processor.process_media(
-            videos=[{"url": video, "process_options": item.effective_options}],
-            fps=10,
-            size={"shortest_edge": 128**2, "longest_edge": 128**2},
-        )
-        torch.testing.assert_close(
-            first["video"].encoder_inputs["pixel_values_videos"],
-            replayed["video"].encoder_inputs["pixel_values_videos"],
-        )
-        self.assertEqual(
-            processor.mm_token_expansion([VIDEO], replayed), first_expansion
-        )
 
-    def test_audio_recipe_keeps_truncation_and_mixes_batch_padding(self):
+    def test_audio_source_options_keep_truncation_and_batch_padding(self):
         processor = _make_hf_processor(
             Qwen3OmniMoeProcessor, 16, model_type="qwen3_omni_moe"
         )
         audio = np.zeros(3200, dtype=np.float32)
-        first = processor.process_media(
-            audios=[audio], truncation=True, max_length=1600
-        )["audio"]
+        audio_options = {"truncation": True, "max_length": 1600}
+        first = processor.process_media(audios=[audio], **audio_options)["audio"]
         second = processor.process_media(
             audios=[
-                {"url": audio, "process_options": first.items[0].effective_options},
+                {"url": audio, "preprocess_kwargs": audio_options},
                 audio,
             ],
             truncation=False,

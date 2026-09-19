@@ -320,15 +320,10 @@ def preprocess_video_sync(
             )
         return vr, None
     total_frames, video_fps = len(vr), vr.avg_fps
-    if "frame_indices" in video_config:
-        indices = np.asarray(video_config["frame_indices"], dtype=np.int64)
-    else:
-        nframes = smart_nframes(
-            video_config, total_frames=total_frames, video_fps=video_fps
-        )
-        indices = np.unique(
-            np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64)
-        )
+    nframes = smart_nframes(
+        video_config, total_frames=total_frames, video_fps=video_fps
+    )
+    indices = np.unique(np.linspace(0, total_frames - 1, num=nframes, dtype=np.int64))
     metadata = {
         "fps": video_fps,
         "duration": total_frames / video_fps,
@@ -869,9 +864,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mrope_position_delta=mrope_position_delta,
         )
 
-    def process_videos(
-        self, videos, processor, *, process_options=None, source_configs=None, **kwargs
-    ):
+    def process_videos(self, videos, processor, *, source_configs=None, **kwargs):
         if kwargs.pop("use_audio_in_video", False):
             raise ValueError("Qwen token expansion does not support use_audio_in_video")
         kwargs.pop("seconds_per_chunk", None)
@@ -879,7 +872,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         supplied_metadata = kwargs.pop("video_metadata", None)
         video_processor = processor.video_processor
         native_video_resize = isinstance(video_processor, Qwen3VLVideoProcessor)
-        recipes = process_options or [None] * len(videos)
         prepared, groups = [], []
         for index, video in enumerate(videos):
             config = {
@@ -893,11 +885,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             if source_configs:
                 config.update(source_configs[index])
             processor_kwargs = dict(kwargs)
-            recipe = recipes[index]
-            if recipe:
-                config = dict(recipe["video_config"])
-                processor_kwargs = dict(recipe["processor_kwargs"])
-            elif native_video_resize:
+            if native_video_resize:
                 processor_kwargs.update(
                     {
                         key: value
@@ -905,17 +893,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                         if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
                     }
                 )
-                for key, value in {
-                    "do_resize": video_processor.do_resize,
-                    "size": video_processor.size,
-                    "resample": video_processor.resample,
-                    "patch_size": video_processor.patch_size,
-                    "merge_size": video_processor.merge_size,
-                    "temporal_patch_size": video_processor.temporal_patch_size,
-                }.items():
-                    processor_kwargs.setdefault(key, value)
-                processor_kwargs["size"] = dict(processor_kwargs["size"])
-                config["do_resize"] = processor_kwargs["do_resize"]
             try:
                 frames, metadata = preprocess_video_sync(
                     video,
@@ -926,11 +903,8 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             finally:
                 if isinstance(video, VideoDecoderWrapper):
                     video.close()
-            if metadata is None:
-                if recipe:
-                    metadata = recipe["video_metadata"]
-                elif supplied_metadata is not None:
-                    metadata = supplied_metadata[index]
+            if metadata is None and supplied_metadata is not None:
+                metadata = supplied_metadata[index]
             if metadata is not None:
                 processor_kwargs = {
                     key: value
@@ -942,7 +916,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 processor_kwargs["do_resize"] = False
                 processor_kwargs["input_data_format"] = "channels_first"
             processor_kwargs["return_metadata"] = True
-            prepared.append((frames, metadata, config, processor_kwargs))
+            prepared.append((frames, metadata))
             for group_kwargs, indices in groups:
                 if group_kwargs == processor_kwargs:
                     indices.append(index)
@@ -997,27 +971,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 )
                 for index, item in zip(indices, group_items):
                     video_features[index] = item.feature
-        for index, item in enumerate(items):
-            frames, _, config, processor_kwargs = prepared[index]
-            metadata = item.metadata["video_metadata"]
-            config["frame_indices"] = [int(frame) for frame in metadata.frames_indices]
-            if isinstance(videos[index], VideoDecoderWrapper):
-                config.update(
-                    resized_height=int(frames.shape[-2]),
-                    resized_width=int(frames.shape[-1]),
-                )
-            item.effective_options = {
-                "video_config": config,
-                "processor_kwargs": {
-                    key: str(value) if key == "device" else value
-                    for key, value in processor_kwargs.items()
-                },
-                "video_metadata": {
-                    "fps": metadata.fps,
-                    "total_num_frames": metadata.total_num_frames,
-                    "frames_indices": config["frame_indices"],
-                },
-            }
         if len(groups) > 1:
             output = {
                 "pixel_values_videos": torch.cat(video_features),
@@ -1067,10 +1020,6 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                         key: value[index : index + 1] for key, value in output.items()
                     },
                     metadata={"token_count": int(token_count)},
-                    effective_options={
-                        key: str(value) if key == "device" else value
-                        for key, value in kwargs.items()
-                    },
                     feature_name="input_features",
                 )
                 for index, token_count in enumerate(audio_token_counts)

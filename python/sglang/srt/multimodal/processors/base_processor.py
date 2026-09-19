@@ -1025,18 +1025,14 @@ class BaseMultimodalProcessor(ABC):
             ):
                 if not sources:
                     continue
-                media_sources, frozen_options, source_configs = [], [], []
+                media_sources, source_configs = [], []
                 for source in sources:
                     if isinstance(source, dict) and "url" in source:
                         media_sources.append(source["url"])
-                        frozen_options.append(source.get("process_options"))
                         source_configs.append(source.get("preprocess_kwargs") or {})
                     else:
                         media_sources.append(source)
-                        frozen_options.append(None)
                         source_configs.append({})
-                if any(recipe is not None for recipe in frozen_options):
-                    options["process_options"] = frozen_options
                 if any(source_configs):
                     options["source_configs"] = source_configs
                 processed_media[modality] = process_modality(
@@ -1055,10 +1051,6 @@ class BaseMultimodalProcessor(ABC):
                 ProcessedMediaItem(
                     media_id=("image", index),
                     metadata={"image_grid_thw": grid},
-                    effective_options={
-                        key: str(value) if key == "device" else value
-                        for key, value in kwargs.items()
-                    },
                 )
                 for index, grid in enumerate(output["image_grid_thw"])
             ],
@@ -1166,7 +1158,6 @@ class BaseMultimodalProcessor(ABC):
                     if media_id is not None and segment:
                         token_counts[media_id].append(len(segment))
         mm_items = []
-        media_process_options = []
         for modality, media in processed_media.items():
             grid_items = (
                 get_new_expanded_mm_items(
@@ -1219,13 +1210,6 @@ class BaseMultimodalProcessor(ABC):
                 ):
                     mm_item.feature = mm_item.feature.cpu()
                 mm_items.append(mm_item)
-                media_process_options.append(
-                    {
-                        "modality": item.media_id[0],
-                        "index": item.media_id[1],
-                        "options": item.effective_options,
-                    }
-                )
         position_fields = self._build_position_inputs(input_ids_tensor, encoder_inputs)
         if self.position_encoding == "qwen":
             self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
@@ -1239,7 +1223,6 @@ class BaseMultimodalProcessor(ABC):
             video_token_id=self.mm_tokens.video_token_id,
             audio_token_id=self.mm_tokens.audio_token_id,
             audio_end_id=self.audio_end_token_id,
-            media_process_options=media_process_options,
             **position_fields,
         )
 
@@ -1487,9 +1470,7 @@ class BaseMultimodalProcessor(ABC):
                 data = data.url
             elif isinstance(data, dict) and "url" in data:
                 if modality == Modality.AUDIO:
-                    options = data.get("process_options")
-                    if options is None:
-                        options = data.get("preprocess_kwargs") or {}
+                    options = data.get("preprocess_kwargs") or {}
                     item_sample_rate = options.get("sampling_rate", audio_sample_rate)
                 data = data["url"]
             future = self.io_executor.submit(

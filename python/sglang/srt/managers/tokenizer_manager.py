@@ -237,7 +237,6 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
-    media_process_options: Optional[List[Dict[str, Any]]] = None
 
     # For streaming output
     last_output_offset: int = 0
@@ -1089,10 +1088,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             if mm_inputs and mm_inputs.input_ids is not None:
                 input_ids = mm_inputs.input_ids
-            if mm_inputs and mm_inputs.media_process_options:
-                self.rid_to_state[
-                    obj.rid
-                ].media_process_options = mm_inputs.media_process_options
             if mm_inputs and mm_inputs.token_type_ids is not None:
                 token_type_ids = mm_inputs.token_type_ids
                 if not isinstance(token_type_ids, list):
@@ -2278,9 +2273,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "weight_version": self.config_value("weight_version"),
                 "num_retractions": recv_obj.retraction_counts[i],
             }
-            if state.media_process_options:
-                meta_info["media_process_options"] = state.media_process_options
-
             if self.enable_metrics:
                 if recv_obj.time_stats is not None:
                     scheduler_time_stats = recv_obj.time_stats[i]

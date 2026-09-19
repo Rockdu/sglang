@@ -11,7 +11,6 @@ class ProcessedMediaItem:
     media_id: MediaId
     encoder_inputs: dict[str, Any] | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
-    effective_options: dict[str, Any] = field(default_factory=dict)
     feature_name: str | None = None
 
 
@@ -22,24 +21,15 @@ class MediaProcessOutput:
 
 
 def process_media_groups(media, processor, process_modality, kwargs):
-    """Group frozen options; each item's tensor fields partition batch axis zero."""
+    """Batch adjacent sources with matching preprocessing settings."""
     import torch
 
-    recipes = kwargs.pop("process_options", None)
     source_configs = kwargs.pop("source_configs", None)
-    if recipes is None and source_configs is None:
+    if source_configs is None:
         return None
     groups = []
     for index, source in enumerate(media):
-        recipe = recipes[index] if recipes is not None else None
-        options = (
-            dict(recipe)
-            if recipe is not None
-            else {
-                **kwargs,
-                **(source_configs[index] if source_configs is not None else {}),
-            }
-        )
+        options = {**kwargs, **source_configs[index]}
         if not groups or groups[-1][2] != options:
             groups.append(([], [], options))
         groups[-1][0].append(source)

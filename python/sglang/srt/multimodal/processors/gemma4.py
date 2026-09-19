@@ -288,10 +288,6 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                         key: value[index : index + 1] for key, value in output.items()
                     },
                     metadata={"num_soft_tokens": int(token_count)},
-                    effective_options={
-                        key: str(value) if isinstance(value, torch.device) else value
-                        for key, value in kwargs.items()
-                    },
                     feature_name="pixel_values",
                 )
                 for index, token_count in enumerate(token_counts)
@@ -330,21 +326,15 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
         }
 
     def process_videos(self, videos, processor, **kwargs):
-        recipes = kwargs.pop("process_options", None)
         source_configs = kwargs.pop("source_configs", None)
-        if recipes is not None or source_configs is not None:
+        if source_configs is not None:
             items = []
             for index, video in enumerate(videos):
-                recipe = recipes[index] if recipes is not None else None
-                if recipe is not None:
-                    options = dict(recipe)
-                else:
-                    options = dict(kwargs)
-                    metadata = options.get("video_metadata")
-                    if metadata is not None and not isinstance(metadata, dict):
-                        options["video_metadata"] = [metadata[index]]
-                    if source_configs is not None:
-                        options.update(source_configs[index])
+                options = dict(kwargs)
+                metadata = options.get("video_metadata")
+                if metadata is not None and not isinstance(metadata, dict):
+                    options["video_metadata"] = [metadata[index]]
+                options.update(source_configs[index])
                 output = self.process_videos([video], processor, **options)
                 item = output.items[0]
                 item.media_id = ("video", index)
@@ -435,18 +425,6 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                             frame_index / fps for frame_index in timeline.frames_indices
                         ],
                     },
-                    effective_options={
-                        **{
-                            key: str(value)
-                            if isinstance(value, torch.device)
-                            else value
-                            for key, value in kwargs.items()
-                        },
-                        "num_frames": num_frames,
-                        "video_metadata": _video_metadata_as_dict(
-                            video_metadata[index]
-                        ),
-                    },
                     feature_name="pixel_values_videos",
                 )
             )
@@ -476,10 +454,6 @@ class Gemma4SGLangProcessor(SGLangBaseProcessor):
                         key: value[index : index + 1] for key, value in output.items()
                     },
                     metadata={"num_audio_tokens": self._get_audio_token_count(mask)},
-                    effective_options={
-                        key: str(value) if isinstance(value, torch.device) else value
-                        for key, value in kwargs.items()
-                    },
                     feature_name="input_features",
                 )
                 for index, mask in enumerate(output["input_features_mask"])

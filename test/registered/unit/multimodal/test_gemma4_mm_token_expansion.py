@@ -9,7 +9,7 @@
     IDs + boundary ------+---> expansion ---> final IDs -> serving offsets
     old expanded history | new image  ---> unchanged history + new image block
 
-    frozen source options + new options -> native training tensors
+    per-source preprocessing settings -> native training tensors
         images: zero/-1 patch padding   -> original patch-width serving views
         videos: real frames only       -> original frame/patch-width serving views
         audios: feature/mask padding    -> original time-length serving views
@@ -17,10 +17,9 @@
 Both Gemma4 variants use real HF components for media parity and lightweight
 vision components for source offsets. Serving views share training storage.
 Video readers close after sampling; frame lists and tensor inputs preserve caller
-timelines, and frozen recipes hold detached JSON-compatible metadata.
+timelines independently of the token prefix; per-source timelines override batch metadata.
 """
 
-import json
 from unittest.mock import Mock, PropertyMock, patch
 
 import numpy as np
@@ -283,22 +282,23 @@ def test_vision_features_match_real_components(unified):
     result = processor.process_videos(
         videos, processor._processor, video_metadata=[supplied], return_tensors="pt"
     )
-    recipe = result.items[0].effective_options
-    assert json.loads(json.dumps(recipe))["video_metadata"]["frames_indices"] == [1, 3]
+    assert result.items[0].metadata["timestamps"] == [0.5, 1.5]
     supplied.frames_indices[0] = 0
-    assert recipe["video_metadata"]["frames_indices"] == [1, 3]
+    assert result.items[0].metadata["timestamps"] == [0.5, 1.5]
 
 
 @pytest.mark.parametrize("unified", [False, True], ids=["gemma4", "unified"])
-def test_frozen_image_options_keep_history_when_new_media_uses_a_larger_budget(unified):
+def test_per_source_image_budgets_preserve_native_patches_and_shared_views(unified):
     processor = _make_processor(unified)
     image_cls = Gemma4UnifiedImageProcessor if unified else Gemma4ImageProcessor
     processor._processor.image_processor = image_cls(max_soft_tokens=70)
     source = Image.new("RGB", (96, 64), (30, 40, 50))
     history = processor.process_media(images=[source])
-    recipe = history["image"].items[0].effective_options
     next_media = processor.process_media(
-        images=[{"url": source, "process_options": recipe}, source],
+        images=[
+            {"url": source, "preprocess_kwargs": {"max_soft_tokens": 70}},
+            source,
+        ],
         images_kwargs={"max_soft_tokens": 280},
     )
     old_output = history["image"]
@@ -309,7 +309,6 @@ def test_frozen_image_options_keep_history_when_new_media_uses_a_larger_budget(u
         > output.items[0].metadata["num_soft_tokens"]
     )
     assert [item.media_id for item in output.items] == [("image", 0), ("image", 1)]
-    assert "max_soft_tokens" not in recipe
     pixels = output.encoder_inputs["pixel_values"]
     positions = output.encoder_inputs["image_position_ids"]
     assert isinstance(pixels, torch.Tensor) and isinstance(positions, torch.Tensor)
@@ -353,17 +352,27 @@ def test_different_video_lengths_pack_only_real_frames_with_shared_tensor_views(
     first = torch.zeros(2, 3, 96, 96, dtype=torch.uint8)
     second = torch.ones(1, 3, 96, 96, dtype=torch.uint8)
     old_output = processor.process_videos(
-        [first], processor._processor, return_tensors="pt"
+        [first],
+        processor._processor,
+        video_metadata=[{"fps": 1, "total_num_frames": 2, "frames_indices": [0, 1]}],
+        return_tensors="pt",
     )
     grouped = processor.process_videos(
         [first, second],
         processor._processor,
         return_tensors="pt",
         max_soft_tokens=280,
-        process_options=[old_output.items[0].effective_options, None],
+        source_configs=[
+            {"max_soft_tokens": 70},
+            {
+                "video_metadata": [
+                    {"fps": 2, "total_num_frames": 8, "frames_indices": [6]}
+                ]
+            },
+        ],
         video_metadata=[
             {"fps": 1, "total_num_frames": 2, "frames_indices": [0, 1]},
-            {"fps": 2, "total_num_frames": 8, "frames_indices": [6]},
+            {"fps": 1, "total_num_frames": 1, "frames_indices": [0]},
         ],
     )
     pixels = grouped.encoder_inputs["pixel_values_videos"]
@@ -404,7 +413,7 @@ def test_different_video_lengths_pack_only_real_frames_with_shared_tensor_views(
 
 
 @pytest.mark.parametrize("unified", [False, True], ids=["gemma4", "unified"])
-def test_audio_groups_pad_native_tensors_without_changing_history_features(unified):
+def test_audio_groups_pad_native_tensors_and_preserve_source_views(unified):
     processor = _make_processor(unified)
     first = np.zeros(641, dtype=np.float32)
     second = np.zeros(3201, dtype=np.float32)
@@ -416,7 +425,7 @@ def test_audio_groups_pad_native_tensors_without_changing_history_features(unifi
         processor._processor,
         padding=False,
         return_tensors="pt",
-        process_options=[history.items[0].effective_options, None],
+        source_configs=[{"padding": True}, {}],
     )
     features = output.encoder_inputs["input_features"]
     mask = output.encoder_inputs["input_features_mask"]
