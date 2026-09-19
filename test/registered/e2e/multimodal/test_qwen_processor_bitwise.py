@@ -18,6 +18,8 @@ mRoPE. No model weights or generation are needed. CPU tests exercise the strict
 comparator; CUDA CI also runs a pinned public benchmark sample through both real
 routes with two questions/images joined at an explicit assistant end token.
 A manifest override supplies the complete model/benchmark/turn matrix.
+The default reference is the pinned historical baseline. Explicit corrected-legacy
+captures disable token expansion at the same clean revision as the candidate.
 """
 
 import argparse
@@ -144,6 +146,8 @@ async def _capture(checkout, manifest_path, route):
     source = _checkout_identity(checkout)
     if route == "baseline":
         assert source == {"revision": BASELINE_REVISION, "diff": ""}
+    elif route == "corrected-legacy":
+        assert not source["diff"], "Corrected legacy capture requires clean source"
     manifest = json.loads(manifest_path.read_text())
     checkpoint = (manifest_path.parent / manifest["checkpoint"]["path"]).resolve()
     seed = manifest["seed"]
@@ -180,6 +184,8 @@ async def _capture(checkout, manifest_path, route):
     processor = QwenVLImageProcessor(
         hf_config, server_args, hf_processor, None, skip_mm_pool=True
     )
+    if route == "corrected-legacy":
+        processor.supports_token_expansion = False
     captures = {}
     bookkeeping = {}
     try:
@@ -215,7 +221,7 @@ async def _capture(checkout, manifest_path, route):
                 assert input_ids[: len(previous_ids)] == previous_ids, (
                     f"{case_id}: cumulative prompt does not preserve the prior token prefix"
                 )
-                if route == "baseline":
+                if route in ("baseline", "corrected-legacy"):
                     request = GenerateReqInput(
                         text=prompt,
                         image_data=sources["image"],
@@ -268,6 +274,7 @@ async def _capture(checkout, manifest_path, route):
         processor.shutdown()
         reset_context()
     return {
+        "route": route,
         "source": source,
         "manifest": manifest,
         "checkpoint_files": _checkpoint_files(checkpoint),
@@ -281,12 +288,17 @@ async def _capture(checkout, manifest_path, route):
     }
 
 
-def compare_checkouts(reference, candidate, manifest_path, artifacts):
+def compare_checkouts(
+    reference, candidate, manifest_path, artifacts, *, reference_route="baseline"
+):
     artifacts.mkdir(parents=True, exist_ok=True)
     snapshots = []
     seed = json.loads(manifest_path.read_text())["seed"]
-    for route, checkout in (("baseline", reference), ("candidate", candidate)):
-        output_path = artifacts / f"{route}.pickle"
+    for name, route, checkout in (
+        ("baseline", reference_route, reference),
+        ("candidate", "candidate", candidate),
+    ):
+        output_path = artifacts / f"{name}.pickle"
         subprocess.run(
             [
                 sys.executable,
@@ -312,6 +324,11 @@ def compare_checkouts(reference, candidate, manifest_path, artifacts):
         )
         with output_path.open("rb") as stream:
             snapshots.append(pickle.load(stream))
+    assert snapshots[0]["route"] == reference_route
+    assert snapshots[1]["route"] == "candidate"
+    if reference_route == "corrected-legacy":
+        _assert_identical(snapshots[0]["source"], snapshots[1]["source"], "source")
+        assert not snapshots[0]["source"]["diff"], "Compared source must be clean"
     for field in ("manifest", "checkpoint_files", "dependencies", "python", "cases"):
         _assert_identical(snapshots[0][field], snapshots[1][field], field)
     print(f"Bitwise identical: {len(snapshots[0]['cases'])} benchmark turns")
@@ -451,6 +468,69 @@ def test_bitwise_comparison_rejects_numerically_equal_or_metadata_changed_output
     _assert_identical(_snapshot(reference), _snapshot(reference))
 
 
+@pytest.mark.parametrize(
+    "reference_route,change",
+    [
+        ("baseline", None),
+        ("corrected-legacy", None),
+        ("corrected-legacy", "revision"),
+        ("corrected-legacy", "dirty"),
+        ("corrected-legacy", "route"),
+        ("corrected-legacy", "feature"),
+    ],
+)
+def test_checkout_comparison_requires_matching_corrected_source(
+    tmp_path, monkeypatch, reference_route, change
+):
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_text(json.dumps({"seed": 42}))
+    requested_routes = []
+
+    def capture(command, **kwargs):
+        route = command[command.index("--capture") + 1]
+        requested_routes.append(route)
+        source = {
+            "revision": BASELINE_REVISION if route == "baseline" else "current-commit",
+            "diff": "changed" if change == "dirty" else "",
+        }
+        feature = torch.tensor([0.0])
+        if route == "candidate":
+            if change == "revision":
+                source["revision"] = "another-commit"
+            elif change == "route":
+                route = "corrected-legacy"
+            elif change == "feature":
+                feature = torch.tensor([-0.0])
+        snapshot = {
+            "route": route,
+            "source": source,
+            "manifest": {"seed": 42},
+            "checkpoint_files": {},
+            "dependencies": {},
+            "python": sys.version,
+            "cases": {"turn-0": _snapshot(feature)},
+        }
+        Path(command[command.index("--output") + 1]).write_bytes(pickle.dumps(snapshot))
+
+    monkeypatch.setattr(subprocess, "run", capture)
+    options = (
+        {"reference_route": reference_route}
+        if reference_route == "corrected-legacy"
+        else {}
+    )
+    arguments = (tmp_path, tmp_path, manifest_path, tmp_path / "captures")
+    if change:
+        with pytest.raises(AssertionError):
+            compare_checkouts(*arguments, **options)
+    else:
+        compare_checkouts(*arguments, **options)
+    assert requested_routes == [reference_route, "candidate"]
+    assert {path.name for path in (tmp_path / "captures").iterdir()} == {
+        "baseline.pickle",
+        "candidate.pickle",
+    }
+
+
 def test_benchmark_prompts_match_original_async_boundary(tmp_path):
     if not torch.cuda.is_available():
         pytest.skip("Real async benchmark parity runs on the registered CUDA CI runner")
@@ -474,7 +554,14 @@ def test_benchmark_prompts_match_original_async_boundary(tmp_path):
 
 def _main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--capture", choices=("baseline", "candidate"))
+    parser.add_argument(
+        "--capture", choices=("baseline", "corrected-legacy", "candidate")
+    )
+    parser.add_argument(
+        "--reference-route",
+        choices=("baseline", "corrected-legacy"),
+        default="baseline",
+    )
     parser.add_argument("--checkout", type=Path)
     parser.add_argument("--reference", type=Path)
     parser.add_argument("--candidate", type=Path)
@@ -493,6 +580,7 @@ def _main():
             args.candidate.resolve(),
             args.manifest.resolve(),
             args.output.resolve(),
+            reference_route=args.reference_route,
         )
 
 
