@@ -1,4 +1,10 @@
+# Request boundary tests:
+#   shared enums -> safe pickle (current/legacy modules) -> same enum identity
+#   tokenized request -> msgpack -> typed multimodal fields
+#   generation / embedding request -> normalization -> batch subrequests
+
 import copy
+import pickle
 import re
 import unittest
 import weakref
@@ -23,7 +29,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal import modality as multimodal_modality
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.common import safe_pickle_loads
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
@@ -40,6 +48,22 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
+
+
+class TestMultimodalTypes(unittest.TestCase):
+    def test_pickle_preserves_shared_and_legacy_enum_identity(self):
+        for cls in (Modality, MultimodalInputFormat):
+            self.assertIs(cls, getattr(multimodal_modality, cls.__name__))
+        values = (Modality.IMAGE, MultimodalInputFormat.PROCESSOR_OUTPUT)
+        payload = pickle.dumps(values, protocol=2)
+        reference = b"csglang.srt.multimodal.modality\n"
+        self.assertIn(reference, payload)
+        self.assertEqual(safe_pickle_loads(payload), values)
+        # Protocol 2 GLOBAL references have no binary length prefix.
+        legacy_payload = payload.replace(
+            reference, b"csglang.srt.managers.schedule_batch\n"
+        )
+        self.assertEqual(safe_pickle_loads(legacy_payload), values)
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):
