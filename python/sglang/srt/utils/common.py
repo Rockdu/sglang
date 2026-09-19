@@ -3079,6 +3079,7 @@ class SafeUnpickler(pickle.Unpickler):
         "sglang.srt.utils.",
         "sglang.srt.disaggregation.",
         "sglang.srt.managers.",
+        "sglang.srt.multimodal.types.",
         "torch_npu.",
     }
 

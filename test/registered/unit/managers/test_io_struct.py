@@ -1,5 +1,15 @@
+# Request boundary tests:
+#   enums/classes -> safe pickle (new/legacy module) -> same types
+#   multimodal structs -> pickle (new/legacy module) -> same fields
+#   types / base processor -> fresh import -> no scheduler dependency
+#   tokenized request -> msgpack -> typed multimodal fields
+#   generation / embedding request -> normalization -> batch subrequests
+
 import copy
+import pickle
 import re
+import subprocess
+import sys
 import unittest
 import weakref
 from array import array
@@ -23,7 +33,9 @@ from sglang.srt.managers.schedule_batch import (
     MultimodalInputFormat,
     MultimodalProcessorOutput,
 )
+from sglang.srt.multimodal import types as multimodal_types
 from sglang.srt.sampling.sampling_params import SamplingParams
+from sglang.srt.utils.common import safe_pickle_loads
 from sglang.srt.utils.cuda_ipc_transport_utils import CudaIpcTensorTransportProxy
 from sglang.srt.utils.msgpack_utils import _restore_torch_tensor, enc_hook, ext_hook
 from sglang.test.ci.ci_register import (
@@ -40,6 +52,71 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 register_amd_ci(est_time=8, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=6, suite="stage-b-test-cpu-intel")
+
+
+class TestMultimodalTypes(unittest.TestCase):
+    def test_pickle_preserves_new_and_legacy_type_identity(self):
+        for cls in (
+            Modality,
+            MultimodalInputFormat,
+            MultimodalDataItem,
+            MultimodalProcessorOutput,
+        ):
+            self.assertIs(cls, getattr(multimodal_types, cls.__name__))
+
+        mm_inputs = MultimodalProcessorOutput(
+            mm_items=[
+                MultimodalDataItem(
+                    modality=Modality.IMAGE,
+                    format=MultimodalInputFormat.PROCESSOR_OUTPUT,
+                    feature=[1.0, 2.0],
+                    model_specific_data={"image_grid_thw": [1, 1, 2]},
+                )
+            ],
+            input_ids=[1, 2],
+        )
+        for pickle_object, unpickle in (
+            (
+                (
+                    Modality.IMAGE,
+                    MultimodalInputFormat.PROCESSOR_OUTPUT,
+                    MultimodalDataItem,
+                    MultimodalProcessorOutput,
+                ),
+                safe_pickle_loads,
+            ),
+            (mm_inputs, pickle.loads),
+        ):
+            payload = pickle.dumps(pickle_object, protocol=2)
+            module_reference = b"csglang.srt.multimodal.types\n"
+            self.assertIn(module_reference, payload)
+            for module in (
+                "sglang.srt.multimodal.types",
+                "sglang.srt.managers.schedule_batch",
+            ):
+                with self.subTest(module=module, loader=unpickle.__name__):
+                    # Protocol 2 GLOBAL references have no binary length prefix.
+                    compatible_payload = payload.replace(
+                        module_reference, f"c{module}\n".encode()
+                    )
+                    self.assertEqual(unpickle(compatible_payload), pickle_object)
+
+    def test_base_processor_and_types_import_without_scheduler(self):
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import sys\n"
+                "import sglang.srt.multimodal.types\n"
+                "assert 'sglang.srt.managers.schedule_batch' not in sys.modules\n"
+                "import sglang.srt.multimodal.processors.base_processor\n"
+                "assert 'sglang.srt.managers.schedule_batch' not in sys.modules\n",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stdout + completed.stderr)
 
 
 class TestTokenizedReqInputMsgpack(unittest.TestCase):

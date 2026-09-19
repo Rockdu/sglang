@@ -23,12 +23,6 @@ import torch
 from PIL import Image
 from transformers import BaseImageProcessor
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-    MultimodalProcessorOutput,
-)
 from sglang.srt.multimodal.cache import (
     MultimodalPreprocessCache,
     PreprocessFingerprintProvider,
@@ -49,6 +43,12 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
     CudaIpcTensorTransportProxy,
     MmItemMemoryPool,
     get_mm_feature_pool_size_per_worker,
+)
+from sglang.srt.multimodal.types import (
+    Modality,
+    MultimodalDataItem,
+    MultimodalInputFormat,
+    MultimodalProcessorOutput,
 )
 from sglang.srt.runtime_context import get_context
 from sglang.srt.utils import (
