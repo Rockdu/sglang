@@ -35,6 +35,7 @@ from sglang.srt.multimodal.cache import (
     build_processor_fingerprint,
 )
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
     MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
@@ -255,11 +256,17 @@ class BaseMultimodalProcessor(ABC):
         self.use_ipc_pool_handle_cache = (
             self.use_cuda_ipc and envs.SGLANG_USE_IPC_POOL_HANDLE_CACHE.get()
         )
-        self.image_processor_backend = get_mm().image_processor_backend
+        self.skip_tokenizer_init = get_serving().skip_tokenizer_init
+
+        processor_config = MultimodalProcessorConfig(
+            image_processor_backend=get_mm().image_processor_backend,
+        )
+        self.processor_config = processor_config
+
+        self.image_processor_backend = processor_config.image_processor_backend
         if get_mm().disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
-        self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
         mm_process_config = get_mm().mm_process_config
         self.image_config = mm_process_config.get("image", {})
