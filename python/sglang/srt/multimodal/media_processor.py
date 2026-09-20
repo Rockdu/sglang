@@ -10,6 +10,7 @@ from typing import Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
+from transformers import BaseImageProcessor
 
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.utils import (
@@ -220,6 +221,21 @@ class MultimodalProcessorMixin:
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def _preprocessing_competes_with_the_scheduler(self) -> bool:
+        """Whether image preprocessing submits its work to the serving GPU.
+
+        The fast image processor runs inside the tokenizer process but on
+        ``cuda:{base_gpu_id}`` -- the device the scheduler serves from. A second
+        preprocessing worker there is one more competitor for that device rather
+        than added parallelism.
+        """
+        if self.processor_config.device in (None, "cpu"):
+            return False
+        if self.disable_fast_image_processor:
+            return False
+        image_processor = getattr(self._processor, "image_processor", None)
+        return isinstance(image_processor, BaseImageProcessor)
+
     def _resolve_auto_mm_processor_worker_num(self) -> int:
         """The worker count to use when the user did not ask for one.
 
@@ -241,6 +257,48 @@ class MultimodalProcessorMixin:
             return 1
         declared = self.auto_mm_processor_worker_num
         return 2 if declared is None else declared
+
+    def _get_preprocessing_device(self) -> Optional[str]:
+        return self.processor_config.device
+
+    def _fast_image_processor_device(self, processor) -> Optional[str]:
+        """The device for the fast image processor, or None to leave it unset."""
+        device = self._get_preprocessing_device()
+        if device != "npu":
+            return device
+        if processor.__class__.__name__ == "MiniMaxVLProcessor":
+            # MiniMax's image/video processors create 10-dim tensors during
+            # patch extraction, exceeding the Ascend 8-dim limit; patch them
+            # (same pattern as qwen-vl / GLM-4.6V) and run on NPU.
+            from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
+                npu_apply_minimax_m3_image_preprocess_patch,
+                npu_apply_minimax_m3_video_preprocess_patch,
+            )
+
+            npu_apply_minimax_m3_image_preprocess_patch(processor.image_processor)
+            if (
+                hasattr(processor, "video_processor")
+                and processor.video_processor is not None
+            ):
+                npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
+            return "npu"
+        if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
+            # For qwen-vl, the processor hits a reshape issue from the Ascend
+            # dims restriction.
+            from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
+                npu_apply_qwen_image_preprocess_patch,
+            )
+
+            npu_apply_qwen_image_preprocess_patch()
+            return "npu"
+        if processor.__class__.__name__ == "Glm46VProcessor":
+            from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
+                npu_apply_glm46v_image_preprocess_patch,
+            )
+
+            npu_apply_glm46v_image_preprocess_patch()
+            return "npu"
+        return None
 
     @contextmanager
     def _temporary_fast_processor_cuda_pool(self, device: Optional[str]):

@@ -1,9 +1,14 @@
-"""The fast-image-processor device comes from the processor's own ServerArgs.
+"""Serving resolves the current runtime policy; training uses explicit configuration.
+
+    ServerArgs.base_gpu_id + current runtime policy -> serving device
+    Explicit processor configuration -------------> training device
+    CPU transport -> temporary CUDA pool -> CPU features -> release the pool
 
 Regression: the device decision read the published global ServerArgs, so every
 processor answered with one process-wide device. The encode-server DP workers
 each drive their own GPU, which no process-global value can express — the
 device has to come from what the worker was handed.
+Runtime policy changes affect serving device/competition checks on existing instances.
 """
 
 import unittest
@@ -12,7 +17,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -66,8 +71,6 @@ class TestFastImageProcessorDevice(CustomTestCase):
         self.assertEqual(self._device(second), "cuda:5")
 
     def test_publishing_another_config_does_not_move_the_device(self):
-        from sglang.srt.runtime_context import get_context
-
         processor = _make(base_gpu_id=2)
         override = get_context().override_server_args(base_gpu_id=7)
         override.install()
@@ -77,6 +80,46 @@ class TestFastImageProcessorDevice(CustomTestCase):
     def test_rl_on_policy_target_forces_cpu(self):
         processor = _make(base_gpu_id=3, rl_on_policy_target="fsdp")
         self.assertEqual(self._device(processor), "cpu")
+
+    def test_runtime_policy_changes_update_existing_serving_processor(self):
+        class ImageProcessor:
+            pass
+
+        processor = _make(base_gpu_id=3, mm_process_config={})
+        with patch.multiple(
+            BASE,
+            _is_cpu=False,
+            _is_xpu=False,
+            _is_npu=False,
+            BaseImageProcessor=ImageProcessor,
+        ):
+            processor = _StubProcessor(
+                None, processor.server_args, _Processor(), None, skip_mm_pool=True
+            )
+            self.addCleanup(processor.shutdown)
+            processor._processor = SimpleNamespace(image_processor=ImageProcessor())
+            processor.disable_fast_image_processor = False
+            for target, expected_device, competes in (
+                (None, "cuda:3", True),
+                ("fsdp", "cpu", False),
+                (None, "cuda:3", True),
+            ):
+                with self.subTest(target=target):
+                    override = get_context().override_server_args(
+                        rl_on_policy_target=target
+                    )
+                    override.install()
+                    try:
+                        self.assertEqual(
+                            processor._fast_image_processor_device(_Processor()),
+                            expected_device,
+                        )
+                        self.assertEqual(
+                            processor._preprocessing_competes_with_the_scheduler(),
+                            competes,
+                        )
+                    finally:
+                        override.restore()
 
     def test_cpu_and_xpu_platforms_win_over_base_gpu_id(self):
         processor = _make(base_gpu_id=3)
@@ -91,6 +134,33 @@ class TestFastImageProcessorDevice(CustomTestCase):
         with patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=True):
             device = processor._fast_image_processor_device(Glm4vProcessor())
         self.assertIsNone(device)
+
+    def test_auto_workers_follow_each_instances_preprocessing_device(self):
+        class ImageProcessor:
+            pass
+
+        cases = (
+            ("cpu", False, None, 2),
+            ("cuda", False, None, 1),
+            ("cuda", True, None, 2),
+            ("cpu", False, 5, 5),
+            ("cuda", False, 5, 1),
+        )
+        with patch(f"{BASE}.BaseImageProcessor", ImageProcessor):
+            for platform, use_pil, declared_workers, expected in cases:
+                with self.subTest(platform=platform, use_pil=use_pil):
+                    processor = _make()
+                    processor._processor = SimpleNamespace(
+                        image_processor=ImageProcessor()
+                    )
+                    processor.disable_fast_image_processor = use_pil
+                    processor.auto_mm_processor_worker_num = declared_workers
+                    with patch.multiple(
+                        BASE, _is_cpu=platform == "cpu", _is_xpu=False, _is_npu=False
+                    ):
+                        self.assertEqual(
+                            processor._resolve_auto_mm_processor_worker_num(), expected
+                        )
 
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):
@@ -161,6 +231,7 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
                 events.append("exit")
 
         with (
+            patch.multiple(BASE, _is_cpu=False, _is_xpu=False, _is_npu=False),
             patch(f"{BASE}.BaseImageProcessor", ImageProcessor),
             patch(f"{BASE}.torch.cuda.device", return_value=nullcontext()),
             patch(f"{BASE}.torch.cuda.MemPool", return_value="pool"),

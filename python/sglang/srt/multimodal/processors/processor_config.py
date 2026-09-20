@@ -7,6 +7,7 @@ from typing import Any, Optional
 class MultimodalProcessorConfig:
     """Preprocessing and resource settings owned by one processor instance."""
 
+    device: Optional[str] = "cpu"
     image_processor_backend: str = "auto"
     disable_fast_image_processor: bool = False
     mm_process_config: dict[str, Any] = field(default_factory=dict)

@@ -555,54 +555,14 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         image_processor = getattr(self._processor, "image_processor", None)
         return isinstance(image_processor, BaseImageProcessor)
 
-    def _fast_image_processor_device(self, processor) -> Optional[str]:
-        """The device for the fast image processor, or None to leave it unset.
-
-        Resolved from this processor's own ``server_args``: engines sharing a
-        tokenizer process each carry their own ``base_gpu_id``.
-        """
-        server_args = self.server_args
+    def _get_preprocessing_device(self) -> Optional[str]:
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:
             return "cpu"
         if _is_xpu:
             return "xpu"
-        if not _is_npu:
-            # Per-worker placement travels as a constructor argument, and
-            # this record is that argument.
-            return f"cuda:{server_args.base_gpu_id}"
-        if processor.__class__.__name__ == "MiniMaxVLProcessor":
-            # MiniMax's image/video processors create 10-dim tensors during
-            # patch extraction, exceeding the Ascend 8-dim limit; patch them
-            # (same pattern as qwen-vl / GLM-4.6V) and run on NPU.
-            from sglang.srt.hardware_backend.npu.modules.minimax_m3_processor import (
-                npu_apply_minimax_m3_image_preprocess_patch,
-                npu_apply_minimax_m3_video_preprocess_patch,
-            )
-
-            npu_apply_minimax_m3_image_preprocess_patch(processor.image_processor)
-            if (
-                hasattr(processor, "video_processor")
-                and processor.video_processor is not None
-            ):
-                npu_apply_minimax_m3_video_preprocess_patch(processor.video_processor)
+        if _is_npu:
             return "npu"
-        if processor.__class__.__name__ not in {"Glm4vProcessor", "Glm46VProcessor"}:
-            # For qwen-vl, the processor hits a reshape issue from the Ascend
-            # dims restriction.
-            from sglang.srt.hardware_backend.npu.modules.qwen_vl_processor import (
-                npu_apply_qwen_image_preprocess_patch,
-            )
-
-            npu_apply_qwen_image_preprocess_patch()
-            return "npu"
-        if processor.__class__.__name__ == "Glm46VProcessor":
-            from sglang.srt.hardware_backend.npu.modules.glm46v_processor import (
-                npu_apply_glm46v_image_preprocess_patch,
-            )
-
-            npu_apply_glm46v_image_preprocess_patch()
-            return "npu"
-        return None
+        return f"cuda:{self.server_args.base_gpu_id}"
 
     def process_mm_data(
         self,
