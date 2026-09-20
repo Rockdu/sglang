@@ -260,11 +260,12 @@ class BaseMultimodalProcessor(ABC):
 
         processor_config = MultimodalProcessorConfig(
             image_processor_backend=get_mm().image_processor_backend,
+            disable_fast_image_processor=get_mm().disable_fast_image_processor,
         )
         self.processor_config = processor_config
 
         self.image_processor_backend = processor_config.image_processor_backend
-        if get_mm().disable_fast_image_processor:
+        if processor_config.disable_fast_image_processor:
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
 
