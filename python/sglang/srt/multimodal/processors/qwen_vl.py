@@ -36,6 +36,7 @@ from sglang.srt.multimodal.processors.base_processor import (
 )
 from sglang.srt.multimodal.token_space.qwen_vl import (
     IMAGE_FACTOR,
+    QwenTokenSpaceProcessStrategy,
     _get_processor_video_config,
     preprocess_video_sync,
 )
@@ -86,6 +87,7 @@ async def preprocess_video(
 # Compatible with Qwen-VL & Qwen-Omni Series
 class QwenVLImageProcessor(SGLangBaseProcessor):
     supports_transformers_backend = True
+    token_space_process_strategy_class = QwenTokenSpaceProcessStrategy
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -733,3 +735,44 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
                 )
+
+    def _build_mm_output(self, input_ids, media_features, mm_items):
+        self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
+
+        second_per_grid_ts = self._get_processor_output_value(
+            media_features, "second_per_grid_ts"
+        )
+        if second_per_grid_ts is None:
+            second_per_grid_ts = self._get_processor_output_value(
+                media_features, "video_second_per_grid"
+            )
+        # One length per audio item, in request order, as HF get_rope_index expects.
+        audio_items = [item for item in mm_items if item.is_audio()]
+        audio_feature_lengths = (
+            torch.cat([item.feature_attention_mask.sum(dim=1) for item in audio_items])
+            if audio_items
+            else None
+        )
+        mrope_positions, mrope_position_delta = self._compute_mrope_positions(
+            media_features,
+            mm_items,
+            torch.tensor(input_ids, dtype=torch.long),
+            image_data=None,
+            video_data=None,
+            second_per_grid_ts=second_per_grid_ts,
+            audio_feature_lengths=audio_feature_lengths,
+        )
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            padded_input_ids=MultimodalProcessorOutput.build_padded_input_ids(
+                input_ids, mm_items
+            ),
+            mm_items=mm_items,
+            im_start_id=self.vision_start_token_id,
+            im_end_id=self.vision_end_token_id,
+            im_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            mrope_positions=mrope_positions,
+            mrope_position_delta=mrope_position_delta,
+        )
