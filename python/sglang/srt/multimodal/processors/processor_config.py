@@ -20,3 +20,5 @@ class MultimodalProcessorConfig:
     cpu_process_start_method: str = "spawn"
     # Unset domains inherit the process allowlist; an explicit [] clears it.
     allowed_media_domains: Optional[list[str]] = None
+    # Unset size inherits the policy unless domains select the loader's default.
+    media_url_max_file_size_mb: Optional[int] = None

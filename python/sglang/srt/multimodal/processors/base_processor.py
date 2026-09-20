@@ -266,15 +266,20 @@ class BaseMultimodalProcessor(ABC):
             mm_io_worker_num=get_mm().mm_io_worker_num,
             cpu_process_start_method=cpu_process_start_method,
             allowed_media_domains=get_mm().allowed_media_domains,
+            media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
         )
         self.processor_config = processor_config
 
         allowed_media_domains = processor_config.allowed_media_domains
-        configure_media_url_security(
-            allowed_media_domains,
-            max_file_size_mb=get_mm().media_url_max_file_size_mb,
-            preserve_allowed_domains=allowed_media_domains is None,
-        )
+        media_url_max_file_size_mb = processor_config.media_url_max_file_size_mb
+        if media_url_max_file_size_mb is not None:
+            configure_media_url_security(
+                allowed_media_domains,
+                max_file_size_mb=media_url_max_file_size_mb,
+                preserve_allowed_domains=allowed_media_domains is None,
+            )
+        elif allowed_media_domains is not None:
+            configure_media_url_security(allowed_media_domains)
 
         self.image_processor_backend = processor_config.image_processor_backend
         if processor_config.disable_fast_image_processor:
