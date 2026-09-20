@@ -1,3 +1,4 @@
+import copy
 import re
 import time
 from typing import List, Optional, Union
@@ -29,15 +30,16 @@ from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
 from sglang.srt.models.qwen3_vl_moe import Qwen3VLMoeForConditionalGeneration
 from sglang.srt.models.qwen4_exp import Qwen4ExpForConditionalGeneration
 from sglang.srt.multimodal.processors.base_processor import (
-    BaseMultimodalProcessor as SGLangBaseProcessor,
-)
-from sglang.srt.multimodal.processors.base_processor import (
+    BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 from sglang.srt.multimodal.token_space.qwen_vl import (
     IMAGE_FACTOR,
+    QwenTokenSpaceProcessStrategy,
     _get_processor_video_config,
-    preprocess_video_sync,
+)
+from sglang.srt.multimodal.token_space.qwen_vl import (
+    preprocess_video_sync as preprocess_video_sync,
 )
 from sglang.srt.multimodal.token_space.qwen_vl import smart_nframes as smart_nframes
 from sglang.srt.multimodal.token_space.qwen_vl import smart_resize as smart_resize
@@ -82,8 +84,10 @@ async def preprocess_video(
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
-class QwenVLImageProcessor(SGLangBaseProcessor):
+class QwenVLImageProcessor(BaseMultimodalProcessor):
     supports_transformers_backend = True
+    supports_token_expansion = True
+    token_space_process_strategy_class = QwenTokenSpaceProcessStrategy
     models = [
         Qwen2VLForConditionalGeneration,
         Qwen2_5_VLForConditionalGeneration,
@@ -98,6 +102,15 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         Cosmos3ForConditionalGeneration,
         Qwen4ExpForConditionalGeneration,
     ]
+
+    @classmethod
+    def supports_token_space_processing(cls, hf_config):
+        return (
+            cls.supports_token_expansion
+            and cls.token_space_process_strategy_class.supports_token_space_processing(
+                hf_config
+            )
+        )
 
     def __init__(self, hf_config, server_args, _processor, *args, **kwargs):
         self.model_type = hf_config.model_type
@@ -531,15 +544,39 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
         input_text,
         request_obj,
         *args,
+        video_data=None,
+        audio_data=None,
+        input_ids=None,
+        mm_token_expansion_start_len=None,
         **kwargs,
     ):
+        if self.use_token_space_processor:
+            return await self.process_token_space_mm_data_async(
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                input_text=input_text,
+                input_ids=input_ids,
+                request_obj=request_obj,
+                mm_token_expansion_start_len=mm_token_expansion_start_len,
+                **kwargs,
+            )
+        mm_token_expansion_start_len = self._get_mm_token_expansion_start_len(
+            request_obj, mm_token_expansion_start_len
+        )
+        if video_data is None and request_obj is not None:
+            video_data = request_obj.video_data
+        if audio_data is None and request_obj is not None:
+            audio_data = request_obj.audio_data
+        if input_ids is not None:
+            input_text = input_ids
         entry_time = time.perf_counter()
         base_output = await self.load_mm_data(
             prompt=input_text,
-            image_data=image_data,
-            video_data=request_obj.video_data,
-            audio_data=request_obj.audio_data,
             multimodal_tokens=self.mm_tokens,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
         )
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
@@ -631,7 +668,7 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
             mm_items,
             "video_grid_thw",
             Modality.VIDEO,
-            request_obj.video_data,
+            video_data,
         )
 
         mrope_result = self._get_precomputed_mrope_from_output(ret)
@@ -708,3 +745,56 @@ class QwenVLImageProcessor(SGLangBaseProcessor):
                 item.model_specific_data[DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY] = (
                     True
                 )
+
+    def _build_position_inputs(self, input_ids, encoder_inputs):
+        audio_mask = encoder_inputs.get("feature_attention_mask")
+        positions, delta = MRotaryEmbedding.get_rope_index(
+            spatial_merge_size=self._spatial_merge_size,
+            image_token_id=self.mm_tokens.image_token_id,
+            video_token_id=self.mm_tokens.video_token_id,
+            vision_start_token_id=self.vision_start_token_id,
+            model_type=self.model_type,
+            tokens_per_second=self._tokens_per_second,
+            input_ids=input_ids,
+            image_grid_thw=encoder_inputs.get("image_grid_thw"),
+            video_grid_thw=encoder_inputs.get("video_grid_thw"),
+            second_per_grid_ts=encoder_inputs.get(
+                "second_per_grid_ts", encoder_inputs.get("video_second_per_grid")
+            ),
+            use_audio_in_video=False,
+            audio_seqlens=audio_mask.sum(dim=1) if audio_mask is not None else None,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            audio_start_token_id=self.audio_start_token_id,
+            position_id_per_seconds=getattr(
+                self.hf_config, "position_id_per_seconds", None
+            ),
+        )
+        return {"mrope_positions": positions.squeeze(1), "mrope_position_delta": delta}
+
+    def _postprocess_mm_items_before_transport(self, mm_items, *, images):
+        if self.use_token_space_processor:
+            self._mark_dp_encoder_features_for_deferred_reconstruction(mm_items)
+        return mm_items
+
+    def collect_mm_items_from_processor_output(self, data_dict, modality=None):
+        mm_items = super().collect_mm_items_from_processor_output(data_dict, modality)
+        if (
+            not self.use_token_space_processor
+            or self._is_preprocessed_input(data_dict)
+            or "input_features" not in data_dict
+        ):
+            return mm_items
+        for index, item in enumerate(mm_items):
+            if item.modality == Modality.AUDIO and item.offsets is None:
+                audio_items = []
+                for source_index in range(len(item.feature)):
+                    audio_item = copy.copy(item)
+                    audio_item.feature = item.feature[source_index : source_index + 1]
+                    audio_item.model_specific_data = {
+                        name: value[source_index : source_index + 1]
+                        for name, value in item.model_specific_data.items()
+                    }
+                    audio_items.append(audio_item)
+                mm_items[index : index + 1] = audio_items
+                break
+        return mm_items
