@@ -88,7 +88,6 @@ import pybase64
 import requests
 import torch
 import torch.distributed as dist
-import triton
 from packaging import version as pkg_version
 from PIL import Image, ImageOps, UnidentifiedImageError
 from starlette.routing import Mount
@@ -109,6 +108,13 @@ from sglang.srt.runtime_context import (
     get_spec,
 )
 from sglang.srt.utils.video_decoder import _BACKEND, VideoDecoderWrapper
+
+try:
+    import triton
+except ModuleNotFoundError as error:
+    if error.name != "triton":
+        raise
+    triton = None
 
 if TYPE_CHECKING:
     pass
@@ -3426,7 +3432,8 @@ def round_up(x: int, y: int) -> int:
     return ((x - 1) // y + 1) * y
 
 
-setattr(triton, "next_power_of_2", next_power_of_2)
+if triton is not None:
+    setattr(triton, "next_power_of_2", next_power_of_2)
 
 
 class EmptyContextManager:
