@@ -2,6 +2,9 @@
 
 Media the client supplied but that cannot be fetched or decoded must raise
 ``ValueError``; anything else must stay a ``RuntimeError``.
+
+client media -> Base._load_single_item -> ValueError
+server fault -> Base._load_single_item -> RuntimeError
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci

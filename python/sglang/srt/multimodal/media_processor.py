@@ -15,6 +15,8 @@ from transformers import BaseImageProcessor
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    VideoData,
     load_audio,
     load_image,
     load_video,
@@ -167,6 +169,7 @@ def _tokenizer_of(processor):
 
 
 class MultimodalProcessorMixin:
+    use_token_space_processor = False
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
@@ -438,12 +441,18 @@ class MultimodalProcessorMixin:
                 idx,
                 type(data),
             )
+            item_sample_rate = audio_sample_rate
+            if isinstance(data, dict) and "url" in data:
+                if modality == Modality.AUDIO:
+                    options = data.get("preprocess_kwargs") or {}
+                    item_sample_rate = options.get("sampling_rate", audio_sample_rate)
+                data = data["url"]
             future = self.io_executor.submit(
                 self.__class__._load_single_item,
                 data,
                 modality,
                 None,  # frame_count_limit: no consider for fast path
-                audio_sample_rate,
+                item_sample_rate,
                 discard_alpha_channel,
             )
             futures.append((modality, idx, future))
@@ -496,7 +505,7 @@ class MultimodalProcessorMixin:
 
     async def fast_load_mm_data(
         self,
-        prompt: str,
+        prompt: Optional[Union[str, List[int]]],
         multimodal_tokens: MultimodalSpecialTokens,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
@@ -513,11 +522,19 @@ class MultimodalProcessorMixin:
         The behavior is as follows:
           1. It runs `_load_single_item` for all input data concurrently.
           2. It returns the loaded images, videos, and audios in their original order.
-          3. It returns the input prompt as a string.
+          3. It returns text, or passes supported token IDs through unchanged.
+        A missing prompt preserves per-source processing options with the media.
         """
 
+        if self.use_token_space_processor and isinstance(prompt, list):
+            if input_ids is None:
+                input_ids = prompt
+            prompt = None
+
         # Convert prompt into str
-        if isinstance(prompt, list) and return_text:
+        if prompt is None:
+            prompt_str = ""
+        elif isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt_str = self._tokenizer.decode(prompt)
         else:
@@ -545,6 +562,9 @@ class MultimodalProcessorMixin:
         videos: List[Any] = [None] * len(video_data) if video_data else []
         audios: List[Any] = [None] * len(audio_data) if audio_data else []
 
+        if prompt is None:
+            media_sources = {modality: data for data, modality in modalities_data}
+
         for modality, idx, future in futures:
             try:
                 result = await asyncio.wrap_future(future)
@@ -568,6 +588,16 @@ class MultimodalProcessorMixin:
                 raise RuntimeError(
                     f"An exception occurred while loading {modality.name} data at index {idx}: {e}"
                 )
+
+            if prompt is None:
+                source = media_sources[modality][idx]
+                if isinstance(source, (ImageData, VideoData)):
+                    source = {
+                        "url": source.url,
+                        "preprocess_kwargs": source.preprocess_kwargs,
+                    }
+                if isinstance(source, dict) and "url" in source:
+                    result = {**source, "url": result}
 
             if modality == Modality.IMAGE:
                 images[idx] = result

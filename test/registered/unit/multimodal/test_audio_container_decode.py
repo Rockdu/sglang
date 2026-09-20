@@ -1,4 +1,8 @@
-"""Regression tests for explicit ``input_audio`` media containers."""
+"""Regression tests for explicit ``input_audio`` media containers.
+
+container bytes/path -> load_audio -> decoded waveform
+bad container -> Base._load_single_item -> Base fast loader -> ValueError
+"""
 
 import asyncio
 import base64

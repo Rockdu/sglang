@@ -7,6 +7,10 @@ letting it fire lazily on the main event-loop thread later (inside
 (mode, pixels) must be unchanged; only *when/where* the decode happens differs.
 
 No server, no model loading — pure CPU.
+
+source -> Base._load_single_item -> decoded image or client/server error
+             IO workers         -> ordered media + per-source options
+ImageData / VideoData wrappers -> decoder-owned unwrapping
 """
 
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -17,10 +21,11 @@ import asyncio
 import concurrent.futures
 import io
 import sys
+import threading
 import types
 import unittest
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 
 import numpy as np
 import requests
@@ -97,20 +102,83 @@ class TestLoadSingleItemImageDecode(CustomTestCase):
 
     def test_fast_loader_preserves_invalid_input_as_value_error(self):
         processor = object.__new__(_StubProcessor)
-        future = concurrent.futures.Future()
-        future.set_exception(ValueError("invalid base64 image"))
-        processor._submit_mm_data_loading_tasks_simple = Mock(
-            side_effect=[[(Modality.IMAGE, 0, future)], [], []]
-        )
+        with (
+            concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor,
+            patch.object(
+                _StubProcessor,
+                "_load_single_item",
+                side_effect=ValueError("invalid base64 image"),
+            ),
+        ):
+            processor.io_executor = executor
+            with self.assertRaisesRegex(ValueError, "invalid base64 image"):
+                asyncio.run(
+                    processor.fast_load_mm_data(
+                        prompt="<image>",
+                        multimodal_tokens=None,
+                        image_data=["bad-image"],
+                    )
+                )
 
-        with self.assertRaisesRegex(ValueError, "invalid base64 image"):
-            asyncio.run(
+    def test_fast_loader_submits_all_media_and_preserves_source_options(self):
+        all_started = threading.Barrier(4, timeout=5)
+        calls = []
+
+        def load(data, modality, frame_count_limit, sample_rate, discard_alpha):
+            calls.append(
+                (data, modality, frame_count_limit, sample_rate, discard_alpha)
+            )
+            all_started.wait()
+            source = (
+                data.url
+                if isinstance(data, (common.ImageData, common.VideoData))
+                else data
+            )
+            return f"decoded:{source}"
+
+        sources = {
+            "image_data": [
+                common.ImageData(url="first", preprocess_kwargs={"size": 10}),
+                {"url": "second", "preprocess_kwargs": {"size": 20}},
+            ],
+            "video_data": [common.VideoData(url="video")],
+            "audio_data": [
+                {"url": "audio", "preprocess_kwargs": {"sampling_rate": 8000}}
+            ],
+        }
+        processor = object.__new__(_StubProcessor)
+        with (
+            concurrent.futures.ThreadPoolExecutor(max_workers=4) as executor,
+            patch.object(_StubProcessor, "_load_single_item", side_effect=load),
+        ):
+            processor.io_executor = executor
+            loaded = asyncio.run(
                 processor.fast_load_mm_data(
-                    prompt="<image>",
-                    multimodal_tokens=Mock(),
-                    image_data=["bad-image"],
+                    prompt=None,
+                    multimodal_tokens=None,
+                    **sources,
+                    audio_sample_rate=16000,
+                    discard_alpha_channel=False,
                 )
             )
+        self.assertEqual(
+            loaded.images,
+            [
+                {"url": "decoded:first", "preprocess_kwargs": {"size": 10}},
+                {"url": "decoded:second", "preprocess_kwargs": {"size": 20}},
+            ],
+        )
+        self.assertEqual(loaded.videos[0]["url"], "decoded:video")
+        self.assertEqual(loaded.audios[0]["url"], "decoded:audio")
+        self.assertCountEqual(
+            calls,
+            [
+                (sources["image_data"][0], Modality.IMAGE, None, 16000, False),
+                ("second", Modality.IMAGE, None, 16000, False),
+                (sources["video_data"][0], Modality.VIDEO, None, 16000, False),
+                ("audio", Modality.AUDIO, None, 8000, False),
+            ],
+        )
 
     def test_unreachable_image_url_is_a_client_error(self):
         with patch(

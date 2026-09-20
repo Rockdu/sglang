@@ -781,8 +781,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
     async def load_mm_data(
         self,
-        prompt: str,
-        multimodal_tokens: MultimodalSpecialTokens,
+        prompt: Optional[Union[str, List[int]]] = None,
+        multimodal_tokens: MultimodalSpecialTokens = None,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
         audio_data: Optional[list] = None,
@@ -803,6 +803,25 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 images=list(image_data or []),
                 videos=list(video_data or []),
                 audios=list(audio_data or []),
+            )
+
+        if prompt is None or (self.use_token_space_processor and input_ids is not None):
+            if audio_data:
+                audio_sample_rate = self.audio_config.get(
+                    "sampling_rate", audio_sample_rate
+                )
+                if audio_sample_rate is None:
+                    audio_sample_rate = self._processor.feature_extractor.sampling_rate
+            return await self.fast_load_mm_data(
+                prompt=prompt,
+                multimodal_tokens=multimodal_tokens,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                return_text=False,
+                discard_alpha_channel=discard_alpha_channel,
+                audio_sample_rate=audio_sample_rate,
+                input_ids=input_ids,
             )
 
         multimodal_tokens_pattern = multimodal_tokens.get_combined_regex()
