@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -7,3 +8,4 @@ class MultimodalProcessorConfig:
 
     image_processor_backend: str = "auto"
     disable_fast_image_processor: bool = False
+    mm_process_config: dict[str, Any] = field(default_factory=dict)

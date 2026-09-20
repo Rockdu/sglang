@@ -261,6 +261,7 @@ class BaseMultimodalProcessor(ABC):
         processor_config = MultimodalProcessorConfig(
             image_processor_backend=get_mm().image_processor_backend,
             disable_fast_image_processor=get_mm().disable_fast_image_processor,
+            mm_process_config=get_mm().mm_process_config,
         )
         self.processor_config = processor_config
 
@@ -269,7 +270,7 @@ class BaseMultimodalProcessor(ABC):
             self.image_processor_backend = "pil"
         self.disable_fast_image_processor = self.image_processor_backend == "pil"
 
-        mm_process_config = get_mm().mm_process_config
+        mm_process_config = processor_config.mm_process_config
         self.image_config = mm_process_config.get("image", {})
         self.video_config = mm_process_config.get("video", {})
         self.audio_config = mm_process_config.get("audio", {})
