@@ -513,7 +513,7 @@ class BaseMultimodalProcessor(ABC):
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
         return concurrent.futures.ProcessPoolExecutor(
             mp_context=mp.get_context(self.processor_config.cpu_process_start_method),
-            max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
+            max_workers=self.processor_config.cpu_worker_num,
         )
 
     def _replace_broken_cpu_executor(
