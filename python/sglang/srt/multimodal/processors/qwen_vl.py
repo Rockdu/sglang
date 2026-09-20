@@ -44,7 +44,6 @@ from sglang.srt.multimodal.transport.cuda_ipc import (
 )
 from sglang.srt.runtime_context import get_mm
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
-from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.utils import logger
 
 IMAGE_FACTOR = 28
@@ -205,15 +204,20 @@ def smart_nframes(
 
 
 # process video, qwen-specific
-async def preprocess_video(
+def preprocess_video_sync(
     vr,
+    *,
     image_factor: int = IMAGE_FACTOR,
-    video_config: dict = {},
-) -> torch.Tensor:
+    video_config: dict = None,
+):
+    from sglang.srt.utils import is_cpu
+    from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
     # preprocessed video
     is_video_obj = isinstance(vr, VideoDecoderWrapper)
     if not is_video_obj:
         return vr, None
+    video_config = video_config or {}
     entry_time = time.perf_counter()
 
     total_frames, video_fps = len(vr), vr.avg_fps
@@ -286,6 +290,16 @@ async def preprocess_video(
         f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
     )
     return video, video_metadata
+
+
+async def preprocess_video(
+    vr,
+    image_factor: int = IMAGE_FACTOR,
+    video_config: dict = {},
+):
+    return preprocess_video_sync(
+        vr, image_factor=image_factor, video_config=video_config
+    )
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
