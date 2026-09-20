@@ -13,8 +13,11 @@ from PIL import Image
 
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
+    ImageData,
+    VideoData,
     configure_media_url_security,
     load_audio,
     load_image,
@@ -22,6 +25,20 @@ from sglang.srt.utils import (
     logger,
     smart_to_rgb,
 )
+
+
+def get_media_source_configs(mm_data):
+    """Return per-source preprocessing options in the original media order."""
+    source_configs = []
+    for source in mm_data or []:
+        if isinstance(source, (ImageData, VideoData)):
+            options = source.preprocess_kwargs
+        elif isinstance(source, dict):
+            options = source.get("preprocess_kwargs")
+        else:
+            options = None
+        source_configs.append(options or {})
+    return source_configs
 
 
 @dataclasses.dataclass
@@ -328,6 +345,40 @@ class MultimodalProcessorMixin:
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def _resolve_auto_mm_processor_worker_num(self) -> int:
+        return 1
+
+    async def _run_mm_processor(self, function, **kwargs):
+        if self.mm_processor_executor is None:
+            return function(**kwargs)
+        return await self.mm_processor_executor.run(function, **kwargs)
+
+    async def process_media_async(self, **kwargs):
+        """Process loaded media with the instance's isolated processor workers."""
+        return await self._run_mm_processor(self.process_media, **kwargs)
+
+    def process_media(
+        self,
+        *,
+        images=None,
+        videos=None,
+        audios=None,
+        processor=None,
+        image_device=None,
+        video_device=None,
+        **kwargs,
+    ):
+        processor, _ = self._resolve_processor(processor)
+        return self.token_space_process_strategy.process_media(
+            images=images,
+            videos=videos,
+            audios=audios,
+            processor=processor,
+            image_device=image_device,
+            video_device=video_device,
+            **kwargs,
+        )
+
     @classmethod
     def _load_single_item(
         cls,
@@ -504,6 +555,30 @@ class MultimodalProcessorMixin:
         MultimodalProcessorMixin._validate_one_modality(Modality.VIDEO, video_data)
         MultimodalProcessorMixin._validate_one_modality(Modality.AUDIO, audio_data)
 
+    async def load_mm_data(
+        self,
+        prompt=None,
+        multimodal_tokens=None,
+        image_data=None,
+        video_data=None,
+        audio_data=None,
+        return_text=False,
+        discard_alpha_channel=True,
+        audio_sample_rate=None,
+    ) -> BaseMultiModalProcessorOutput:
+        self.validate_mm_data(image_data, video_data, audio_data)
+        return await self.fast_load_mm_data(
+            prompt=prompt,
+            multimodal_tokens=multimodal_tokens,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            return_text=return_text,
+            discard_alpha_channel=discard_alpha_channel,
+            audio_sample_rate=audio_sample_rate,
+            input_ids=prompt if isinstance(prompt, list) else None,
+        )
+
     async def fast_load_mm_data(
         self,
         prompt: Optional[Union[str, List[int]]],
@@ -604,4 +679,28 @@ class MultimodalProcessorMixin:
             videos=videos,
             input_text=prompt_str,
             input_ids=input_ids,
+        )
+
+
+class TokenSpaceMMProcessor(MultimodalProcessorMixin):
+    """Load media and run a token-space process strategy without serving dependencies."""
+
+    use_token_space_processor = True
+
+    def __init__(
+        self,
+        hf_config,
+        processor,
+        token_space_process_strategy_class,
+        *,
+        processor_config=None,
+        **kwargs,
+    ):
+        if processor_config is None:
+            processor_config = MultimodalProcessorConfig()
+        self.token_space_process_strategy = token_space_process_strategy_class(
+            hf_config, processor, mm_process_config=processor_config.mm_process_config
+        )
+        self._initialize_processor(
+            hf_config, processor, processor_config=processor_config, **kwargs
         )
