@@ -74,6 +74,11 @@ class Mm(msgspec.Struct):
             type_parser=json.loads,
         ),
     ] = None
+    enable_token_space_processor: A[
+        bool,
+        "Enable token-space multimodal preprocessing for supported models. "
+        "Unsupported models keep their existing processor.",
+    ] = False
     mm_processor_worker_num: A[
         int,
         "Number of threads for multimodal processor calls. 0 selects the "
