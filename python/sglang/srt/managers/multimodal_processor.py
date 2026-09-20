@@ -6,7 +6,7 @@ import pkgutil
 
 from sglang.srt.configs.model_config import ModelImpl
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.runtime_context import get_model
+from sglang.srt.runtime_context import get_mm, get_model
 from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
@@ -85,5 +85,16 @@ def get_mm_processor(
         raise ValueError(
             f"No processor registered for architecture: {hf_config.architectures}.\n"
             f"Registered architectures: {[model_cls.__name__ for model_cls in PROCESSOR_MAPPING.keys()]}"
+        )
+    if (
+        get_mm().enable_token_space_processor
+        and processor_cls.supports_token_space_processing(hf_config)
+    ):
+        return processor_cls.token_space_processor_class(
+            hf_config,
+            processor,
+            server_args=server_args,
+            transport_mode=transport_mode,
+            **kwargs,
         )
     return processor_cls(hf_config, server_args, processor, transport_mode, **kwargs)
