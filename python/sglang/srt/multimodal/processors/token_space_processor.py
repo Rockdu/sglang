@@ -3,6 +3,7 @@ from transformers import BatchFeature
 from sglang.srt.multimodal.media_processing import process_media_groups
 from sglang.srt.multimodal.media_processor import MultimodalProcessorMixin
 from sglang.srt.multimodal.mm_token_expansion import expand_token_placeholders
+from sglang.srt.multimodal.modality import Modality
 
 
 class TokenSpaceMultimodalProcessor(MultimodalProcessorMixin):
@@ -98,6 +99,14 @@ class TokenSpaceMultimodalProcessor(MultimodalProcessorMixin):
         raise NotImplementedError
 
     def process_audio(self, audios, processor, **kwargs):
+        raise NotImplementedError
+
+    def split_media_features(self, modality: Modality, features: dict) -> list[dict]:
+        """Split one modality's native fields into ordered per-source fields."""
+        raise NotImplementedError
+
+    def merge_media_features(self, modality: Modality, features: list[dict]) -> dict:
+        """Assemble ordered per-source fields using the model's batching rules."""
         raise NotImplementedError
 
     def get_mm_token_expansion_spec(self, processor, media_features):

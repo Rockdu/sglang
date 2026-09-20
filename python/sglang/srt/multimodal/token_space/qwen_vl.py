@@ -23,6 +23,7 @@ from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_processing import process_media_groups
 from sglang.srt.multimodal.media_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.token_space_processor import (
     TokenSpaceMultimodalProcessor,
 )
@@ -498,7 +499,6 @@ class QwenTokenSpaceProcessor(TokenSpaceMultimodalProcessor):
             else:
                 groups.append((processor_kwargs, [index]))
         video_features = [None] * len(videos)
-        video_fields = {}
         for processor_kwargs, indices in groups:
             metadata = [prepared[index][1] for index in indices]
             output = dict(
@@ -526,20 +526,12 @@ class QwenTokenSpaceProcessor(TokenSpaceMultimodalProcessor):
                     for item in output["video_metadata"]
                 ]
             if len(groups) > 1:
-                patch_counts = output["video_grid_thw"].prod(-1).tolist()
                 for index, features in zip(
-                    indices, output["pixel_values_videos"].split(patch_counts)
+                    indices, self.split_media_features(Modality.VIDEO, output)
                 ):
                     video_features[index] = features
-                for name, values in output.items():
-                    if name == "pixel_values_videos":
-                        continue
-                    ordered_values = video_fields.setdefault(name, [None] * len(videos))
-                    for index, value in zip(indices, values):
-                        ordered_values[index] = value
         if len(groups) > 1:
-            output = {"pixel_values_videos": torch.cat(video_features), **video_fields}
-            output["video_grid_thw"] = torch.stack(output["video_grid_thw"])
+            output = self.merge_media_features(Modality.VIDEO, video_features)
         return output
 
     def process_audio(self, audios, processor, **kwargs):
@@ -557,6 +549,46 @@ class QwenTokenSpaceProcessor(TokenSpaceMultimodalProcessor):
         output = dict(processor.feature_extractor(audios, **kwargs))
         output["feature_attention_mask"] = output.pop("attention_mask")
         return output
+
+    def split_media_features(self, modality: Modality, features: dict) -> list[dict]:
+        if modality == Modality.AUDIO:
+            return [
+                {name: value[index : index + 1] for name, value in features.items()}
+                for index in range(len(features["input_features"]))
+            ]
+        feature_name, grid_name = {
+            Modality.IMAGE: ("pixel_values", "image_grid_thw"),
+            Modality.VIDEO: ("pixel_values_videos", "video_grid_thw"),
+        }[modality]
+        patch_counts = features[grid_name].prod(-1).tolist()
+        return [
+            {
+                name: patches if name == feature_name else value[index : index + 1]
+                for name, value in features.items()
+            }
+            for index, patches in enumerate(features[feature_name].split(patch_counts))
+        ]
+
+    def merge_media_features(self, modality: Modality, features: list[dict]) -> dict:
+        if modality == Modality.AUDIO:
+            return {
+                "input_features": torch.nn.utils.rnn.pad_sequence(
+                    [feature["input_features"][0].T for feature in features],
+                    batch_first=True,
+                ).transpose(1, 2),
+                "feature_attention_mask": torch.nn.utils.rnn.pad_sequence(
+                    [feature["feature_attention_mask"][0] for feature in features],
+                    batch_first=True,
+                ),
+            }
+        return {
+            name: (
+                torch.cat([feature[name] for feature in features])
+                if isinstance(features[0][name], torch.Tensor)
+                else [value for feature in features for value in feature[name]]
+            )
+            for name in features[0]
+        }
 
     def get_mm_token_expansion_spec(self, processor, media_features):
         image_expansions, video_expansions, audio_expansions = [], [], []
