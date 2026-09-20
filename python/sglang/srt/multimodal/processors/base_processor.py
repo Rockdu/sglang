@@ -262,6 +262,7 @@ class BaseMultimodalProcessor(ABC):
             image_processor_backend=get_mm().image_processor_backend,
             disable_fast_image_processor=get_mm().disable_fast_image_processor,
             mm_process_config=get_mm().mm_process_config,
+            mm_processor_worker_num=get_mm().mm_processor_worker_num,
         )
         self.processor_config = processor_config
 
@@ -342,7 +343,7 @@ class BaseMultimodalProcessor(ABC):
                 io_worker_source,
             )
         skip_mm_pool = kwargs.get("skip_mm_pool", False)
-        requested_mm_processor_worker_num = get_mm().mm_processor_worker_num
+        requested_mm_processor_worker_num = processor_config.mm_processor_worker_num
         self.mm_processor_worker_num = (
             1
             if skip_mm_pool
