@@ -205,7 +205,7 @@ def smart_nframes(
 
 
 # process video, qwen-specific
-async def preprocess_video(
+def preprocess_video_sync(
     vr,
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
@@ -286,6 +286,16 @@ async def preprocess_video(
         f"total_time: {(torchvision_resize_time - entry_time) * 1000:.2f} ms"
     )
     return video, video_metadata
+
+
+async def preprocess_video(
+    vr,
+    image_factor: int = IMAGE_FACTOR,
+    video_config: dict = {},
+):
+    return preprocess_video_sync(
+        vr, image_factor=image_factor, video_config=video_config
+    )
 
 
 # Compatible with Qwen-VL & Qwen-Omni Series
