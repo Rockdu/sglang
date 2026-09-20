@@ -1,13 +1,27 @@
 import logging
 import math
 import os
+import re
 import time
+from dataclasses import replace
 
 import numpy as np
+import torch
 import torchvision
 from torchvision.transforms import InterpolationMode
+from transformers.models.qwen3_omni_moe.processing_qwen3_omni_moe import (
+    Qwen3OmniMoeProcessorKwargs,
+)
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
+    Qwen3VLVideoProcessor,
+)
 
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_processing import process_media_groups
+from sglang.srt.multimodal.media_processor import MultimodalSpecialTokens
+from sglang.srt.multimodal.processors.token_space_processor import (
+    TokenSpaceMultimodalProcessor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -247,3 +261,247 @@ def _get_feat_extract_output_lengths(input_lengths):
         ((feat_lengths - 1) // 2 + 1 - 1) // 2 + 1 + (input_lengths // 100) * 13
     )
     return output_lengths
+
+
+class QwenTokenSpaceProcessor(TokenSpaceMultimodalProcessor):
+    supports_token_expansion = True
+    supports_transformers_backend = True
+    _TOKENIZED_MEDIA_MODEL_TYPES = frozenset(
+        {
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen3_omni_moe",
+            "qwen4_exp",
+        }
+    )
+
+    @classmethod
+    def supports_token_space_processing(cls, hf_config):
+        return (
+            cls.supports_token_expansion
+            and hf_config.model_type in cls._TOKENIZED_MEDIA_MODEL_TYPES
+        )
+
+    def __init__(self, hf_config, processor, **kwargs):
+        self.model_type = hf_config.model_type
+        self.supports_token_expansion = self.supports_token_space_processing(hf_config)
+        if self.model_type in (
+            "qwen2_vl",
+            "qwen2_5_vl",
+            "qwen3_vl",
+            "qwen3_vl_moe",
+            "qwen3_5",
+            "qwen3_5_moe",
+            "qwen4_exp",
+            "intern_s2_preview",
+            "interns2_mobius",
+        ):
+            # Two workers overlap CPU preprocessing without over-fragmenting
+            # burst arrivals into smaller GPU prefill batches. Higher counts can
+            # improve short-output TTFT, but regress long-output throughput on
+            # Blackwell when requests reach the scheduler too far apart.
+            self.auto_mm_processor_worker_num = 2
+            self.auto_mm_io_worker_num = 16
+            self.supports_mm_processor_concurrency = True
+        if self.model_type == "qwen3_omni_moe":
+            self.media_processor_kwargs_type = Qwen3OmniMoeProcessorKwargs
+            hf_config = hf_config.thinker_config
+
+        super().__init__(hf_config, processor, **kwargs)
+
+        self.IM_START_TOKEN_ID = hf_config.vision_start_token_id
+        self.IM_END_TOKEN_ID = hf_config.vision_end_token_id
+        self.IM_TOKEN_ID = self.image_token_id = hf_config.image_token_id
+        self.VIDEO_TOKEN_ID = self.video_token_id = hf_config.video_token_id
+
+        self.vision_start_token_id = hf_config.vision_start_token_id
+        self.vision_end_token_id = getattr(hf_config, "vision_end_token_id", None)
+
+        self.audio_start_token_id = getattr(hf_config, "audio_start_token_id", None)
+        self.audio_token_id = getattr(hf_config, "audio_token_id", None)
+
+        self._spatial_merge_size = self.hf_config.vision_config.spatial_merge_size
+        self._tokens_per_second = getattr(
+            self.hf_config.vision_config, "tokens_per_second", None
+        )
+
+        self.mm_tokens = MultimodalSpecialTokens(
+            image_token="<|vision_start|><|image_pad|><|vision_end|>",
+            image_token_id=hf_config.image_token_id,
+            # The regex that matches expanded image tokens.
+            image_token_regex=re.compile(
+                r"<\|vision_start\|>(?:<\|image_pad\|>)+<\|vision_end\|>"
+            ),
+            video_token_id=self.VIDEO_TOKEN_ID,
+            audio_token_id=self.audio_token_id,
+        ).build(processor)
+
+    def process_videos(self, videos, processor, *, source_configs=None, **kwargs):
+        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
+        if kwargs.pop("use_audio_in_video", False):
+            raise ValueError("Qwen token expansion does not support use_audio_in_video")
+        kwargs.pop("seconds_per_chunk", None)
+        kwargs.pop("position_id_per_seconds", None)
+        supplied_metadata = kwargs.pop("video_metadata", None)
+        prepared, groups = [], []
+        for index, video in enumerate(videos):
+            config = {
+                **self.video_config,
+                **{
+                    key: value
+                    for key, value in kwargs.items()
+                    if key in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+                },
+            }
+            if source_configs:
+                config.update(source_configs[index])
+            processor_kwargs = dict(kwargs)
+            if isinstance(processor.video_processor, Qwen3VLVideoProcessor):
+                processor_kwargs.update(
+                    {
+                        key: value
+                        for key, value in config.items()
+                        if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS
+                    }
+                )
+            try:
+                frames, metadata = preprocess_video_sync(video, video_config=config)
+            finally:
+                if isinstance(video, VideoDecoderWrapper):
+                    video.close()
+            if metadata is None and supplied_metadata is not None:
+                metadata = supplied_metadata[index]
+            if metadata is not None:
+                processor_kwargs = {
+                    key: value
+                    for key, value in processor_kwargs.items()
+                    if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS - {"fps"}
+                }
+                processor_kwargs["do_sample_frames"] = False
+            processor_kwargs["return_metadata"] = True
+            prepared.append((frames, metadata))
+            for group_kwargs, indices in groups:
+                if group_kwargs == processor_kwargs:
+                    indices.append(index)
+                    break
+            else:
+                groups.append((processor_kwargs, [index]))
+        video_features = [None] * len(videos)
+        video_fields = {}
+        for processor_kwargs, indices in groups:
+            metadata = [prepared[index][1] for index in indices]
+            output = dict(
+                processor.video_processor(
+                    [prepared[index][0] for index in indices],
+                    video_metadata=metadata
+                    if all(item is not None for item in metadata)
+                    else None,
+                    **processor_kwargs,
+                )
+            )
+            if self.model_type == "qwen2_5_vl":
+                output["second_per_grid_ts"] = [
+                    processor.video_processor.temporal_patch_size / item.sampled_fps
+                    for item in output["video_metadata"]
+                ]
+            elif self.model_type == "qwen3_omni_moe":
+                output["video_second_per_grid"] = [
+                    processor.video_processor.temporal_patch_size
+                    / processor_kwargs.get("fps", 1.0)
+                ] * len(indices)
+            elif self.model_type != "qwen2_vl":
+                output["video_metadata"] = [
+                    replace(item, fps=24) if item.fps is None else item
+                    for item in output["video_metadata"]
+                ]
+            if len(groups) > 1:
+                patch_counts = output["video_grid_thw"].prod(-1).tolist()
+                for index, features in zip(
+                    indices, output["pixel_values_videos"].split(patch_counts)
+                ):
+                    video_features[index] = features
+                for name, values in output.items():
+                    if name == "pixel_values_videos":
+                        continue
+                    ordered_values = video_fields.setdefault(name, [None] * len(videos))
+                    for index, value in zip(indices, values):
+                        ordered_values[index] = value
+        if len(groups) > 1:
+            output = {"pixel_values_videos": torch.cat(video_features), **video_fields}
+            output["video_grid_thw"] = torch.stack(output["video_grid_thw"])
+        return output
+
+    def process_audio(self, audios, processor, **kwargs):
+        grouped = process_media_groups(audios, processor, self.process_audio, kwargs)
+        if grouped is not None:
+            features = grouped["input_features"]
+            if isinstance(features, list):
+                grouped["input_features"] = torch.nn.utils.rnn.pad_sequence(
+                    [feature.T for feature in features], batch_first=True
+                ).transpose(1, 2)
+                grouped["feature_attention_mask"] = torch.nn.utils.rnn.pad_sequence(
+                    grouped["feature_attention_mask"], batch_first=True
+                )
+            return grouped
+        output = dict(processor.feature_extractor(audios, **kwargs))
+        output["feature_attention_mask"] = output.pop("attention_mask")
+        return output
+
+    def get_mm_token_expansion_spec(self, processor, media_features):
+        image_expansions, video_expansions, audio_expansions = [], [], []
+        if "image_grid_thw" in media_features:
+            merge_length = processor.image_processor.merge_size**2
+            image_expansions = [
+                [self.image_token_id] * (int(grid.prod()) // merge_length)
+                for grid in media_features["image_grid_thw"]
+            ]
+        if "video_grid_thw" in media_features:
+            merge_length = processor.video_processor.merge_size**2
+            for index, grid in enumerate(media_features["video_grid_thw"]):
+                if self.model_type in {"qwen2_vl", "qwen2_5_vl", "qwen3_omni_moe"}:
+                    video_expansions.append(
+                        [self.video_token_id] * (int(grid.prod()) // merge_length)
+                    )
+                    continue
+                metadata = media_features["video_metadata"][index]
+                frame_count, height, width = grid.tolist()
+                timestamps = processor._calculate_timestamps(
+                    list(metadata.frames_indices),
+                    metadata.fps,
+                    processor.video_processor.temporal_patch_size,
+                )
+                expanded_tokens = []
+                for timestamp in timestamps[:frame_count]:
+                    expanded_tokens.extend(
+                        processor.tokenizer.encode(
+                            f"<{timestamp:.1f} seconds>", add_special_tokens=False
+                        )
+                        + [self.vision_start_token_id]
+                        + [self.video_token_id] * (height * width // merge_length)
+                        + [self.vision_end_token_id]
+                    )
+                video_expansions.append(expanded_tokens)
+        if "feature_attention_mask" in media_features:
+            audio_token_counts = _get_feat_extract_output_lengths(
+                media_features["feature_attention_mask"].sum(-1)
+            )
+            audio_expansions = [
+                [self.audio_token_id] * int(token_count)
+                for token_count in audio_token_counts
+            ]
+        mm_token_expansion_spec = [
+            ([self.image_token_id], image_expansions),
+            ([self.video_token_id], video_expansions),
+        ]
+        if self.audio_token_id is not None:
+            mm_token_expansion_spec.append(([self.audio_token_id], audio_expansions))
+        return mm_token_expansion_spec
+
+    @property
+    def spatial_merge_size(self):
+        return self._spatial_merge_size
