@@ -1,18 +1,28 @@
-"""Every processor must reach preprocessing through the executor-backed helper.
+"""Check multimodal async dispatch and executor-backed preprocessing.
 
-`process_and_combine_mm_data` is the function the multimodal processor worker
-pool actually runs. A processor that calls it directly can never use those
-workers: it will build the thread pool and its processor clones on startup and
-then route every request past them. That failure is silent -- the model just
-serves at one-worker speed -- so pin the call site instead of the symptom.
+  async processor entry
+    -> await process_and_combine_mm_data_async
+      -> worker pool (or direct fallback when no executor exists)
+        -> sync process_and_combine_mm_data
+  Base token-space async entry -> _run_mm_processor -> same worker pool
+  disabled + partial boundary / sync IDs -> reject before media or tokenization
+  startup opt-in AND model supports_token_expansion
+    True  -> serving host + token-space member -> shared loading -> same worker pool
+    False -> original async route -> original HF/native media processor
+  request audio/video -> loader; explicit media arguments override request fields
+  per-source configs stay with the outer call and reach the member beside loaded media
 
-`process_and_combine_mm_data_async` delegates straight to the sync function when
-no executor exists, so using it costs nothing until a model opts into
-concurrency.
+  request video_data -> original InternVL special-format dispatch -> video item offsets
+                       (no duplicate keyword through **kwargs)
+
+Source-tree checks reject processor calls that bypass the async worker helper.
 """
 
 import ast
+import asyncio
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -93,6 +103,42 @@ def test_every_call_site_can_await():
     )
 
 
+def test_internvl_request_video_reaches_special_format_dispatch():
+    import torch
+
+    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+    from sglang.srt.multimodal.processors.internvl import InternVLProcessor
+
+    processor = object.__new__(InternVLProcessor)
+    processor.img_start_token_id = 10
+    processor.img_end_token_id = 11
+    processor.img_context_token_id = 12
+    processor.video_token_id = 13
+    processor.mm_tokens = MultimodalSpecialTokens(video_token_id=13)
+    input_ids = [1, 13, 13, 2]
+    features = torch.zeros(2, 4)
+    video_data = [{"format": "processor_output", "pixel_values_videos": features}]
+    item = MultimodalDataItem(modality=Modality.VIDEO, feature=features)
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([item], torch.tensor(input_ids), {})
+    )
+
+    output = asyncio.run(
+        processor.process_mm_data_async(
+            image_data=None,
+            input_text=input_ids,
+            request_obj=SimpleNamespace(video_data=video_data),
+        )
+    )
+
+    loaded = processor.process_and_combine_mm_data_async.call_args.args[0]
+    assert loaded.videos == video_data
+    assert output.input_ids == input_ids
+    assert output.mm_items[0].feature is features
+    assert output.mm_items[0].offsets == [(1, 2)]
+
+
 def test_default_worker_count_follows_the_preprocessing_path():
     """The count is resolved per path, not pinned to a number.
 
@@ -111,6 +157,164 @@ def test_default_worker_count_follows_the_preprocessing_path():
 
     assert BaseMultimodalProcessor.supports_mm_processor_concurrency is True
     assert BaseMultimodalProcessor.auto_mm_processor_worker_num is None
+
+
+@pytest.fixture
+def migrated_processor():
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+    return object.__new__(QwenVLImageProcessor)
+
+
+@pytest.mark.parametrize("media_source", ["arguments", "request"])
+def test_supported_models_delegate_the_complete_request(
+    media_source,
+):
+    from sglang.srt.multimodal.processors.qwen_vl import (
+        QwenVLImageProcessor,
+    )
+
+    migrated_processor = object.__new__(QwenVLImageProcessor)
+    migrated_processor.use_token_space_processor = True
+    loaded = SimpleNamespace(images=[object()], videos=[object()], audios=[object()])
+    migrated_processor.load_mm_data = AsyncMock(return_value=loaded)
+    migrated_processor._run_mm_processor = AsyncMock(return_value=object())
+    request_kwargs = {
+        "image_data": ["image"],
+        "video_data": ["video"],
+        "audio_data": ["audio"],
+        "input_text": "",
+        "input_ids": [1, 101, 2],
+        "request_obj": SimpleNamespace(
+            video_data=["request video"], audio_data=["request audio"]
+        ),
+        "mm_token_expansion_start_len": 1,
+    }
+
+    call_kwargs = dict(request_kwargs)
+    if media_source == "request":
+        for name in ("video_data", "audio_data"):
+            del call_kwargs[name]
+        request_kwargs["video_data"] = request_kwargs["request_obj"].video_data
+        request_kwargs["audio_data"] = request_kwargs["request_obj"].audio_data
+    output = asyncio.run(migrated_processor.process_mm_data_async(**call_kwargs))
+
+    assert output is migrated_processor._run_mm_processor.return_value
+    migrated_processor.load_mm_data.assert_awaited_once_with(
+        image_data=request_kwargs["image_data"],
+        video_data=request_kwargs["video_data"],
+        audio_data=request_kwargs["audio_data"],
+        audio_sample_rate=None,
+    )
+    migrated_processor._run_mm_processor.assert_awaited_once_with(
+        migrated_processor.process_mm_data,
+        input_ids=request_kwargs["input_ids"],
+        input_text="",
+        images=loaded.images,
+        videos=loaded.videos,
+        audios=loaded.audios,
+        image_source_configs=[{}],
+        video_source_configs=[{}],
+        audio_source_configs=[{}],
+        mm_token_expansion_start_len=1,
+    )
+
+
+@pytest.mark.parametrize("boundary_source", ["argument", "request"])
+def test_disabled_async_rejects_partial_before_loading(
+    migrated_processor, boundary_source
+):
+    from sglang.srt.managers.io_struct import GenerateReqInput
+
+    migrated_processor.use_token_space_processor = False
+    # The instance has no loader or tokenizer: validation must precede either.
+    request = GenerateReqInput(input_ids=[1, 101, 2])
+    kwargs = {}
+    if boundary_source == "request":
+        request.mm_token_expansion_start_len = 1
+    else:
+        kwargs["mm_token_expansion_start_len"] = 1
+    with pytest.raises(ValueError, match="--enable-token-space-processor"):
+        asyncio.run(
+            migrated_processor.process_mm_data_async(
+                image_data=["image"], input_text="", request_obj=request, **kwargs
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "token_kwargs", [{"input_ids": [1, 101]}, {"mm_token_expansion_start_len": 1}]
+)
+def test_disabled_sync_rejects_token_arguments_before_media(
+    migrated_processor, token_kwargs
+):
+    migrated_processor.use_token_space_processor = False
+    with pytest.raises(ValueError, match="--enable-token-space-processor"):
+        migrated_processor.process_mm_data(audios=[object()], **token_kwargs)
+
+
+def test_disabled_models_reach_original_media_processing(migrated_processor):
+    """Follow the old entry through synchronous preprocessing, not just loading."""
+
+    class LegacyProcessingReached(Exception):
+        pass
+
+    calls = []
+
+    def legacy_component(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise LegacyProcessingReached
+
+    def reject_shared_pipeline(**kwargs):
+        pytest.fail("Disabled token-space strategy entered process_media")
+
+    processor = migrated_processor
+    processor.use_token_space_processor = False
+    processor.process_media = reject_shared_pipeline
+    processor._processor = legacy_component
+    processor._tokenizer = None
+    processor._tokenizer_auto_adds_specials = False
+    processor.hf_config = SimpleNamespace(model_type="qwen3_5")
+    processor.image_config = {}
+    processor.video_config = {}
+    processor.audio_config = {}
+    processor.mm_tokens = SimpleNamespace(image_token_id=101)
+    processor.IMAGE_TOKEN_ID = 101
+    processor.AUDIO_TOKEN_ID = None
+    loaded = SimpleNamespace(input_text="image prompt", images=[b"loaded image"])
+    loaded.videos = loaded.audios = []
+    processor.load_mm_data = AsyncMock(return_value=loaded)
+
+    async def combine_in_worker(base_output, mm_tokens, **kwargs):
+        return processor.process_mm_data(
+            input_text=base_output.input_text, images=base_output.images
+        )
+
+    processor.process_and_combine_mm_data_async = combine_in_worker
+    with pytest.raises(LegacyProcessingReached):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[b"encoded image"],
+                input_text="image prompt",
+                request_obj=SimpleNamespace(
+                    input_ids=[1, 101, 2], video_data=None, audio_data=["audio"]
+                ),
+            )
+        )
+
+    assert processor.load_mm_data.call_args.kwargs["prompt"] == "image prompt"
+    assert processor.load_mm_data.call_args.kwargs["audio_data"] == ["audio"]
+    assert calls == [
+        (
+            (),
+            {
+                "text": ["image prompt"],
+                "images": loaded.images,
+                "padding": True,
+                "return_tensors": "pt",
+            },
+        )
+    ]
 
 
 def _process_mm_data_overrides():
@@ -184,14 +388,17 @@ def test_processors_outside_the_worker_pool_are_declared():
             "async def process_mm_data_async" in source
             or "async def _process_special_format" in source
         )
-        if entry_points and "process_and_combine_mm_data_async" not in source:
+        if entry_points and not any(
+            dispatcher in source
+            for dispatcher in ("process_and_combine_mm_data_async", "_run_mm_processor")
+        ):
             unrouted.add(path.name)
 
     newly_unrouted = unrouted - _NO_WORKER_POOL_ROUTE
     assert not newly_unrouted, (
         "these processors reach preprocessing without going through the worker "
         "pool, so they will serve at one-worker speed; either route them through "
-        "`process_and_combine_mm_data_async` or add them to "
+        "`process_and_combine_mm_data_async` / `_run_mm_processor` or add them to "
         f"_NO_WORKER_POOL_ROUTE with a reason: {sorted(newly_unrouted)}"
     )
     now_routed = _NO_WORKER_POOL_ROUTE - unrouted

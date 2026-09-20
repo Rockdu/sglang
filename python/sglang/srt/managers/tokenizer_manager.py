@@ -972,6 +972,19 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         obj: Union[GenerateReqInput, EmbeddingReqInput],
     ):
         """Tokenize one request."""
+        if (
+            isinstance(obj, GenerateReqInput)
+            and obj.mm_token_expansion_start_len is not None
+            and obj.mm_token_expansion_start_len > 0
+            and (
+                self.mm_processor is None
+                or not self.mm_processor.use_token_space_processor
+            )
+        ):
+            raise ValueError(
+                "Partial multimodal token expansion requires "
+                "--enable-token-space-processor and a supported model."
+            )
         # Tokenize
         input_embeds = None
         input_text = obj.text
@@ -1042,6 +1055,14 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if self.mm_processor.prefer_tokenized_input and input_ids is not None
                 else (input_text or input_ids)
             )
+            if self.mm_processor.use_token_space_processor:
+                mm_processor_kwargs = {
+                    "input_ids": input_ids,
+                    "input_text": input_text or "",
+                    "video_data": obj.video_data,
+                }
+            else:
+                mm_processor_kwargs = {"input_text": mm_processor_input}
 
             if (
                 not get_disagg().language_only
@@ -1064,7 +1085,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     mm_inputs = await self.mm_processor.process_mm_data_async(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
-                        input_text=mm_processor_input,
+                        **mm_processor_kwargs,
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
@@ -1079,7 +1100,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 mm_inputs = await self.mm_processor.process_mm_data_async(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
+                    **mm_processor_kwargs,
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
                 )
