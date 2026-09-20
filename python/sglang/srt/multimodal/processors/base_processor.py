@@ -1,9 +1,5 @@
 import asyncio
-import concurrent
-import concurrent.futures
-import os
 import re
-import threading
 from abc import ABC, abstractmethod
 from typing import (
     Any,
@@ -33,9 +29,7 @@ from sglang.srt.multimodal.media_processor import (
     BaseMultiModalProcessorOutput,
     MultimodalProcessorMixin,
     MultimodalSpecialTokens,
-    _tokenizer_of,
 )
-from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.multimodal.transport.cuda_ipc import (
     MM_FEATURE_CACHE_SIZE,
@@ -49,14 +43,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_serving,
 )
-from sglang.srt.utils import (
-    configure_media_url_security,
-    envs,
-    is_cpu,
-    is_npu,
-    is_xpu,
-    logger,
-)
+from sglang.srt.utils import envs, is_cpu, is_npu, is_xpu, logger
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -66,6 +53,12 @@ _is_xpu = is_xpu()
 class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     models = []
     prefer_tokenized_input = False
+    # Opt in when multimodal placeholders can be expanded directly in token ID space.
+    supports_token_expansion = False
+    token_space_processor_class = None
+    audio_end_token_id = None
+    IM_START_TOKEN_ID = None
+    IM_END_TOKEN_ID = None
     precompute_hash_before_cpu_transfer = False
     # Set by processors that already build input_ids from the request's own
     # tokens, so the retokenize-avoidance rebuild below has nothing to add.
@@ -74,13 +67,20 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
 
+    @classmethod
+    def supports_token_space_processing(cls, hf_config):
+        return cls.supports_token_expansion
+
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):
-        self.hf_config = hf_config
-        self._processor = _processor
         self.server_args = server_args
         self.transport_mode = transport_mode
+        self.use_token_space_processor = (
+            get_mm().enable_token_space_processor and self.supports_token_expansion
+        )
+        if self.supports_token_expansion:
+            self.prefer_tokenized_input = self.use_token_space_processor
         configured_mm_feature_transport = get_mm().mm_feature_transport
         self.mm_feature_transport = (
             configured_mm_feature_transport
@@ -107,28 +107,9 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             allowed_media_domains=get_mm().allowed_media_domains,
             media_url_max_file_size_mb=get_mm().media_url_max_file_size_mb,
         )
-        self.processor_config = processor_config
-
-        allowed_media_domains = processor_config.allowed_media_domains
-        media_url_max_file_size_mb = processor_config.media_url_max_file_size_mb
-        if media_url_max_file_size_mb is not None:
-            configure_media_url_security(
-                allowed_media_domains,
-                max_file_size_mb=media_url_max_file_size_mb,
-                preserve_allowed_domains=allowed_media_domains is None,
-            )
-        elif allowed_media_domains is not None:
-            configure_media_url_security(allowed_media_domains)
-
-        self.image_processor_backend = processor_config.image_processor_backend
-        if processor_config.disable_fast_image_processor:
-            self.image_processor_backend = "pil"
-        self.disable_fast_image_processor = self.image_processor_backend == "pil"
-
-        mm_process_config = processor_config.mm_process_config
-        self.image_config = mm_process_config.get("image", {})
-        self.video_config = mm_process_config.get("video", {})
-        self.audio_config = mm_process_config.get("audio", {})
+        MultimodalProcessorMixin._initialize_processor(
+            self, hf_config, _processor, processor_config=processor_config, **kwargs
+        )
 
         # Each tokenizer worker is a separate process with its own CPU cache.
         # Split the requested service-wide budget so increasing worker count
@@ -164,81 +145,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 "trusted" if self.trust_mm_content_hashes else "verified",
             )
 
-        self._tokenizer = _tokenizer_of(self._processor)
-
-        # Same guard as in serving_chat.py against double BOS.
-        try:
-            self._tokenizer_auto_adds_specials = len(self._tokenizer.encode("")) > 0
-        except Exception:
-            self._tokenizer_auto_adds_specials = False
-
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
-
-        requested_mm_io_worker_num = processor_config.mm_io_worker_num
-        env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
-        if requested_mm_io_worker_num:
-            self.mm_io_worker_num = requested_mm_io_worker_num
-            io_worker_source = "explicit"
-        elif env_mm_io_worker_num is not None:
-            self.mm_io_worker_num = int(env_mm_io_worker_num)
-            io_worker_source = "environment"
-        else:
-            self.mm_io_worker_num = self.auto_mm_io_worker_num
-            io_worker_source = "auto"
-        self.io_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=self.mm_io_worker_num,
-            thread_name_prefix="sglang-mm-io",
-        )
-        if self.mm_io_worker_num > 4:
-            logger.info(
-                "Multimodal data loading enabled with %d worker threads (%s).",
-                self.mm_io_worker_num,
-                io_worker_source,
-            )
-        skip_mm_pool = kwargs.get("skip_mm_pool", False)
-        requested_mm_processor_worker_num = processor_config.mm_processor_worker_num
-        self.mm_processor_worker_num = (
-            1
-            if skip_mm_pool
-            else requested_mm_processor_worker_num
-            or self._resolve_auto_mm_processor_worker_num()
-        )
-        if (
-            self.mm_processor_worker_num > 1
-            and not self.supports_mm_processor_concurrency
-        ):
-            logger.warning(
-                "Concurrent multimodal processing is not supported by %s; "
-                "using synchronous processing.",
-                type(self).__name__,
-            )
-            self.mm_processor_worker_num = 1
-        self.mm_processor_executor = None
-        if self.mm_processor_worker_num > 1:
-            try:
-                # A callable, not the object: subclasses finish customizing
-                # `_processor` after this returns, and the workers must clone it
-                # as the subclass left it.
-                self.mm_processor_executor = MultimodalProcessorExecutor(
-                    lambda: self._processor, self.mm_processor_worker_num
-                )
-            except Exception:
-                logger.warning(
-                    "Unable to clone the multimodal processor for concurrent "
-                    "workers; falling back to synchronous processing.",
-                    exc_info=True,
-                )
-                self.mm_processor_worker_num = 1
-        if self.mm_processor_executor is not None:
-            logger.info(
-                "Multimodal processor concurrency enabled with %d isolated "
-                "worker threads (%s).",
-                self.mm_processor_worker_num,
-                "auto" if requested_mm_processor_worker_num == 0 else "explicit",
-            )
-        self._cpu_executor_lock = threading.Lock()
-        self.cpu_executor = self._create_cpu_executor()
 
         # Mapping from attribute names to modality types
         self.ATTR_NAME_TO_MODALITY = {
@@ -284,7 +192,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             "input_features",
         ]
 
-        if self.use_cuda_ipc and not skip_mm_pool:
+        if self.use_cuda_ipc and not kwargs.get("skip_mm_pool", False):
             # SGLANG_MM_FEATURE_CACHE_MB is the total pool budget across all
             # tokenizer workers. Each worker gets an equal share so that adding
             # workers doesn't multiply the GPU-side footprint.
@@ -353,10 +261,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     def shutdown(self) -> None:
         """Drop cached artifacts and stop every processor-side executor."""
         self.clear_preprocess_cache()
-        self.io_executor.shutdown(wait=False, cancel_futures=True)
-        self.cpu_executor.shutdown(wait=False, cancel_futures=True)
-        if self.mm_processor_executor is not None:
-            self.mm_processor_executor.shutdown()
+        super().shutdown()
 
     def compute_mrope_positions(self, input_ids, mm_items):
         """Compute M-RoPE positions from expanded input_ids and multimodal items.
@@ -566,18 +471,57 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
     def process_mm_data(
         self,
-        input_text,
+        input_text="",
         images=None,
         videos=None,
         audios=None,
         processor=None,
         processor_video_config: Optional[Dict[str, Any]] = None,
+        mm_token_expansion_start_len=0,
+        *,
+        input_ids=None,
         **kwargs,
-    ) -> dict:
-        """
-        process multimodal data with transformers AutoProcessor
-        """
+    ):
+        """Process multimodal input using the instance's selected tokenization path."""
+        if not self.use_token_space_processor and (
+            input_ids is not None or mm_token_expansion_start_len
+        ):
+            raise ValueError(
+                "Synchronous token-ID processing requires "
+                "--enable-token-space-processor and a supported model."
+            )
         processor, tokenizer = self._resolve_processor(processor)
+        if self.use_token_space_processor:
+            if processor_video_config is not None:
+                kwargs["videos_kwargs"] = processor_video_config
+            if input_ids is None:
+                if mm_token_expansion_start_len:
+                    raise ValueError("Partial expansion requires input_ids.")
+                add_special_tokens = kwargs.get("add_special_tokens", True)
+                if tokenizer.bos_token and input_text.startswith(tokenizer.bos_token):
+                    add_special_tokens = False
+                input_ids = tokenizer.encode(
+                    input_text, add_special_tokens=add_special_tokens
+                )
+            media_features = self.process_media(
+                images=images,
+                videos=videos,
+                audios=audios,
+                processor=processor,
+                **kwargs,
+            )
+            mm_token_expansion_spec = self.get_mm_token_expansion_spec(
+                processor, media_features
+            )
+            expanded_input_ids = self.mm_token_expansion(
+                input_ids, mm_token_expansion_spec, mm_token_expansion_start_len
+            )
+            return self.sglang_post_process(
+                expanded_input_ids,
+                media_features,
+                mm_token_expansion_spec=mm_token_expansion_spec,
+                processor=processor,
+            )
 
         if images:
             kwargs["images"] = images
@@ -653,6 +597,154 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                         result[feature_name] = result[feature_name].to("cpu")
 
         return result
+
+    def sglang_post_process(
+        self,
+        input_ids,
+        media_features,
+        *,
+        mm_token_expansion_spec=None,
+        processor=None,
+    ):
+        """Build serving items and positions from final IDs and native media fields."""
+        processor, _ = self._resolve_processor(processor)
+        input_ids_tensor = torch.tensor([input_ids], dtype=torch.long)
+        from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
+
+        if mm_token_expansion_spec is None:
+            mm_token_expansion_spec = self.get_mm_token_expansion_spec(
+                processor, media_features
+            )
+        expansion_tokens = [
+            [torch.tensor(fragment, dtype=torch.long) for fragment in fragments]
+            for _, fragments in mm_token_expansion_spec
+        ]
+        mm_items = self.collect_mm_items_from_processor_output(media_features)
+        for modality in Modality.all():
+            modality_items = [item for item in mm_items if item.modality == modality]
+            if not modality_items:
+                continue
+            token_counts = []
+            for fragments in expansion_tokens:
+                fragment_offsets = [
+                    self.get_mm_item_offsets(fragment, self.mm_tokens, modality)
+                    for fragment in fragments
+                ]
+                if any(fragment_offsets):
+                    token_counts.extend(
+                        [end - start + 1 for start, end in offsets]
+                        for offsets in fragment_offsets
+                    )
+            if len(modality_items) == 1:
+                token_counts = [[count for counts in token_counts for count in counts]]
+            elif not token_counts:
+                token_counts = [[] for _ in modality_items]
+            offsets = self.get_mm_item_offsets(
+                input_ids_tensor[0], self.mm_tokens, modality
+            )
+            if len(token_counts) != len(modality_items) or sum(
+                sum(counts) for counts in token_counts
+            ) != sum(end - start + 1 for start, end in offsets):
+                raise ValueError(
+                    f"{modality.name.lower()} token count does not match preprocessing results; "
+                    "keep historical media and preprocessing settings unchanged"
+                )
+            offset_index = 0
+            for mm_item, counts in zip(modality_items, token_counts):
+                item_offsets = []
+                for token_count in counts:
+                    start, end = offsets[offset_index]
+                    segment_end = start + token_count - 1
+                    if segment_end > end:
+                        raise ValueError(
+                            f"{modality.name.lower()} token span does not match preprocessing results"
+                        )
+                    item_offsets.append((start, segment_end))
+                    if segment_end == end:
+                        offset_index += 1
+                    else:
+                        offsets[offset_index] = (segment_end + 1, end)
+                mm_item.offsets = item_offsets
+                if (
+                    isinstance(mm_item.feature, torch.Tensor)
+                    and not self.keep_mm_features_on_device
+                    and not self.precompute_hash_before_cpu_transfer
+                ):
+                    mm_item.feature = mm_item.feature.cpu()
+        mm_items = get_new_expanded_mm_items(mm_items)
+        position_fields = self._build_position_inputs(input_ids_tensor, media_features)
+        mm_items = self._finalize_mm_items(mm_items, images=None)
+        return MultimodalProcessorOutput(
+            input_ids=input_ids,
+            mm_items=mm_items,
+            im_token_id=self.mm_tokens.image_token_id,
+            im_start_id=self.IM_START_TOKEN_ID,
+            im_end_id=self.IM_END_TOKEN_ID,
+            video_token_id=self.mm_tokens.video_token_id,
+            audio_token_id=self.mm_tokens.audio_token_id,
+            audio_end_id=self.audio_end_token_id,
+            **position_fields,
+        )
+
+    def _build_position_inputs(self, input_ids, encoder_inputs):
+        return {}
+
+    def _get_mm_token_expansion_start_len(self, request_obj, start_len):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+
+        if start_len is None:
+            start_len = (
+                request_obj.mm_token_expansion_start_len or 0
+                if isinstance(request_obj, GenerateReqInput)
+                else 0
+            )
+        if start_len and not self.use_token_space_processor:
+            raise ValueError(
+                "Partial multimodal token expansion requires "
+                "--enable-token-space-processor and a supported model."
+            )
+        return start_len
+
+    async def process_token_space_mm_data_async(
+        self,
+        image_data=None,
+        audio_data=None,
+        input_text="",
+        request_obj=None,
+        *,
+        video_data=None,
+        input_ids=None,
+        mm_token_expansion_start_len=None,
+        max_req_input_len=None,
+        **kwargs,
+    ):
+        if input_ids is None and isinstance(input_text, list):
+            input_ids, input_text = input_text, ""
+        mm_token_expansion_start_len = self._get_mm_token_expansion_start_len(
+            request_obj, mm_token_expansion_start_len
+        )
+        if video_data is None and request_obj is not None:
+            video_data = request_obj.video_data
+        if audio_data is None and request_obj is not None:
+            audio_data = request_obj.audio_data
+        loaded_media = await self.load_mm_data(
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            audio_sample_rate=kwargs.get("audio_kwargs", {}).get(
+                "sampling_rate", kwargs.get("sampling_rate")
+            ),
+        )
+        process_kwargs = dict(
+            input_ids=input_ids,
+            input_text=input_text,
+            images=loaded_media.images,
+            videos=loaded_media.videos,
+            audios=loaded_media.audios,
+            mm_token_expansion_start_len=mm_token_expansion_start_len,
+            **kwargs,
+        )
+        return await self._run_mm_processor(self.process_mm_data, **process_kwargs)
 
     @abstractmethod
     async def process_mm_data_async(
@@ -1015,8 +1107,11 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return result = [(2,4),(6,7)]
         """
         mask = input_ids == mm_token_id
-        start_positions = (mask & ~torch.roll(mask, 1)).nonzero(as_tuple=True)[0]
-        end_positions = (mask & ~torch.roll(mask, -1)).nonzero(as_tuple=True)[0]
+        start_mask, end_mask = mask.clone(), mask.clone()
+        start_mask[1:] &= ~mask[:-1]
+        end_mask[:-1] &= ~mask[1:]
+        start_positions = start_mask.nonzero(as_tuple=True)[0]
+        end_positions = end_mask.nonzero(as_tuple=True)[0]
         return list(zip(start_positions.tolist(), end_positions.tolist()))
 
     @staticmethod

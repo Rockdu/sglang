@@ -2,12 +2,17 @@
 
     ServerArgs.base_gpu_id + current runtime policy -> serving device
     Explicit processor configuration -------------> training device
+      Serving device policy --------->|-> image kwargs <- model video override
+                                      |-> video kwargs <- request / model override
     CPU transport -> temporary CUDA pool -> CPU features -> release the pool
 
 Regression: the device decision read the published global ServerArgs, so every
 processor answered with one process-wide device. The encode-server DP workers
 each drive their own GPU, which no process-global value can express — the
 device has to come from what the worker was handed.
+Video-only and mixed requests use the same default device; PIL keeps it unset.
+The model video override also controls images in a mixed request.
+Captured modality kwargs occupy distinct keys in the merged media output.
 Runtime policy changes affect serving device/competition checks on existing instances.
 """
 
@@ -16,7 +21,13 @@ from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from transformers.processing_utils import ProcessorMixin
+
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
+from sglang.srt.multimodal.processors.token_space_processor import (
+    TokenSpaceMultimodalProcessor,
+)
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -162,6 +173,73 @@ class TestFastImageProcessorDevice(CustomTestCase):
                             processor._resolve_auto_mm_processor_worker_num(), expected
                         )
 
+    def test_media_dispatch_keeps_video_device_and_override_priority(self):
+        def capture_options(sources, processor, **kwargs):
+            return {f"{sources[0]}_options": kwargs}
+
+        # CPU-only capture at the component boundary catches a missing video device.
+        cases = (
+            (None, False, None, None, "cuda:3"),
+            (["image"], False, None, None, "cuda:3"),
+            (None, False, "cpu", None, "cpu"),
+            (None, False, "cuda:5", "cpu", "cpu"),
+            (["image"], False, "cuda:5", "cpu", "cpu"),
+            (None, True, None, None, None),
+        )
+        for images, use_pil, requested_device, model_device, expected_device in cases:
+            with self.subTest(
+                images=images,
+                use_pil=use_pil,
+                requested_device=requested_device,
+                model_device=model_device,
+            ):
+                processor = TokenSpaceMultimodalProcessor(
+                    None,
+                    _Processor(),
+                    processor_config=MultimodalProcessorConfig(
+                        device="cuda:3",
+                        mm_processor_worker_num=1,
+                    ),
+                )
+                processor.shutdown()
+                processor.use_token_space_processor = True
+                processor._processor = object.__new__(ProcessorMixin)
+                processor._tokenizer = SimpleNamespace(init_kwargs={})
+                processor._processor.tokenizer = processor._tokenizer
+                processor.image_config = {}
+                processor.video_config = {}
+                processor.audio_config = {}
+                processor.disable_fast_image_processor = use_pil
+                processor.video_preprocessing_device = model_device
+                videos_kwargs = (
+                    {} if requested_device is None else {"device": requested_device}
+                )
+                with (
+                    patch.object(
+                        processor,
+                        "_temporary_fast_processor_cuda_pool",
+                        return_value=nullcontext(),
+                    ),
+                    patch.object(
+                        processor,
+                        "process_images",
+                        new=capture_options,
+                    ),
+                    patch.object(
+                        processor,
+                        "process_videos",
+                        new=capture_options,
+                    ),
+                ):
+                    output = processor.process_media(
+                        images=images,
+                        videos=["video"],
+                        videos_kwargs=videos_kwargs,
+                    )
+                self.assertEqual(output["video_options"].get("device"), expected_device)
+                if images:
+                    self.assertEqual(output["image_options"]["device"], expected_device)
+
 
 class TestFastImageProcessorMemoryPool(CustomTestCase):
     def setUp(self):
@@ -171,6 +249,7 @@ class TestFastImageProcessorMemoryPool(CustomTestCase):
     def _processor(self, *, transport="cpu", precompute_hash=False):
         processor = _make(base_gpu_id=0)
         processor.mm_feature_transport = transport
+        processor.use_token_space_processor = False
         processor.precompute_hash_before_cpu_transfer = precompute_hash
         return processor
 

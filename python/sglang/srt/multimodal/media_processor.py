@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import dataclasses
 import multiprocessing as mp
+import os
 import re
 import threading
 from contextlib import contextmanager
@@ -13,10 +14,13 @@ from PIL import Image
 from transformers import BaseImageProcessor
 
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
+from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.srt.utils import (
     CLIENT_MEDIA_EXCEPTIONS,
     ImageData,
     VideoData,
+    configure_media_url_security,
     load_audio,
     load_image,
     load_video,
@@ -169,21 +173,130 @@ def _tokenizer_of(processor):
 
 
 class MultimodalProcessorMixin:
-    use_token_space_processor = False
+    """Share media loading and preprocessing resources across training and serving."""
+
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
     video_preprocessing_device = None
+    use_token_space_processor = False
     # None lets the worker count follow where preprocessing actually runs; a
     # model that measured its own optimum assigns a number instead. See
     # `_resolve_auto_mm_processor_worker_num`.
     auto_mm_processor_worker_num = None
     auto_mm_io_worker_num = 4
-    # Processors opt out only when their preprocessing is not thread-safe. The
-    # worker pool gives each thread its own `copy.deepcopy` of the HF processor
-    # and injects it, and the single function it runs --
-    # `process_and_combine_mm_data` -- resolves that clone instead of
-    # `self._processor`, so isolation does not depend on the subclass.
+    # Workers receive isolated HF processor clones; models may opt out of concurrency.
     supports_mm_processor_concurrency = True
+    keep_mm_features_on_device = True
+
+    def _initialize_processor(
+        self, hf_config, _processor=None, *, processor_config=None, **kwargs
+    ):
+        self.hf_config = hf_config
+        self._processor = _processor
+        if processor_config is None:
+            processor_config = MultimodalProcessorConfig()
+        self.processor_config = processor_config
+
+        allowed_media_domains = processor_config.allowed_media_domains
+        media_url_max_file_size_mb = processor_config.media_url_max_file_size_mb
+        if media_url_max_file_size_mb is not None:
+            configure_media_url_security(
+                allowed_media_domains,
+                max_file_size_mb=media_url_max_file_size_mb,
+                preserve_allowed_domains=allowed_media_domains is None,
+            )
+        elif allowed_media_domains is not None:
+            configure_media_url_security(allowed_media_domains)
+
+        self.image_processor_backend = processor_config.image_processor_backend
+        if processor_config.disable_fast_image_processor:
+            self.image_processor_backend = "pil"
+        self.disable_fast_image_processor = self.image_processor_backend == "pil"
+
+        mm_process_config = processor_config.mm_process_config
+        self.image_config = mm_process_config.get("image", {})
+        self.video_config = mm_process_config.get("video", {})
+        self.audio_config = mm_process_config.get("audio", {})
+
+        self._tokenizer = _tokenizer_of(self._processor)
+
+        # Same guard as in serving_chat.py against double BOS.
+        try:
+            self._tokenizer_auto_adds_specials = len(self._tokenizer.encode("")) > 0
+        except Exception:
+            self._tokenizer_auto_adds_specials = False
+
+        requested_mm_io_worker_num = processor_config.mm_io_worker_num
+        env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
+        if requested_mm_io_worker_num:
+            self.mm_io_worker_num = requested_mm_io_worker_num
+            io_worker_source = "explicit"
+        elif env_mm_io_worker_num is not None:
+            self.mm_io_worker_num = int(env_mm_io_worker_num)
+            io_worker_source = "environment"
+        else:
+            self.mm_io_worker_num = self.auto_mm_io_worker_num
+            io_worker_source = "auto"
+        self.io_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=self.mm_io_worker_num,
+            thread_name_prefix="sglang-mm-io",
+        )
+        if self.mm_io_worker_num > 4:
+            logger.info(
+                "Multimodal data loading enabled with %d worker threads (%s).",
+                self.mm_io_worker_num,
+                io_worker_source,
+            )
+        skip_mm_pool = kwargs.get("skip_mm_pool", False)
+        requested_mm_processor_worker_num = processor_config.mm_processor_worker_num
+        self.mm_processor_worker_num = (
+            1
+            if skip_mm_pool
+            else requested_mm_processor_worker_num
+            or self._resolve_auto_mm_processor_worker_num()
+        )
+        if (
+            self.mm_processor_worker_num > 1
+            and not self.supports_mm_processor_concurrency
+        ):
+            logger.warning(
+                "Concurrent multimodal processing is not supported by %s; "
+                "using synchronous processing.",
+                type(self).__name__,
+            )
+            self.mm_processor_worker_num = 1
+        self.mm_processor_executor = None
+        if self.mm_processor_worker_num > 1:
+            try:
+                # A callable, not the object: subclasses finish customizing
+                # `_processor` after this returns, and the workers must clone it
+                # as the subclass left it.
+                self.mm_processor_executor = MultimodalProcessorExecutor(
+                    lambda: self._processor, self.mm_processor_worker_num
+                )
+            except Exception:
+                logger.warning(
+                    "Unable to clone the multimodal processor for concurrent "
+                    "workers; falling back to synchronous processing.",
+                    exc_info=True,
+                )
+                self.mm_processor_worker_num = 1
+        if self.mm_processor_executor is not None:
+            logger.info(
+                "Multimodal processor concurrency enabled with %d isolated "
+                "worker threads (%s).",
+                self.mm_processor_worker_num,
+                "auto" if requested_mm_processor_worker_num == 0 else "explicit",
+            )
+        self._cpu_executor_lock = threading.Lock()
+        self.cpu_executor = self._create_cpu_executor()
+
+    def shutdown(self) -> None:
+        """Stop every processor-side executor."""
+        self.io_executor.shutdown(wait=False, cancel_futures=True)
+        self.cpu_executor.shutdown(wait=False, cancel_futures=True)
+        if self.mm_processor_executor is not None:
+            self.mm_processor_executor.shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
         return concurrent.futures.ProcessPoolExecutor(
@@ -320,6 +433,22 @@ class MultimodalProcessorMixin:
             pool = torch.cuda.MemPool()
         with torch.cuda.use_mem_pool(pool, device=device):
             yield
+
+    async def _run_mm_processor(self, function, **kwargs):
+        if self.mm_processor_executor is not None:
+            return await self.mm_processor_executor.run(function, **kwargs)
+
+        def process_request():
+            with self._cpu_executor_lock:
+                return function(**kwargs)
+
+        return await asyncio.get_running_loop().run_in_executor(
+            self.io_executor, process_request
+        )
+
+    async def process_media_async(self, **kwargs):
+        """Process loaded media with the instance's isolated processor workers."""
+        return await self._run_mm_processor(self.process_media, **kwargs)
 
     @classmethod
     def _load_single_item(
@@ -503,6 +632,36 @@ class MultimodalProcessorMixin:
         MultimodalProcessorMixin._validate_one_modality(Modality.VIDEO, video_data)
         MultimodalProcessorMixin._validate_one_modality(Modality.AUDIO, audio_data)
 
+    async def load_mm_data(
+        self,
+        prompt=None,
+        multimodal_tokens=None,
+        image_data=None,
+        video_data=None,
+        audio_data=None,
+        return_text=False,
+        discard_alpha_channel=True,
+        audio_sample_rate=None,
+    ) -> BaseMultiModalProcessorOutput:
+        self.validate_mm_data(image_data, video_data, audio_data)
+        if audio_data:
+            audio_sample_rate = self.audio_config.get(
+                "sampling_rate", audio_sample_rate
+            )
+            if audio_sample_rate is None:
+                audio_sample_rate = self._processor.feature_extractor.sampling_rate
+        return await self.fast_load_mm_data(
+            prompt=prompt,
+            multimodal_tokens=multimodal_tokens,
+            image_data=image_data,
+            video_data=video_data,
+            audio_data=audio_data,
+            return_text=return_text,
+            discard_alpha_channel=discard_alpha_channel,
+            audio_sample_rate=audio_sample_rate,
+            input_ids=prompt if isinstance(prompt, list) else None,
+        )
+
     async def fast_load_mm_data(
         self,
         prompt: Optional[Union[str, List[int]]],
@@ -619,4 +778,33 @@ class MultimodalProcessorMixin:
             videos=videos,
             input_text=prompt_str,
             input_ids=input_ids,
+        )
+
+    @classmethod
+    def _process_video_item(cls, video, process_video):
+        from sglang.srt.utils.video_decoder import VideoDecoderWrapper
+
+        if cls._is_preprocessed_input(video):
+            return video, None
+        try:
+            return process_video(video)
+        finally:
+            if isinstance(video, VideoDecoderWrapper):
+                video.close()
+
+    async def process_video_data_async(self, videos, process_video):
+        """Process loaded videos concurrently, returning pixels and aligned metadata."""
+        loop = asyncio.get_running_loop()
+        futures = [
+            loop.run_in_executor(
+                self.io_executor, self._process_video_item, video, process_video
+            )
+            for video in videos
+        ]
+        # Queued jobs must still release their readers if the request is cancelled.
+        results = await asyncio.shield(asyncio.gather(*futures))
+        processed_videos = [video for video, _ in results]
+        video_metadata = [metadata for _, metadata in results]
+        return processed_videos, (
+            video_metadata if any(item is not None for item in video_metadata) else None
         )
