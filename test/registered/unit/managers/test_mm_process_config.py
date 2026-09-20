@@ -1,3 +1,16 @@
+"""Multimodal configuration controls processor routing and feature transport.
+
+startup opt-in + model capability -> registry attaches member -> fixed route
+  selected    -> explicit input_ids + textual input_text -> shared processing
+  unselected  -> original text/ID preference              -> legacy processing
+video input -> read from the request on both routes
+partial prefix + unselected route -> reject before media work
+
+modality config -> processor kwargs -> features -> CPU / IPC / VMM transport
+"""
+
+import argparse
+import asyncio
 import os
 import threading
 import unittest
@@ -81,6 +94,8 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         mm_processor_worker_num=0,
         mm_io_worker_num=0,
         image_processor=None,
+        enable_token_space_processor=False,
+        through_registry=False,
     ):
         """Create a BaseMultimodalProcessor via the real __init__ with mocked deps."""
         from sglang.srt.multimodal.processors.base_processor import (
@@ -89,6 +104,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
 
         override = get_context().override_server_args(
             mm_process_config=mm_process_config,
+            enable_token_space_processor=enable_token_space_processor,
             allowed_media_domains=[],
             mm_processor_worker_num=mm_processor_worker_num,
             mm_io_worker_num=mm_io_worker_num,
@@ -107,6 +123,7 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
         server_args = ServerArgs(
             model_path="dummy",
             mm_process_config=mm_process_config,
+            enable_token_space_processor=enable_token_space_processor,
             allowed_media_domains=[],
             mm_processor_worker_num=mm_processor_worker_num,
             mm_io_worker_num=mm_io_worker_num,
@@ -124,15 +141,165 @@ class TestBaseProcessorConfigExtraction(CustomTestCase):
 
         # Call real __init__ so we test actual config extraction
         with patch.object(BaseMultimodalProcessor, "__abstractmethods__", set()):
-            proc = BaseMultimodalProcessor(
-                hf_config=hf_config,
-                server_args=server_args,
-                _processor=mock_hf_processor,
-                transport_mode=None,
-            )
+            if through_registry:
+                from sglang.srt.managers.multimodal_processor import (
+                    PROCESSOR_MAPPING,
+                    get_mm_processor,
+                )
+
+                class TestModel:
+                    pass
+
+                hf_config.architectures = ["TestModel"]
+                with patch.dict(
+                    PROCESSOR_MAPPING, {TestModel: BaseMultimodalProcessor}, clear=True
+                ):
+                    proc = get_mm_processor(
+                        hf_config, server_args, mock_hf_processor, None
+                    )
+            else:
+                proc = BaseMultimodalProcessor(
+                    hf_config=hf_config,
+                    server_args=server_args,
+                    _processor=mock_hf_processor,
+                    transport_mode=None,
+                )
         if proc.mm_processor_executor is not None:
             self.addCleanup(proc.mm_processor_executor.shutdown)
         return proc
+
+    def test_startup_selection_controls_manager_inputs_and_partial_expansion(self):
+        from sglang.srt.managers.io_struct import GenerateReqInput
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.srt.multimodal.processors.base_processor import (
+            BaseMultimodalProcessor,
+        )
+        from sglang.srt.multimodal.token_space.process_strategy import (
+            TokenSpaceProcessStrategy,
+        )
+
+        self.enterContext(
+            patch.object(
+                BaseMultimodalProcessor,
+                "token_space_process_strategy_class",
+                TokenSpaceProcessStrategy,
+            )
+        )
+
+        class Dispatched(Exception):
+            pass
+
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        input_ids = [10, 101, 11]
+
+        async def tokenize_texts(*args):
+            return input_ids, None
+
+        for enabled, supported, legacy_prefers_ids in (
+            (False, True, True),
+            (True, True, False),
+            (True, False, False),
+            (True, False, True),
+        ):
+            options = ["--model", "dummy"]
+            if enabled:
+                options.append("--enable-token-space-processor")
+            server_args = ServerArgs.from_cli_args(parser.parse_args(options))
+            self.enterContext(
+                patch.object(
+                    BaseMultimodalProcessor,
+                    "supports_token_space_processing",
+                    classmethod(lambda cls, hf_config, supported=supported: supported),
+                )
+            )
+            self.enterContext(
+                patch.object(
+                    BaseMultimodalProcessor,
+                    "prefer_tokenized_input",
+                    legacy_prefers_ids,
+                )
+            )
+            processor = self._make_processor(
+                {},
+                mm_processor_worker_num=1,
+                enable_token_space_processor=server_args.enable_token_space_processor,
+                through_registry=True,
+            )
+            self.assertEqual(processor.use_token_space_processor, enabled and supported)
+            calls = []
+
+            def capture_request(entry):
+                async def capture(**kwargs):
+                    calls.append((entry, kwargs))
+                    raise Dispatched
+
+                return capture
+
+            processor.process_mm_data_async = capture_request("legacy")
+            processor.process_token_space_mm_data_async = capture_request("token_space")
+            manager = object.__new__(TokenizerManager)
+            manager.mm_processor = processor
+            manager.tokenizer = object()
+            manager._tokenize_texts = tokenize_texts
+            manager.model_config = SimpleNamespace(
+                hf_config=SimpleNamespace(architectures=["test"])
+            )
+            manager.max_req_input_len = 4096
+            manager._validate_mm_limits = lambda request: None
+            manager._normalize_mm_content_hashes = lambda request: None
+            selected = enabled and supported
+            for language_only in (False, True):
+                disagg = SimpleNamespace(
+                    language_model_only=False,
+                    language_only=language_only,
+                    encoder_transfer_backend="zmq_to_scheduler",
+                )
+                for text, boundary in (("image prompt", None), (None, None), (None, 1)):
+                    request = GenerateReqInput(
+                        text=text,
+                        input_ids=None if text else input_ids,
+                        image_data=["image"],
+                        video_data=["video"],
+                        mm_token_expansion_start_len=boundary,
+                    )
+                    with (
+                        self.subTest(
+                            enabled=enabled,
+                            supported=supported,
+                            legacy_prefers_ids=legacy_prefers_ids,
+                            language_only=language_only,
+                            text=text,
+                            boundary=boundary,
+                        ),
+                        patch(
+                            "sglang.srt.managers.tokenizer_manager.get_disagg",
+                            return_value=disagg,
+                        ),
+                    ):
+                        if boundary and not selected:
+                            with self.assertRaisesRegex(
+                                ValueError, "--enable-token-space-processor"
+                            ):
+                                asyncio.run(manager._tokenize_one_request(request))
+                            continue
+                        with self.assertRaises(Dispatched):
+                            asyncio.run(manager._tokenize_one_request(request))
+                        entry, kwargs = calls[-1]
+                        self.assertIs(kwargs["request_obj"], request)
+                        self.assertEqual(request.video_data, ["video"])
+                        self.assertNotIn("video_data", kwargs)
+                        if selected:
+                            self.assertEqual(entry, "token_space")
+                            self.assertIs(kwargs["input_ids"], input_ids)
+                            self.assertEqual(kwargs["input_text"], text or "")
+                        else:
+                            self.assertEqual(entry, "legacy")
+                            self.assertNotIn("input_ids", kwargs)
+                            expected = (
+                                input_ids if legacy_prefers_ids else text or input_ids
+                            )
+                            self.assertEqual(kwargs["input_text"], expected)
 
     def test_configs_extracted(self):
         config = {

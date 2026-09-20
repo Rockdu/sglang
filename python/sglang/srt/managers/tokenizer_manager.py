@@ -1042,6 +1042,25 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if self.mm_processor.prefer_tokenized_input and input_ids is not None
                 else (input_text or input_ids)
             )
+            if self.mm_processor.use_token_space_processor:
+                process_mm_data_async_func = (
+                    self.mm_processor.process_token_space_mm_data_async
+                )
+                mm_processor_kwargs = {
+                    "input_ids": input_ids,
+                    "input_text": input_text or "",
+                }
+            else:
+                if (
+                    isinstance(obj, GenerateReqInput)
+                    and obj.mm_token_expansion_start_len
+                ):
+                    raise ValueError(
+                        "Partial multimodal token expansion requires "
+                        "--enable-token-space-processor and a supported model."
+                    )
+                process_mm_data_async_func = self.mm_processor.process_mm_data_async
+                mm_processor_kwargs = {"input_text": mm_processor_input}
 
             if (
                 not get_disagg().language_only
@@ -1061,10 +1080,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                             "Encoder embedding not available, "
                             "falling back to local mm processing"
                         )
-                    mm_inputs = await self.mm_processor.process_mm_data_async(
+                    mm_inputs = await process_mm_data_async_func(
                         image_data=obj.image_data,
                         audio_data=obj.audio_data,
-                        input_text=mm_processor_input,
+                        **mm_processor_kwargs,
                         request_obj=obj,
                         max_req_input_len=self.max_req_input_len,
                     )
@@ -1076,10 +1095,10 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             ):
                 # In language_only mode with zmq_to_scheduler/mooncake, if we didn't dispatch
                 # to encoder (e.g., only one image), process locally like non-language_only mode
-                mm_inputs = await self.mm_processor.process_mm_data_async(
+                mm_inputs = await process_mm_data_async_func(
                     image_data=obj.image_data,
                     audio_data=obj.audio_data,
-                    input_text=mm_processor_input,
+                    **mm_processor_kwargs,
                     request_obj=obj,
                     max_req_input_len=self.max_req_input_len,
                 )
