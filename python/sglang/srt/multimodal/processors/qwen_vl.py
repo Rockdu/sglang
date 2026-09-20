@@ -5,6 +5,10 @@ from typing import List, Optional, Union
 
 import torch
 from PIL import Image
+from transformers import BaseImageProcessor
+from transformers.models.qwen3_vl.video_processing_qwen3_vl import (
+    Qwen3VLVideoProcessor,
+)
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
@@ -74,9 +78,17 @@ async def preprocess_video(
     vr,
     image_factor: int = IMAGE_FACTOR,
     video_config: dict = {},
+    *,
+    video_processor=None,
+    resize_raw_frames=False,
 ):
     return preprocess_video_sync(
-        vr, image_factor=image_factor, video_config=video_config
+        vr,
+        image_factor=image_factor,
+        video_config=video_config,
+        video_processor=video_processor,
+        processor_kwargs=video_config,
+        resize_raw_frames=resize_raw_frames,
     )
 
 
@@ -595,9 +607,27 @@ class QwenVLImageProcessor(QwenSGLangTokenSpaceProcessor):
         load_time = time.perf_counter()
         rid = getattr(request_obj, "rid", "anonymous_rid")
 
+        video_processor = getattr(self._processor, "video_processor", None)
+        video_processor_kwargs = dict(self.video_config)
+        if isinstance(video_processor, Qwen3VLVideoProcessor):
+            video_device = self.video_preprocessing_device
+            if (
+                video_device is None
+                and isinstance(self._processor.image_processor, BaseImageProcessor)
+                and not self.disable_fast_image_processor
+            ):
+                video_device = self._fast_image_processor_device(self._processor)
+            if video_device is not None:
+                video_processor_kwargs["device"] = video_device
         base_output.videos, video_metadata = await self.process_video_data_async(
             base_output.videos,
-            partial(preprocess_video_sync, video_config=self.video_config),
+            partial(
+                preprocess_video_sync,
+                video_config=self.video_config,
+                video_processor=video_processor,
+                processor_kwargs=video_processor_kwargs,
+                resize_raw_frames=True,
+            ),
         )
         preprocess_time = time.perf_counter()
 
@@ -606,10 +636,15 @@ class QwenVLImageProcessor(QwenSGLangTokenSpaceProcessor):
             self.video_config, video_metadata
         )
         if processor_video_config is not None:
+            if isinstance(video_processor, Qwen3VLVideoProcessor):
+                processor_video_config["do_resize"] = False
+                processor_video_config["input_data_format"] = "channels_first"
             processor_kwargs["processor_video_config"] = processor_video_config
 
         # NOTE: for qwen3-vl, video_meta need to be passed in, since do_sample_frames is already done in preprocess_video
-        if self.hf_config.model_type in (
+        if isinstance(
+            video_processor, Qwen3VLVideoProcessor
+        ) or self.hf_config.model_type in (
             "qwen3_vl",
             "qwen3_vl_moe",
             "qwen3_5",

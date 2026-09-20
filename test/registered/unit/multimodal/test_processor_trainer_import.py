@@ -1,11 +1,12 @@
 """A fresh trainer uses shared processor pools without loading inference modules.
 
 fresh Python -> independent Qwen + explicit processor config
-                serving Base, model wrapper and ServerArgs imports forbidden
-                                                   |
-              PNG path -> shared IO + clone pools -> BatchFeature
-                                                   |
-                       shared CPU pool + token expansion -> shutdown
+                     |
+PNG / video frames -> shared IO + clone pools -> native BatchFeature
+                     |
+CPU pool + token expansion -> shutdown -> executor submission rejected
+
+Serving Base, model wrappers, ServerArgs and inference kernel imports are forbidden.
 """
 
 import os
@@ -101,6 +102,15 @@ def test_trainer_uses_shared_pools_without_inference_imports():
             loaded = await processor.load_mm_data(image_data=[str(image_path)])
             return await processor.process_media_async(images=loaded.images)
 
+        async def process_video(frames, metadata):
+            loaded = await processor.load_mm_data(video_data=[frames])
+            return await processor.process_media_async(
+                videos=loaded.videos,
+                videos_kwargs={
+                    "do_sample_frames": False, "video_metadata": [metadata],
+                },
+            )
+
         try:
             with tempfile.TemporaryDirectory() as directory:
                 image_path = Path(directory) / "image.png"
@@ -115,6 +125,25 @@ def test_trainer_uses_shared_pools_without_inference_imports():
             spec = processor.get_mm_token_expansion_spec(hf_processor, features)
             assert processor.mm_token_expansion([4, 2, 5], spec) == [4, 2, 2, 2, 2, 5]
 
+            frames = (torch.arange(4 * 3 * 56 * 56) % 256).to(torch.uint8)
+            frames = frames.reshape(4, 3, 56, 56)
+            metadata = {
+                "fps": 2.0, "total_num_frames": 4, "frames_indices": [0, 1, 2, 3],
+            }
+            video_features = asyncio.run(process_video(frames, metadata))
+            expected_video = hf_processor(
+                text="<|video_pad|>", videos=[frames],
+                video_metadata=[dict(metadata)], do_sample_frames=False,
+                return_tensors="pt",
+            )
+            for name in ("pixel_values_videos", "video_grid_thw"):
+                assert torch.equal(video_features[name], expected_video[name]), name
+            video_spec = processor.get_mm_token_expansion_spec(
+                hf_processor, video_features,
+            )
+            assert processor.mm_token_expansion([3], video_spec) == (
+                expected_video["input_ids"][0].tolist()
+            )
             assert processor.cpu_executor.submit(sum, [2, 3]).result(timeout=20) == 5
             assert not hasattr(processor, "runtime_context")
             assert not hasattr(processor, "server_args")
