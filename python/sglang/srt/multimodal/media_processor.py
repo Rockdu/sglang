@@ -26,8 +26,8 @@ from sglang.srt.utils import (
 
 @dataclasses.dataclass
 class BaseMultiModalProcessorOutput:
-    # input_text with all multimodality placeholder token expanded
-    input_text: str
+    # Legacy prompt text; None for token-space media loading.
+    input_text: Optional[str]
 
     # original pre-tokenized ids, useful for processor_output/precomputed inputs,
     # when they already carry the input ids
@@ -172,6 +172,7 @@ class MultimodalProcessorMixin:
 
     gpu_image_decode = True  # Enable GPU decoding by default
     smart_rgb_conversion = False
+    use_token_space_processor = False
     auto_mm_io_worker_num = 4
     # Processors opt out only when their preprocessing is not thread-safe. The
     # worker pool gives each thread its own `copy.deepcopy` of the HF processor
@@ -505,7 +506,7 @@ class MultimodalProcessorMixin:
 
     async def fast_load_mm_data(
         self,
-        prompt: str,
+        prompt: Optional[Union[str, List[int]]],
         multimodal_tokens: MultimodalSpecialTokens,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
@@ -522,11 +523,16 @@ class MultimodalProcessorMixin:
         The behavior is as follows:
           1. It runs `_load_single_item` for all input data concurrently.
           2. It returns the loaded images, videos, and audios in their original order.
-          3. It returns the input prompt as a string.
+          3. With `use_token_space_processor`, it never detokenizes the prompt
+             and always returns `input_text=None`, preserving token IDs unchanged.
+             Otherwise, it returns text using the original prompt conversion.
         """
 
-        # Convert prompt into str
-        if isinstance(prompt, list) and return_text:
+        if self.use_token_space_processor:
+            if input_ids is None and isinstance(prompt, list):
+                input_ids = prompt
+            prompt_str = None
+        elif isinstance(prompt, list) and return_text:
             assert len(prompt) and isinstance(prompt[0], int)
             prompt_str = self._tokenizer.decode(prompt)
         else:

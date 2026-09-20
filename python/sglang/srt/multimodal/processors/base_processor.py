@@ -757,8 +757,8 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
 
     async def load_mm_data(
         self,
-        prompt: str,
-        multimodal_tokens: MultimodalSpecialTokens,
+        prompt: Optional[Union[str, List[int]]] = None,
+        multimodal_tokens: MultimodalSpecialTokens = None,
         image_data: Optional[list] = None,
         video_data: Optional[list] = None,
         audio_data: Optional[list] = None,
@@ -769,6 +769,19 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         BaseMultimodalProcessor.validate_mm_data(image_data, video_data, audio_data)
 
         input_ids = prompt if isinstance(prompt, list) else None
+        if self.use_token_space_processor:
+            return await self.fast_load_mm_data(
+                prompt=prompt,
+                multimodal_tokens=multimodal_tokens,
+                image_data=image_data,
+                video_data=video_data,
+                audio_data=audio_data,
+                return_text=False,
+                discard_alpha_channel=discard_alpha_channel,
+                audio_sample_rate=audio_sample_rate,
+                input_ids=input_ids,
+            )
+
         if input_ids is not None and self._all_mm_data_is_preprocessed(
             image_data, video_data, audio_data
         ):
