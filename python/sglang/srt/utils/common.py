@@ -1565,6 +1565,8 @@ def _normalize_media_domain(domain: str) -> str:
 def configure_media_url_security(
     allowed_media_domains: Optional[Sequence[str]] = None,
     max_file_size_mb: int = _DEFAULT_MEDIA_URL_MAX_FILE_SIZE_MB,
+    *,
+    preserve_allowed_domains: bool = False,
 ) -> list[str]:
     """Configure process-wide safeguards for client-supplied media URLs.
 
@@ -1576,10 +1578,12 @@ def configure_media_url_security(
     if max_file_size_mb < 0:
         raise ValueError("media_url_max_file_size_mb must be non-negative")
 
-    normalized_domains = sorted(
-        {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
-    )
     global _allowed_media_domains, _media_url_max_file_size_bytes
+    normalized_domains = sorted(
+        _allowed_media_domains
+        if preserve_allowed_domains
+        else {_normalize_media_domain(domain) for domain in allowed_media_domains or []}
+    )
     _allowed_media_domains = frozenset(normalized_domains)
     _media_url_max_file_size_bytes = max_file_size_mb * 1024 * 1024
     return normalized_domains

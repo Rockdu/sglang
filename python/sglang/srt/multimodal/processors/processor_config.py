@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Optional
 
 
 @dataclass
@@ -18,3 +18,5 @@ class MultimodalProcessorConfig:
         )
     )
     cpu_process_start_method: str = "spawn"
+    # Unset domains inherit the process allowlist; an explicit [] clears it.
+    allowed_media_domains: Optional[list[str]] = None
