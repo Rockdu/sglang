@@ -263,6 +263,7 @@ class BaseMultimodalProcessor(ABC):
             disable_fast_image_processor=get_mm().disable_fast_image_processor,
             mm_process_config=get_mm().mm_process_config,
             mm_processor_worker_num=get_mm().mm_processor_worker_num,
+            mm_io_worker_num=get_mm().mm_io_worker_num,
         )
         self.processor_config = processor_config
 
@@ -321,7 +322,7 @@ class BaseMultimodalProcessor(ABC):
         # FIXME: not accurate, model and image specific
         self.NUM_TOKEN_PER_FRAME = 330
 
-        requested_mm_io_worker_num = get_mm().mm_io_worker_num
+        requested_mm_io_worker_num = processor_config.mm_io_worker_num
         env_mm_io_worker_num = os.environ.get("SGLANG_IO_WORKERS")
         if requested_mm_io_worker_num:
             self.mm_io_worker_num = requested_mm_io_worker_num
