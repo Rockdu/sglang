@@ -8,6 +8,7 @@ from unittest.mock import Mock
 import pytest
 
 from sglang.srt.multimodal.processors.llava import LlavaImageProcessor
+from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=13, suite="base-a-test-cpu")
@@ -96,7 +97,9 @@ def test_broken_pool_is_replaced_once_for_concurrent_failures():
 def test_replacement_pool_runs_after_real_worker_exit(monkeypatch):
     monkeypatch.setenv("SGLANG_CPU_WORKERS", "1")
     processor = object.__new__(LlavaImageProcessor)
-    processor.mm_feature_transport = "cpu"
+    processor.processor_config = MultimodalProcessorConfig(
+        cpu_process_start_method="fork"
+    )
     processor._cpu_executor_lock = threading.Lock()
     failed_executor = processor._create_cpu_executor()
     processor.cpu_executor = failed_executor

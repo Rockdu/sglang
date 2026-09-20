@@ -258,12 +258,17 @@ class BaseMultimodalProcessor(ABC):
         )
         self.skip_tokenizer_init = get_serving().skip_tokenizer_init
 
+        cpu_process_start_method = (
+            "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
+        )
+
         processor_config = MultimodalProcessorConfig(
             image_processor_backend=get_mm().image_processor_backend,
             disable_fast_image_processor=get_mm().disable_fast_image_processor,
             mm_process_config=get_mm().mm_process_config,
             mm_processor_worker_num=get_mm().mm_processor_worker_num,
             mm_io_worker_num=get_mm().mm_io_worker_num,
+            cpu_process_start_method=cpu_process_start_method,
         )
         self.processor_config = processor_config
 
@@ -506,9 +511,8 @@ class BaseMultimodalProcessor(ABC):
             self.mm_processor_executor.shutdown()
 
     def _create_cpu_executor(self) -> concurrent.futures.ProcessPoolExecutor:
-        start_method = "spawn" if self.mm_feature_transport == "cuda_vmm" else "fork"
         return concurrent.futures.ProcessPoolExecutor(
-            mp_context=mp.get_context(start_method),
+            mp_context=mp.get_context(self.processor_config.cpu_process_start_method),
             max_workers=int(os.environ.get("SGLANG_CPU_WORKERS", os.cpu_count())),
         )
 
