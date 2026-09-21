@@ -18,6 +18,7 @@
 Real HF processors provide feature/token references without model weights.
 Partial expansion takes trailing media, preserves history and never decodes IDs.
 Reader/frame batches retain native sampling, resize, channels and reader closure.
+Pre-sampled Qwen3.5/Flash frames retain all frames and explicit resize dimensions.
 Grouped video and padded audio retain source order, masks and shared tensor views.
 Serving keeps legacy video bundling; adjacent image spans split by expansion lengths.
 Bare-placeholder fixtures stub position building; complete prompts exercise MRoPE.
@@ -583,6 +584,53 @@ class TestQwenTokenizedMedia(CustomTestCase):
                 for item in serving.mm_items:
                     self.assertNotIn("video_metadata", item.model_specific_data)
                     self.assertIsInstance(item.video_grid_thw, torch.Tensor)
+
+    def test_presampled_video_frames_keep_legacy_sampling_and_resize(self):
+        # Sixteen supplied frames exceed HF's default four-frame resampling result.
+        video = (
+            torch.arange(16 * 112 * 168 * 3)
+            .remainder(251)
+            .to(torch.uint8)
+            .reshape(16, 112, 168, 3)
+        )
+        for model_type in ("qwen3_5", "qwen4_exp"):
+            for resize_options in ({}, {"resized_height": 64, "resized_width": 64}):
+                with self.subTest(model_type=model_type, resize_options=resize_options):
+                    processor = _make_hf_processor(
+                        Qwen3VLProcessor, 16, model_type=model_type
+                    )
+                    processor.video_config = {
+                        "input_data_format": "channels_last",
+                        **resize_options,
+                    }
+                    frames, metadata = preprocess_video_sync(
+                        video,
+                        video_config=processor.video_config,
+                        video_processor=processor._processor.video_processor,
+                        processor_kwargs=processor.video_config,
+                        resize_raw_frames=True,
+                    )
+                    reference = processor._processor(
+                        text="<|video_pad|>",
+                        videos=[frames],
+                        video_metadata=[metadata],
+                        do_sample_frames=False,
+                        do_resize=False,
+                        input_data_format="channels_first",
+                        add_special_tokens=False,
+                        return_tensors="pt",
+                    )
+                    media = processor.process_media(videos=[video])
+                    for key in ("pixel_values_videos", "video_grid_thw"):
+                        self.assert_tensor_bytes_equal(media[key], reference[key])
+                    expanded = processor.mm_token_expansion(
+                        [VIDEO],
+                        processor.get_mm_token_expansion_spec(
+                            processor._processor, media
+                        ),
+                    )
+                    self.assertEqual(expanded, reference["input_ids"][0].tolist())
+                    self.assertEqual(media["video_grid_thw"][0, 0].item(), 8)
 
     def test_video_option_groups_preserve_source_order_and_serving_views(self):
         processor = _make_hf_processor(Qwen3VLProcessor, 16)

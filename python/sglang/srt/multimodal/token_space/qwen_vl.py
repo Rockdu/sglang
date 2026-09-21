@@ -474,11 +474,14 @@ class QwenTokenSpaceProcessor(TokenSpaceMultimodalProcessor):
                     video_config=config,
                     video_processor=video_processor,
                     processor_kwargs=processor_kwargs,
+                    resize_raw_frames=True,
                 )
             finally:
                 if isinstance(video, VideoDecoderWrapper):
                     video.close()
-            if metadata is None and supplied_metadata is not None:
+            if supplied_metadata is not None and not isinstance(
+                video, VideoDecoderWrapper
+            ):
                 metadata = supplied_metadata[index]
             if metadata is not None:
                 processor_kwargs = {
@@ -487,7 +490,7 @@ class QwenTokenSpaceProcessor(TokenSpaceMultimodalProcessor):
                     if key not in QWEN_VIDEO_PREPROCESS_CONFIG_KEYS - {"fps"}
                 }
                 processor_kwargs["do_sample_frames"] = False
-            if native_video_resize and isinstance(video, VideoDecoderWrapper):
+            if native_video_resize:
                 processor_kwargs["do_resize"] = False
                 processor_kwargs["input_data_format"] = "channels_first"
             processor_kwargs["return_metadata"] = True
