@@ -2,6 +2,7 @@
 
     published ServerArgs -> registry -> Qwen serving processor
     startup opt-in -> token-space route    disabled -> original route
+    both routes -> CPU auto: 2; GPU auto: 1; explicit workers override auto
                               |
     PNG history -> load/process -> history IDs + new placeholder + both PNGs
                               |
@@ -200,6 +201,43 @@ def _check_serving_processor_lifecycle():
         PROCESSOR_MAPPING.update(
             {model: processor_class for model in processor_class.models}
         )
+        # Construct both routes to catch an inherited training default shadowing Base.
+        for token_space in (False, True):
+            for is_cpu, requested, expected in (
+                (True, 0, 2),
+                (False, 0, 1),
+                (False, 3, 3),
+            ):
+                worker_args = ServerArgs(
+                    model_path="dummy",
+                    mm_process_config={},
+                    enable_token_space_processor=token_space,
+                    mm_feature_transport="cpu",
+                    mm_preprocess_cache_size_mb=0,
+                    mm_io_worker_num=1,
+                    mm_processor_worker_num=requested,
+                )
+                publish(worker_args, role="test")
+                with patch(
+                    "sglang.srt.multimodal.processors.base_processor._is_cpu", is_cpu
+                ):
+                    configured = get_mm_processor(
+                        config, worker_args, hf_processor, transport_mode=None
+                    )
+                try:
+                    assert configured.mm_processor_worker_num == expected, (
+                        token_space,
+                        is_cpu,
+                        requested,
+                    )
+                    executor = configured.mm_processor_executor
+                    if expected == 1:
+                        assert executor is None
+                    else:
+                        assert executor._executor._max_workers == expected
+                finally:
+                    configured.shutdown()
+
         args = ServerArgs(
             model_path="dummy",
             mm_process_config={},

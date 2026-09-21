@@ -2,6 +2,8 @@
 
 fresh Python -> independent Qwen + explicit processor config
                      |
+CPU / GPU device -> default: one worker; explicit: requested clone workers
+                     |
 PNG / video frames -> shared IO + clone pools -> native BatchFeature
                      |
 CPU pool + token expansion -> shutdown -> executor submission rejected
@@ -86,6 +88,28 @@ def test_trainer_uses_shared_pools_without_inference_imports():
                 size={"shortest_edge": 56**2, "longest_edge": 56**2},
             ),
         )
+        # Training owns its worker count even when the model declares a serving default.
+        worker_cases = [({}, 1)]
+        for device in ("cpu", "cuda:0"):
+            for requested, expected in ((0, 1), (1, 1), (3, 3)):
+                worker_cases.append(({
+                    "processor_config": MultimodalProcessorConfig(
+                        device=device, mm_processor_worker_num=requested,
+                        cpu_worker_num=1,
+                    ),
+                }, expected))
+        for options, expected_workers in worker_cases:
+            configured = QwenTokenSpaceProcessor(Qwen3VLConfig(), hf_processor, **options)
+            try:
+                assert configured.mm_processor_worker_num == expected_workers, options
+                executor = configured.mm_processor_executor
+                if expected_workers == 1:
+                    assert executor is None, options
+                else:
+                    assert executor._executor._max_workers == expected_workers, options
+            finally:
+                configured.shutdown()
+
         processor = QwenTokenSpaceProcessor(
             Qwen3VLConfig(
                 image_token_id=2, video_token_id=3,

@@ -66,6 +66,10 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
     # Models opt in by assigning a non-zero default. A user-provided server
     # argument overrides this value; zero disables storage and cache-key work.
     auto_mm_preprocess_cache_size_mb = 0
+    # None lets the worker count follow where preprocessing actually runs; a
+    # model that measured its own optimum assigns a number instead. See
+    # `_resolve_auto_mm_processor_worker_num`.
+    auto_mm_processor_worker_num = None
 
     @classmethod
     def supports_token_space_processing(cls, hf_config):
@@ -459,6 +463,28 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return False
         image_processor = getattr(self._processor, "image_processor", None)
         return isinstance(image_processor, BaseImageProcessor)
+
+    def _resolve_auto_mm_processor_worker_num(self) -> int:
+        """The worker count to use when the user did not ask for one.
+
+        Two workers overlap preprocessing that runs on the CPU, where the second
+        thread is real parallelism: measured on Qwen2.5-VL with full-page images
+        at 32-way concurrency, 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
+        GB300.
+
+        The GPU path is capped at one worker even when a model declares more.
+        A declaration records what its author measured on one platform and one
+        image shape; contending for the device the scheduler is serving from is a
+        property of the path itself, and it does not go away because a subclass
+        asked for concurrency. Qwen-VL declares two and is the model that
+        measures 9.30 -> 4.02 req/s on GB300 full-page images, so honouring the
+        declaration here would exempt exactly the case that regresses.
+        `--mm-processor-worker-num` still overrides this.
+        """
+        if self._preprocessing_competes_with_the_scheduler():
+            return 1
+        declared = self.auto_mm_processor_worker_num
+        return 2 if declared is None else declared
 
     def _get_preprocessing_device(self) -> Optional[str]:
         if _is_cpu or get_exec().deterministic.rl_on_policy_target is not None:

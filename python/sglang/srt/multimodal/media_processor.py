@@ -11,7 +11,6 @@ from typing import Any, List, Optional, Tuple, Union
 import numpy as np
 import torch
 from PIL import Image
-from transformers import BaseImageProcessor
 
 from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
@@ -179,10 +178,6 @@ class MultimodalProcessorMixin:
     smart_rgb_conversion = False
     video_preprocessing_device = None
     use_token_space_processor = False
-    # None lets the worker count follow where preprocessing actually runs; a
-    # model that measured its own optimum assigns a number instead. See
-    # `_resolve_auto_mm_processor_worker_num`.
-    auto_mm_processor_worker_num = None
     auto_mm_io_worker_num = 4
     # Workers receive isolated HF processor clones; models may opt out of concurrency.
     supports_mm_processor_concurrency = True
@@ -337,42 +332,8 @@ class MultimodalProcessorMixin:
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
-    def _preprocessing_competes_with_the_scheduler(self) -> bool:
-        """Whether image preprocessing submits its work to the serving GPU.
-
-        The fast image processor runs inside the tokenizer process but on
-        ``cuda:{base_gpu_id}`` -- the device the scheduler serves from. A second
-        preprocessing worker there is one more competitor for that device rather
-        than added parallelism.
-        """
-        if self.processor_config.device in (None, "cpu"):
-            return False
-        if self.disable_fast_image_processor:
-            return False
-        image_processor = getattr(self._processor, "image_processor", None)
-        return isinstance(image_processor, BaseImageProcessor)
-
     def _resolve_auto_mm_processor_worker_num(self) -> int:
-        """The worker count to use when the user did not ask for one.
-
-        Two workers overlap preprocessing that runs on the CPU, where the second
-        thread is real parallelism: measured on Qwen2.5-VL with full-page images
-        at 32-way concurrency, 4.46 -> 6.08 req/s on H200 and 7.07 -> 8.76 on
-        GB300.
-
-        The GPU path is capped at one worker even when a model declares more.
-        A declaration records what its author measured on one platform and one
-        image shape; contending for the device the scheduler is serving from is a
-        property of the path itself, and it does not go away because a subclass
-        asked for concurrency. Qwen-VL declares two and is the model that
-        measures 9.30 -> 4.02 req/s on GB300 full-page images, so honouring the
-        declaration here would exempt exactly the case that regresses.
-        `--mm-processor-worker-num` still overrides this.
-        """
-        if self._preprocessing_competes_with_the_scheduler():
-            return 1
-        declared = self.auto_mm_processor_worker_num
-        return 2 if declared is None else declared
+        return 1
 
     def _get_preprocessing_device(self) -> Optional[str]:
         return self.processor_config.device
