@@ -17,6 +17,18 @@ Qwen-Image text-stream Q/K/V:
 
     Guards: the wrapped projection runs its own forward instead of the packed-weight
     split, so each of q, k, v equals base plus its LoRA delta.
+
+MiniMax-H3 MXFP8 input gate:
+
+    activation --> _accepts_mxfp8_input(linear) ?
+                     |
+                     +-- True  --> prequantized MXFP8 input (e4m3 + swizzled scales)
+                     +-- False --> bf16 input
+
+    linear = RowParallelLinear          -> decided by linear.quant_method
+    linear = RowParallelLinearWithLoRA  -> False, since the LoRA delta needs bf16 input
+
+    Guards: the gate answers False for a wrapper instead of raising.
 """
 
 import unittest
@@ -25,6 +37,7 @@ import torch
 import torch.nn as nn
 
 # Must precede layers.linear: importing it first cycles via quantization.auto_round.
+import sglang.multimodal_gen.runtime.models.dits.minimax_h3 as minimax_h3
 import sglang.multimodal_gen.runtime.models.dits.qwen_image as qwen_image
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
@@ -32,9 +45,11 @@ from sglang.multimodal_gen.runtime.distributed.parallel_state import (
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
+    RowParallelLinear,
 )
 from sglang.multimodal_gen.runtime.layers.lora.linear import (
     MergedColumnParallelLinearWithLoRA,
+    RowParallelLinearWithLoRA,
 )
 from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
     ensure_distributed_env_defaults,
@@ -99,6 +114,12 @@ class TestDiTLoRAWrappedLinears(CustomTestCase):
             torch.testing.assert_close(
                 projection, base_sections[section] + lora_delta, rtol=1e-4, atol=1e-3
             )
+
+    def test_minimax_h3_lora_wrapped_linear_takes_bf16_input(self):
+        lora_wrapped_linear = RowParallelLinearWithLoRA(
+            RowParallelLinear(input_size=16, output_size=8)
+        )
+        self.assertFalse(minimax_h3._accepts_mxfp8_input(lora_wrapped_linear))
 
 
 if __name__ == "__main__":
