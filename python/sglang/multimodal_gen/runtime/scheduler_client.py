@@ -342,8 +342,6 @@ sync_scheduler_client = SchedulerClient()
 
 
 def _prepare_local_payload(endpoint: str, batch: Any) -> Any:
-    if is_local_endpoint(endpoint):
-        return spill_cuda_tensors(batch)
     return batch
 
 

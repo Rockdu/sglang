@@ -788,8 +788,7 @@ class Scheduler(SchedulerWarmupMixin, SchedulerPostTrainingMixin, SchedulerDisag
                     ):
                         # The previous reply has already been mapped: the client
                         # only sends the next hop after materializing the last one.
-                        release_retained_producer_tensors()
-                        spill_cuda_tensors(output_batch, in_place=True)
+                        pass
                 with self._record_return_stage(
                     output_batch, "Scheduler.return_result.pickle"
                 ):
