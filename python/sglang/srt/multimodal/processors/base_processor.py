@@ -1360,6 +1360,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
                 add_special_tokens=True,
             ).input_ids.flatten()
 
+        images = base_output.images
         # Add offsets to all items
         for mm_item in all_collected_items:
             if mm_item.offsets is not None:
@@ -1376,7 +1377,7 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
         all_collected_items = get_new_expanded_mm_items(all_collected_items)
         all_collected_items = self._finalize_mm_items(
             all_collected_items,
-            images=base_output.images,
+            images=images,
         )
 
         return all_collected_items, input_ids, ret
