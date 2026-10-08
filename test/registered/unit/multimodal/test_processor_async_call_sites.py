@@ -9,10 +9,30 @@ serves at one-worker speed -- so pin the call site instead of the symptom.
 `process_and_combine_mm_data_async` delegates straight to the sync function when
 no executor exists, so using it costs nothing until a model opts into
 concurrency.
+
+  async processor entry
+    -> await process_and_combine_mm_data_async
+      -> worker pool (or direct fallback when no executor exists)
+        -> sync process_and_combine_mm_data
+  Base token-space async entry -> one media task per item -> same worker pool
+                              -> expansion and serving assembly -> same worker pool
+  startup opt-in AND model supports_token_space_processing
+    True  -> serving host + token-space member -> shared loading -> same worker pool
+    False -> original async route -> original HF/native media processor
+  request audio/video -> loader; explicit media arguments override request fields
+  per-source configs stay with the outer call and reach the member beside loaded media
+
+  request video_data -> original InternVL special-format dispatch -> video item offsets
+                       (no duplicate keyword through **kwargs)
+
+Source-tree checks reject processor calls that bypass the async worker helper.
 """
 
 import ast
+import asyncio
 import pathlib
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -93,6 +113,42 @@ def test_every_call_site_can_await():
     )
 
 
+def test_internvl_request_video_reaches_special_format_dispatch():
+    import torch
+
+    from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+    from sglang.srt.multimodal.processors.base_processor import MultimodalSpecialTokens
+    from sglang.srt.multimodal.processors.internvl import InternVLProcessor
+
+    processor = object.__new__(InternVLProcessor)
+    processor.img_start_token_id = 10
+    processor.img_end_token_id = 11
+    processor.img_context_token_id = 12
+    processor.video_token_id = 13
+    processor.mm_tokens = MultimodalSpecialTokens(video_token_id=13)
+    input_ids = [1, 13, 13, 2]
+    features = torch.zeros(2, 4)
+    video_data = [{"format": "processor_output", "pixel_values_videos": features}]
+    item = MultimodalDataItem(modality=Modality.VIDEO, feature=features)
+    processor.process_and_combine_mm_data_async = AsyncMock(
+        return_value=([item], torch.tensor(input_ids), {})
+    )
+
+    output = asyncio.run(
+        processor.process_mm_data_async(
+            image_data=None,
+            input_text=input_ids,
+            request_obj=SimpleNamespace(video_data=video_data),
+        )
+    )
+
+    loaded = processor.process_and_combine_mm_data_async.call_args.args[0]
+    assert loaded.videos == video_data
+    assert output.input_ids == input_ids
+    assert output.mm_items[0].feature is features
+    assert output.mm_items[0].offsets == [(1, 2)]
+
+
 def test_default_worker_count_follows_the_preprocessing_path():
     """The count is resolved per path, not pinned to a number.
 
@@ -111,6 +167,147 @@ def test_default_worker_count_follows_the_preprocessing_path():
 
     assert BaseMultimodalProcessor.supports_mm_processor_concurrency is True
     assert BaseMultimodalProcessor.auto_mm_processor_worker_num is None
+
+
+@pytest.fixture
+def migrated_processor():
+    from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
+
+    return object.__new__(QwenVLImageProcessor)
+
+
+@pytest.mark.parametrize("media_source", ["arguments", "request"])
+def test_token_space_entry_runs_the_complete_request(
+    media_source,
+):
+    from sglang.srt.multimodal.processors.qwen_vl import (
+        QwenVLImageProcessor,
+    )
+
+    migrated_processor = object.__new__(QwenVLImageProcessor)
+    migrated_processor._processor = object()
+    migrated_processor.token_space_process_strategy = object()
+    loaded = SimpleNamespace(images=[object()], videos=[object()], audios=[object()])
+    migrated_processor._load_media_lists = AsyncMock(
+        return_value=(loaded.images, loaded.videos, loaded.audios)
+    )
+    migrated_processor._token_space_media_devices = Mock(
+        return_value=(None, "image device", "video device")
+    )
+    migrated_processor.process_media_async = AsyncMock(return_value=object())
+    migrated_processor._run_mm_processor = AsyncMock(return_value=object())
+    request_kwargs = {
+        "image_data": ["image"],
+        "video_data": ["video"],
+        "audio_data": ["audio"],
+        "input_text": "",
+        "input_ids": [1, 101, 2],
+        "request_obj": SimpleNamespace(
+            video_data=["request video"], audio_data=["request audio"]
+        ),
+        "mm_token_expansion_start_len": 1,
+    }
+
+    call_kwargs = dict(request_kwargs)
+    if media_source == "request":
+        for name in ("video_data", "audio_data"):
+            del call_kwargs[name]
+        request_kwargs["video_data"] = request_kwargs["request_obj"].video_data
+        request_kwargs["audio_data"] = request_kwargs["request_obj"].audio_data
+    output = asyncio.run(
+        migrated_processor.process_token_space_mm_data_async(**call_kwargs)
+    )
+
+    assert output is migrated_processor._run_mm_processor.return_value
+    migrated_processor._load_media_lists.assert_awaited_once_with(
+        request_kwargs["image_data"],
+        request_kwargs["video_data"],
+        request_kwargs["audio_data"],
+        audio_sample_rate=None,
+        discard_alpha_channel=True,
+    )
+    migrated_processor.process_media_async.assert_awaited_once_with(
+        images=loaded.images,
+        videos=loaded.videos,
+        audios=loaded.audios,
+        image_source_configs=[{}],
+        video_source_configs=[{}],
+        audio_source_configs=[{}],
+        image_device="image device",
+        video_device="video device",
+    )
+    migrated_processor._run_mm_processor.assert_awaited_once_with(
+        migrated_processor._expand_token_space_media,
+        input_text="",
+        input_ids=request_kwargs["input_ids"],
+        media_features=migrated_processor.process_media_async.return_value,
+        mm_token_expansion_start_len=1,
+        add_special_tokens=True,
+    )
+
+
+def test_disabled_models_reach_original_media_processing(migrated_processor):
+    """Follow the old entry through synchronous preprocessing, not just loading."""
+
+    class LegacyProcessingReached(Exception):
+        pass
+
+    calls = []
+
+    def legacy_component(*args, **kwargs):
+        calls.append((args, kwargs))
+        raise LegacyProcessingReached
+
+    def reject_shared_pipeline(**kwargs):
+        pytest.fail("Disabled token-space strategy entered process_media")
+
+    processor = migrated_processor
+    processor.use_token_space_processor = False
+    processor.process_media = reject_shared_pipeline
+    processor._processor = legacy_component
+    processor._tokenizer = None
+    processor._tokenizer_auto_adds_specials = False
+    processor.hf_config = SimpleNamespace(model_type="qwen3_5")
+    processor.image_config = {}
+    processor.video_config = {}
+    processor.audio_config = {}
+    processor.mm_tokens = SimpleNamespace(image_token_id=101)
+    processor.IMAGE_TOKEN_ID = 101
+    processor.AUDIO_TOKEN_ID = None
+    loaded = SimpleNamespace(input_text="image prompt", images=[b"loaded image"])
+    loaded.videos = loaded.audios = []
+    processor.load_mm_data = AsyncMock(return_value=loaded)
+
+    async def combine_in_worker(base_output, mm_tokens, **kwargs):
+        return processor.process_mm_data(
+            input_text=base_output.input_text, images=base_output.images
+        )
+
+    processor.process_and_combine_mm_data_async = combine_in_worker
+    with pytest.raises(LegacyProcessingReached):
+        asyncio.run(
+            processor.process_mm_data_async(
+                image_data=[b"encoded image"],
+                input_text="image prompt",
+                request_obj=SimpleNamespace(
+                    input_ids=[1, 101, 2], video_data=None, audio_data=["audio"]
+                ),
+            )
+        )
+
+    assert processor.load_mm_data.call_args.kwargs["prompt"] == "image prompt"
+    assert processor.load_mm_data.call_args.kwargs["audio_data"] == ["audio"]
+    assert calls == [
+        (
+            (),
+            {
+                "text": ["image prompt"],
+                "images": loaded.images,
+                "padding": True,
+                "return_tensors": "pt",
+            },
+        )
+    ]
 
 
 def _process_mm_data_overrides():
