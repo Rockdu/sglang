@@ -84,6 +84,15 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             )
         )
 
+    def enable_token_space_processing(self, hf_config):
+        """Attach the model's strategy; hf_config is the outer startup config."""
+        self.token_space_process_strategy = self.token_space_process_strategy_class(
+            hf_config,
+            self._processor,
+            mm_process_config=self.mm_process_config,
+        )
+        self.use_token_space_processor = True
+
     def __init__(
         self, hf_config, server_args, _processor, transport_mode, *args, **kwargs
     ):
