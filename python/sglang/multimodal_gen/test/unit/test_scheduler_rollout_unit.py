@@ -77,6 +77,15 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             latents=torch.zeros(2, 4, 8, 8, dtype=torch.float32),
         )
 
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_trajectory_timestep_stays_on_device(self):
+        batch = self._build_batch(debug_mode=False)
+        batch.rollout_return_dit_trajectory = True
+        rollout = _make_rollout(batch)
+        timestep = torch.tensor(500.0, device="cuda")
+        rollout._maybe_append_dit_trajectory_step(batch.latents, timestep, 0)
+        self.assertEqual(rollout.step_timesteps[0].device, timestep.device)
+
     def test_ode_step_does_not_call_variance_noise_sampler(self):
         batch = self._build_batch(debug_mode=False)
         rollout = _make_rollout(batch)

@@ -31,6 +31,12 @@ from sglang.multimodal_gen.runtime.post_training.sp_utils import (
 )
 
 
+def release_rollout_resources(batch: Req) -> None:
+    """Drop request-owned rollout state, including callbacks capturing the request."""
+    batch.rollout_controllers.clear()
+    batch._rollout_denoising_env_state = None
+
+
 def _kwargs_to_cpu(d: Any) -> Any:
     if isinstance(d, torch.Tensor):
         return d.detach().cpu()
@@ -90,6 +96,7 @@ def prepare_rollout_if_enabled(
     ``build_controller(batch=, pipeline_config=)`` returns it; a loop without a
     scheduler passes its own.
     """
+    release_rollout_resources(batch)
     if not batch.rollout:
         return
     controller = build_controller(batch=batch, pipeline_config=pipeline_config)

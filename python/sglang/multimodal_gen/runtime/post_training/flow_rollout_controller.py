@@ -410,7 +410,7 @@ class FlowRolloutController:
         if not self.return_dit_trajectory:
             return
 
-        self.step_timesteps.append(timestep_value.detach().cpu())
+        self.step_timesteps.append(timestep_value.detach())
         return_step_indices = self.return_step_indices
         if return_step_indices is not None and step_index not in return_step_indices:
             return

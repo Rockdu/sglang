@@ -66,6 +66,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
+    release_rollout_resources,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
@@ -1526,6 +1527,8 @@ class Cosmos3DenoisingStage(PipelineStage):
             guidance=None,
         )
         transition = rollout_transition(batch)
+        # UniPC serving does not accept the Euler rollout transition keyword.
+        extra_step_kwargs = {"transition": transition} if transition is not None else {}
 
         do_cfg = guidance_scale > 1.0
         # Control-CFG runs even when text guidance is off (its own extra
@@ -1791,8 +1794,8 @@ class Cosmos3DenoisingStage(PipelineStage):
                 t,
                 latents,
                 generator=generator,
-                transition=transition,
                 return_dict=False,
+                **extra_step_kwargs,
             )[0]
 
             if action_noise_pred is not None:
@@ -1846,7 +1849,7 @@ class Cosmos3DenoisingStage(PipelineStage):
             batch=batch,
             latents=latents,
             num_inference_steps=len(timesteps),
-            final_timestep=timesteps.new_zeros(()).cpu(),
+            final_timestep=timesteps.new_zeros(()),
             pipeline_config=server_args.pipeline_config,
         )
 
@@ -1859,14 +1862,17 @@ class Cosmos3DenoisingStage(PipelineStage):
         return batch
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
-        if batch.extra.get("transfer_plan") is not None:
-            return self._forward_transfer(batch, server_args)
-        with self.use_declared_component(
-            component_name="transformer",
-            module=self.transformer,
-            phase="denoise",
-        ):
-            return self._denoise_once(batch, server_args)
+        try:
+            if batch.extra.get("transfer_plan") is not None:
+                return self._forward_transfer(batch, server_args)
+            with self.use_declared_component(
+                component_name="transformer",
+                module=self.transformer,
+                phase="denoise",
+            ):
+                return self._denoise_once(batch, server_args)
+        finally:
+            release_rollout_resources(batch)
 
     def _predict_noise_cfg(
         self,

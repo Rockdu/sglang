@@ -17,7 +17,7 @@ import os
 import pprint
 from collections import Counter
 from copy import deepcopy
-from dataclasses import MISSING, asdict, dataclass, field, fields
+from dataclasses import MISSING, dataclass, field, fields
 from typing import TYPE_CHECKING, Any, Optional, Sequence, Union
 
 import PIL.Image
@@ -413,7 +413,10 @@ class Req:
         self.metrics = RequestMetrics(request_id=self.request_id)
 
     def __str__(self):
-        return pprint.pformat(asdict(self), indent=2, width=120)
+        # Logging must not deepcopy live tensors or rollout controller state.
+        values = {f.name: getattr(self, f.name) for f in fields(self)}
+        values["rollout_controllers"] = list(self.rollout_controllers)
+        return pprint.pformat(values, indent=2, width=120)
 
     def log(self, server_args: ServerArgs):
         if self.is_warmup or self.suppress_logs:
