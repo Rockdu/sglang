@@ -136,6 +136,11 @@ def handle_multimodal(server_args: Any):
         and cfg.mm_preprocess_cache_size_mb < 0
     ):
         raise ValueError("mm_preprocess_cache_size_mb must be non-negative")
+    if cfg.mm_preprocess_cache_trust_url and not cfg.mm_preprocess_cache_size_mb:
+        raise ValueError(
+            "--mm-preprocess-cache-trust-url requires a positive "
+            "--mm-preprocess-cache-size-mb"
+        )
     if cfg.mm_process_config is not None:
         if not isinstance(cfg.mm_process_config, dict):
             raise TypeError(
