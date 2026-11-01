@@ -10,14 +10,13 @@ import torch.nn.functional as F
 from diffusers.utils import logging
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
 
-from .vit_utils import apply_rotary_pos_emb_qk
+from .vit_utils import _env_flag, apply_rotary_pos_emb_qk
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 _FORCE_ROCM_MATH_SDPA = current_platform.is_rocm() and "gfx95" in str(
@@ -37,15 +36,52 @@ def _sdpa_attention(query, key, value):
 
 
 def _vit_norm_input(module, hidden_states):
-    if envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM:
+    if _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1"):
         return hidden_states.float()
     weight = module.weight
     return hidden_states.to(weight.dtype if weight is not None else hidden_states.dtype)
 
 
+def _try_fused_qk_rmsnorm_rope(norm_q, norm_k, query, key, rotary_pos_emb):
+    if not _env_flag("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1"):
+        return None
+    # NVIDIA only: see _fused_blocks_available in vae_vit.py.
+    if not current_platform.is_cuda():
+        return None
+    if (
+        rotary_pos_emb is None
+        or torch.is_grad_enabled()
+        or torch.compiler.is_compiling()
+        or not isinstance(norm_q, nn.RMSNorm)
+        or not isinstance(norm_k, nn.RMSNorm)
+        or norm_q.weight is not None
+        or norm_k.weight is not None
+        or norm_q.eps != norm_k.eps
+    ):
+        return None
+    cos, sin = rotary_pos_emb[:2]
+    if cos.dim() != 4 or sin.shape != cos.shape or cos.shape[2] != 1:
+        return None
+    # Stacked tiles broadcast one rotary table. A real batch stride would mean
+    # each tile has its own positions, which this kernel does not index.
+    if cos.shape[0] != 1 and cos.stride(0) != 0:
+        return None
+    if sin.shape[0] != 1 and sin.stride(0) != 0:
+        return None
+    from sglang.kernels.ops.diffusion import h3_vae_qk_rmsnorm_rope
+
+    return h3_vae_qk_rmsnorm_rope(
+        query,
+        key,
+        norm_q.eps,
+        cos[0, :, 0, :],
+        sin[0, :, 0, :],
+    )
+
+
 def _apply_qk_norm(module, hidden_states):
     if (
-        envs.MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM
+        _env_flag("MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM", "1")
         and isinstance(module, (nn.LayerNorm, nn.RMSNorm))
         and module.weight is None
         and (not isinstance(module, nn.LayerNorm) or module.bias is None)
@@ -139,12 +175,20 @@ class Attention(nn.Module):
         qkv = qkv.view(batch_size, seq_len, -1, 3 * self.dim_head)
         query, key, value = torch.chunk(qkv, 3, dim=-1)
 
-        if self.norm_q is not None:
-            query = _apply_qk_norm(self.norm_q, query)
-        if self.norm_k is not None:
-            key = _apply_qk_norm(self.norm_k, key)
-        if rotary_pos_emb is not None:
-            query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
+        fused_qk = None
+        if self.norm_q is not None and self.norm_k is not None:
+            fused_qk = _try_fused_qk_rmsnorm_rope(
+                self.norm_q, self.norm_k, query, key, rotary_pos_emb
+            )
+        if fused_qk is not None:
+            query, key = fused_qk
+        else:
+            if self.norm_q is not None:
+                query = _apply_qk_norm(self.norm_q, query)
+            if self.norm_k is not None:
+                key = _apply_qk_norm(self.norm_k, key)
+            if rotary_pos_emb is not None:
+                query, key = apply_rotary_pos_emb_qk(query, key, rotary_pos_emb)
 
         if self.attn is not None and query.dtype in (torch.float16, torch.bfloat16):
             hidden_states = self.attn(query, key, value)
