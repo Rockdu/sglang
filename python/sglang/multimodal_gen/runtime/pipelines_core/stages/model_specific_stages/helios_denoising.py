@@ -562,10 +562,10 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             dtype=torch.float32,
         )
 
-        # Build frame indices on the device: every forward embeds them four times
+        # Build frame indices
         if keep_first_frame:
             indices = torch.arange(
-                0, sum([1, *history_sizes, num_latent_frames_per_chunk]), device=device
+                0, sum([1, *history_sizes, num_latent_frames_per_chunk])
             )
             (
                 indices_prefix,
@@ -579,7 +579,7 @@ class HeliosChunkedDenoisingStage(PipelineStage):
             )
         else:
             indices = torch.arange(
-                0, sum([*history_sizes, num_latent_frames_per_chunk]), device=device
+                0, sum([*history_sizes, num_latent_frames_per_chunk])
             )
             (
                 indices_latents_history_long,
