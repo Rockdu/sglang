@@ -838,13 +838,10 @@ class MiniMaxH3AdalnCache(nn.Module):
         num_timesteps: int,
     ) -> tuple[tuple[torch.Tensor, ...], ...]:
         """Every block's AdaLN tuple via one layer-major slab gather."""
-        # index_select: indexing by a 0-dim tensor reads it back to the host
-        stacked = (
-            self.block_params[:, :num_timesteps]
-            .index_select(0, cache_plan_index.view(1))
-            .permute(2, 0, 1, 3)
-            .reshape(self.num_layers, -1, 6, self.hidden_size)
-        )
+        stacked = self.block_params.permute(2, 0, 1, 3)[
+            :, cache_plan_index, :num_timesteps
+        ]
+        stacked = stacked.reshape(self.num_layers, -1, 6, self.hidden_size)
         return tuple(tuple(layer.unbind(dim=1)) for layer in stacked)
 
     def final(
@@ -852,7 +849,5 @@ class MiniMaxH3AdalnCache(nn.Module):
         cache_plan_index: torch.Tensor,
         num_timesteps: int,
     ) -> tuple[torch.Tensor, ...]:
-        params = self.final_params[:, :num_timesteps].index_select(
-            0, cache_plan_index.view(1)
-        )
+        params = self.final_params[cache_plan_index, :num_timesteps]
         return tuple(params.reshape(-1, 2, self.hidden_size).unbind(dim=1))

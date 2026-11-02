@@ -195,18 +195,15 @@ def camera_major_slice(
     *,
     num_views: int,
     frames_per_view: int,
-    frames: torch.Tensor,
+    frames: Sequence[int],
 ) -> torch.Tensor:
-    """Select ``frames`` of every view from camera-major ``[1, C, V*T, h, w]`` -> ``[1, C, V*n, h, w]``.
-
-    ``frames`` is a long index on the latents' device: the per-step callers keep
-    one, since building it from host ints is a blocking upload.
-    """
+    """Select ``frames`` of every view from camera-major ``[1, C, V*T, h, w]`` -> ``[1, C, V*n, h, w]``."""
     grid = latents.view(
         1, latents.shape[1], num_views, frames_per_view, *latents.shape[3:]
     )
-    return grid.index_select(3, frames).reshape(
-        1, latents.shape[1], num_views * frames.numel(), *latents.shape[3:]
+    index = torch.tensor(list(frames), device=latents.device, dtype=torch.long)
+    return grid.index_select(3, index).reshape(
+        1, latents.shape[1], num_views * len(frames), *latents.shape[3:]
     )
 
 
@@ -216,16 +213,17 @@ def camera_major_write(
     *,
     num_views: int,
     frames_per_view: int,
-    frames: torch.Tensor,
+    frames: Sequence[int],
 ) -> None:
-    """Write ``[1, C, V*n, h, w]`` values into ``frames`` (a device long index) of every view of a camera-major tensor."""
+    """Write ``[1, C, V*n, h, w]`` values into ``frames`` of every view of a camera-major tensor."""
     grid = latents.view(
         1, latents.shape[1], num_views, frames_per_view, *latents.shape[3:]
     )
+    index = torch.tensor(list(frames), device=latents.device, dtype=torch.long)
     grid.index_copy_(
         3,
-        frames,
-        values.view(1, values.shape[1], num_views, frames.numel(), *values.shape[3:]),
+        index,
+        values.view(1, values.shape[1], num_views, len(frames), *values.shape[3:]),
     )
 
 
@@ -346,11 +344,10 @@ class _FlatLayout(msgspec.Struct, eq=False, kw_only=True):
     """
 
     num_views: int
-    noisy_rgb: torch.Tensor
-    noisy_sweeps: torch.Tensor
-    # chunk-local device indexes, built once per chunk instead of every step
-    local_rgb: torch.Tensor
-    local_sweeps: torch.Tensor
+    noisy_rgb: tuple[int, ...]
+    noisy_sweeps: tuple[int, ...]
+    local_rgb: list[int]
+    local_sweeps: list[int]
     rgb_shape: tuple[int, ...]
     lidar_shape: tuple[int, ...]
     rgb_size: int
@@ -384,17 +381,12 @@ class _FlatLayout(msgspec.Struct, eq=False, kw_only=True):
                 len(noisy_sweeps),
                 *lidar_base.shape[3:],
             )
-        device = rgb_base.device
         return cls(
             num_views=num_views,
-            noisy_rgb=torch.tensor(noisy_rgb, dtype=torch.long, device=device),
-            noisy_sweeps=torch.tensor(noisy_sweeps, dtype=torch.long, device=device),
-            local_rgb=torch.tensor(
-                [rgb_item.frames.index(frame) for frame in noisy_rgb],
-                dtype=torch.long,
-                device=device,
-            ),
-            local_sweeps=torch.tensor(local_sweeps, dtype=torch.long, device=device),
+            noisy_rgb=noisy_rgb,
+            noisy_sweeps=noisy_sweeps,
+            local_rgb=[rgb_item.frames.index(frame) for frame in noisy_rgb],
+            local_sweeps=local_sweeps,
             rgb_shape=rgb_shape,
             lidar_shape=lidar_shape,
             rgb_size=math.prod(rgb_shape) if noisy_rgb else 0,
@@ -422,10 +414,8 @@ class _FlatLayout(msgspec.Struct, eq=False, kw_only=True):
             current[1] = noisy
         if self.lidar_size:
             noisy_lidar = latents[3].clone()
-            noisy_lidar.index_copy_(
-                2,
-                self.local_sweeps,
-                x[:, self.rgb_size :].reshape(self.lidar_shape).to(noisy_lidar.dtype),
+            noisy_lidar[:, :, self.local_sweeps] = (
+                x[:, self.rgb_size :].reshape(self.lidar_shape).to(noisy_lidar.dtype)
             )
             current[3] = noisy_lidar
         return current
@@ -443,7 +433,7 @@ class _FlatLayout(msgspec.Struct, eq=False, kw_only=True):
                 ).reshape(1, -1)
             )
         if self.lidar_size:
-            parts.append(targets[1].index_select(2, self.local_sweeps).reshape(1, -1))
+            parts.append(targets[1][:, :, self.local_sweeps].reshape(1, -1))
         return torch.cat(parts, dim=1).float()
 
     def write_back(self, session: _Session, denoised: torch.Tensor) -> None:
@@ -456,11 +446,9 @@ class _FlatLayout(msgspec.Struct, eq=False, kw_only=True):
                 frames=self.noisy_rgb,
             )
         if self.lidar_size:
-            session.lidar_target.index_copy_(
-                2,
-                self.noisy_sweeps,
-                denoised[:, self.rgb_size :].reshape(self.lidar_shape),
-            )
+            session.lidar_target[:, :, list(self.noisy_sweeps)] = denoised[
+                :, self.rgb_size :
+            ].reshape(self.lidar_shape)
 
 
 class Cosmos3SimAutoRolloutStage(PipelineStage):
@@ -826,9 +814,7 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
                         source,
                         num_views=session.num_views,
                         frames_per_view=session.latent_frames,
-                        frames=torch.tensor(
-                            item.frames, dtype=torch.long, device=source.device
-                        ),
+                        frames=item.frames,
                     )
                 )
         return latents
