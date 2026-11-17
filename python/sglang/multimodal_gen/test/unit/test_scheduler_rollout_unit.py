@@ -775,8 +775,7 @@ class TestRolloutStopStepUnit(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "two GPUs required")
     def test_controller_grid_on_another_gpu_than_the_scheduler(self):
-        """Under CFG parallel a rank's scheduler grid is moved to its own GPU after the
-        controller kept rank 0's; the steps must run and match a one-GPU run."""
+        """Under CFG parallel the scheduler's grid and the controller's sit on different GPUs."""
 
         def run(controller_device: str) -> torch.Tensor:
             scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)

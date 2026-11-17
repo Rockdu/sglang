@@ -201,8 +201,7 @@ class FlowRolloutController:
             model_output=model_output,
             sample=sample,
             current_sigma=current_sigma,
-            # Under CFG parallel a rank moves its scheduler grid to its own GPU after
-            # this controller kept the grid broadcast from rank 0.
+            # CFG parallel: the scheduler's grid is on this rank's GPU, ours on rank 0's.
             next_sigma=self.sigmas[step_index + 1].to(current_sigma.device),
             step_index=step_index,
         )
