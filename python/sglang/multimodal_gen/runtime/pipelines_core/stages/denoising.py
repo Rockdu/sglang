@@ -44,6 +44,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.zimage import ZImagePipelineConfig
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     quality_allows,
     resolve_skip_softmax_params,
@@ -147,6 +148,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
+    loop_latent_sp_fns,
     prepare_rollout_if_enabled,
     rollout_scope,
     rollout_step_kwargs,
@@ -1237,8 +1239,15 @@ class DenoisingStage(PipelineStage):
             if uses_boundary_transformer_2
             else None
         )
+        shard_for_sp, gather_for_sp = loop_latent_sp_fns(server_args.pipeline_config)
         prepare_rollout_if_enabled(
-            batch=batch, pipeline_config=server_args.pipeline_config
+            batch=batch,
+            stream=PRIMARY_STREAM,
+            scheduler=scheduler,
+            timesteps=batch.timesteps,
+            latents=batch.latents,
+            shard_for_sp=shard_for_sp,
+            gather_for_sp=gather_for_sp,
         )
         set_rollout_early_stop_if_enabled(batch=batch)
         timesteps = batch.timesteps
@@ -1271,7 +1280,7 @@ class DenoisingStage(PipelineStage):
             {
                 "generator": batch.generator,
                 "eta": batch.eta,
-                **rollout_step_kwargs(batch),
+                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
             },
         )
 
@@ -2034,6 +2043,10 @@ class DenoisingStage(PipelineStage):
         with rollout_scope(batch), self._offload_for_torch_compile_warmup(batch):
             return self._denoise(batch, server_args)
 
+    def _rollout_stream_latents(self, ctx: DenoisingContext) -> dict[str, torch.Tensor]:
+        """Final latents of each of the loop's latent streams, by stream name."""
+        return {PRIMARY_STREAM: ctx.latents}
+
     @torch.no_grad()
     def _denoise(
         self,
@@ -2056,7 +2069,7 @@ class DenoisingStage(PipelineStage):
         # collect rollout outputs before finalization gathers or replaces latents
         finalize_rollout_if_enabled(
             batch=batch,
-            latents=ctx.latents,
+            latents=self._rollout_stream_latents(ctx),
             num_inference_steps=len(timesteps_cpu),
             final_timestep=ctx.timesteps.new_zeros(()),
             pipeline_config=server_args.pipeline_config,

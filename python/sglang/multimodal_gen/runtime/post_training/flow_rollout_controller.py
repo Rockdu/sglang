@@ -79,6 +79,7 @@ class FlowRolloutController:
         # terminal included; stop_at cuts both.
         self.sigmas = sigmas
         self.timesteps = timesteps
+        self.uncut_num_steps = len(timesteps)
         self.latents_shape = latents_shape
         # The model's own deterministic update, called as
         # ode_transition(model_output=, sample=, step_index=) on ODE steps;
@@ -99,9 +100,7 @@ class FlowRolloutController:
         self.step_timesteps: list[torch.Tensor] = []
 
     def stop_at(self, stop_step_index: int) -> None:
-        """Keep steps 0..stop_step_index; the last one steps to the terminal sigma.
-        Called by ``set_rollout_early_stop_if_enabled`` before the loop's first
-        step; loops do not call it themselves."""
+        """Keep steps 0..stop_step_index; the last one steps to the terminal sigma."""
         self.sigmas = truncate_rollout_sigmas(
             self.sigmas, stop_step_index=stop_step_index
         )
@@ -179,7 +178,7 @@ class FlowRolloutController:
 
         Steps on the controller's own grid: the scheduler's ``next_sigma`` and
         ``dt`` are not used, so a requested stop sends the last step to the
-        terminal sigma while the scheduler's grid stays untouched. Draws variance
+        terminal sigma without reading the scheduler's grid. Draws variance
         noise from the request generator captured at creation, so the caller's
         ``generator`` argument is not used either. Records ``sample`` as the
         step's x_t before advancing it.

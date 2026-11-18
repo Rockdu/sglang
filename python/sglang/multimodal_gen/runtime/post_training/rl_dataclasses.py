@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """RL-specific dataclasses used by post-training and rollout paths."""
 
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, field, fields, replace
+from typing import Any, Callable
 
 import torch
 
@@ -39,11 +39,47 @@ class RolloutDitTrajectory:
 
 
 @dataclass
-class RolloutTrajectoryData:
+class RolloutStreamData:
     rollout_log_probs: torch.Tensor | None = None
     rollout_debug_tensors: RolloutDebugTensors | None = None
-    denoising_env: RolloutDenoisingEnv | None = None
     dit_trajectory: RolloutDitTrajectory | None = None
+
+
+@dataclass
+class RolloutTrajectoryData:
+    """The replay env shared by every stream, and each stream's rollout data by name."""
+
+    denoising_env: RolloutDenoisingEnv | None = None
+    streams: dict[str, RolloutStreamData] = field(default_factory=dict)
+
+
+def map_stream_tensors(
+    stream: RolloutStreamData | None,
+    fn: Callable[[torch.Tensor | None], torch.Tensor | None],
+) -> RolloutStreamData | None:
+    """Apply ``fn`` to every per-sample tensor of one stream; the schedule is shared."""
+    if stream is None:
+        return None
+    debug = stream.rollout_debug_tensors
+    trajectory = stream.dit_trajectory
+    return RolloutStreamData(
+        rollout_log_probs=fn(stream.rollout_log_probs),
+        rollout_debug_tensors=(
+            RolloutDebugTensors(
+                **{
+                    field.name: fn(getattr(debug, field.name))
+                    for field in fields(RolloutDebugTensors)
+                }
+            )
+            if debug is not None
+            else None
+        ),
+        dit_trajectory=(
+            replace(trajectory, latents=fn(trajectory.latents))
+            if trajectory is not None
+            else None
+        ),
+    )
 
 
 def _cat_per_output(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
@@ -53,52 +89,58 @@ def _cat_per_output(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
     return torch.cat(tensors, dim=0)
 
 
+def _concat_stream_data(
+    streams: list[RolloutStreamData | None],
+) -> RolloutStreamData | None:
+    if not streams or any(stream is None for stream in streams):
+        return None
+    debug = None
+    if all(stream.rollout_debug_tensors is not None for stream in streams):
+        debug = RolloutDebugTensors(
+            **{
+                field.name: _cat_per_output(
+                    [
+                        getattr(stream.rollout_debug_tensors, field.name)
+                        for stream in streams
+                    ]
+                )
+                for field in fields(RolloutDebugTensors)
+            }
+        )
+    trajectory = None
+    if all(stream.dit_trajectory is not None for stream in streams):
+        trajectory = replace(
+            streams[0].dit_trajectory,
+            latents=_cat_per_output(
+                [stream.dit_trajectory.latents for stream in streams]
+            ),
+        )
+    return RolloutStreamData(
+        rollout_log_probs=_cat_per_output(
+            [stream.rollout_log_probs for stream in streams]
+        ),
+        rollout_debug_tensors=debug,
+        dit_trajectory=trajectory,
+    )
+
+
 def concat_rollout_trajectory_data(
     per_output: list[RolloutTrajectoryData | None],
 ) -> RolloutTrajectoryData | None:
     """Combine aligned per-output trajectories into one batched trajectory."""
-    if any(data is None for data in per_output):
+    if not per_output or any(data is None for data in per_output):
         return None
-
-    first = per_output[0]
     if len(per_output) == 1:
-        return first
-
-    debug_tensors = None
-    if all(data.rollout_debug_tensors is not None for data in per_output):
-        debug = [data.rollout_debug_tensors for data in per_output]
-        debug_tensors = RolloutDebugTensors(
-            rollout_variance_noises=_cat_per_output(
-                [entry.rollout_variance_noises for entry in debug]
-            ),
-            rollout_prev_sample_means=_cat_per_output(
-                [entry.rollout_prev_sample_means for entry in debug]
-            ),
-            rollout_noise_std_devs=_cat_per_output(
-                [entry.rollout_noise_std_devs for entry in debug]
-            ),
-            rollout_model_outputs=_cat_per_output(
-                [entry.rollout_model_outputs for entry in debug]
-            ),
-        )
-
-    dit_trajectory = None
-    if all(data.dit_trajectory is not None for data in per_output):
-        dit_trajectory = RolloutDitTrajectory(
-            latents=_cat_per_output(
-                [data.dit_trajectory.latents for data in per_output]
-            ),
-            timesteps=first.dit_trajectory.timesteps,
-            sigmas=first.dit_trajectory.sigmas,
-        )
-
+        return per_output[0]
+    names = per_output[0].streams.keys()
+    if any(data.streams.keys() != names for data in per_output):
+        raise ValueError("Outputs of one request must roll out the same streams")
     return RolloutTrajectoryData(
-        rollout_log_probs=_cat_per_output(
-            [data.rollout_log_probs for data in per_output]
-        ),
-        rollout_debug_tensors=debug_tensors,
-        denoising_env=first.denoising_env,
-        dit_trajectory=dit_trajectory,
+        denoising_env=per_output[0].denoising_env,
+        streams={
+            name: _concat_stream_data([data.streams[name] for data in per_output])
+            for name in names
+        },
     )
 
 
@@ -119,36 +161,13 @@ def select_output_rollout_trajectory(
     if rollout_trajectory_data is None or output_index is None:
         return rollout_trajectory_data
 
-    debug_tensors = rollout_trajectory_data.rollout_debug_tensors
-    if debug_tensors is not None:
-        debug_tensors = RolloutDebugTensors(
-            rollout_variance_noises=_slice_output_dim(
-                debug_tensors.rollout_variance_noises, output_index
-            ),
-            rollout_prev_sample_means=_slice_output_dim(
-                debug_tensors.rollout_prev_sample_means, output_index
-            ),
-            rollout_noise_std_devs=_slice_output_dim(
-                debug_tensors.rollout_noise_std_devs, output_index
-            ),
-            rollout_model_outputs=_slice_output_dim(
-                debug_tensors.rollout_model_outputs, output_index
-            ),
-        )
-
-    dit_trajectory = rollout_trajectory_data.dit_trajectory
-    if dit_trajectory is not None:
-        dit_trajectory = RolloutDitTrajectory(
-            latents=_slice_output_dim(dit_trajectory.latents, output_index),
-            timesteps=dit_trajectory.timesteps,
-            sigmas=dit_trajectory.sigmas,
-        )
+    def select(tensor: torch.Tensor | None) -> torch.Tensor | None:
+        return _slice_output_dim(tensor, output_index)
 
     return RolloutTrajectoryData(
-        rollout_log_probs=_slice_output_dim(
-            rollout_trajectory_data.rollout_log_probs, output_index
-        ),
-        rollout_debug_tensors=debug_tensors,
         denoising_env=rollout_trajectory_data.denoising_env,
-        dit_trajectory=dit_trajectory,
+        streams={
+            name: map_stream_tensors(stream, select)
+            for name, stream in rollout_trajectory_data.streams.items()
+        },
     )

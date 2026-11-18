@@ -17,6 +17,7 @@ import msgspec
 import torch
 
 from radix_transfer_plugins import StorageBackend
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
 from sglang.multimodal_gen.runtime.entrypoints.post_training.output_store import (
     RolloutOutputStore,
@@ -37,8 +38,17 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
     RolloutDenoisingEnv,
     RolloutDitTrajectory,
+    RolloutStreamData,
     RolloutTrajectoryData,
 )
+
+
+def _trajectory(*, denoising_env=None, **primary) -> RolloutTrajectoryData:
+    """A trajectory whose only stream is the primary one."""
+    return RolloutTrajectoryData(
+        denoising_env=denoising_env,
+        streams={PRIMARY_STREAM: RolloutStreamData(**primary)},
+    )
 
 
 class TestTensorToBytesRoundtrip(unittest.TestCase):
@@ -158,7 +168,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertIsNone(dit_traj)
 
     def test_log_probs_only(self):
-        rtd = RolloutTrajectoryData(
+        rtd = _trajectory(
             rollout_log_probs=torch.tensor([-1.0, -2.0]),
         )
         log_probs, debug, env, dit_traj = _serialize_rollout_trajectory(rtd)
@@ -169,7 +179,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertIsNone(dit_traj)
 
     def test_log_probs_none_in_rtd(self):
-        rtd = RolloutTrajectoryData(rollout_log_probs=None)
+        rtd = _trajectory(rollout_log_probs=None)
         log_probs, debug, env, dit_traj = _serialize_rollout_trajectory(rtd)
         self.assertIsNone(log_probs)
         self.assertIsNone(debug)
@@ -183,7 +193,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             rollout_noise_std_devs=torch.randn(2, 5, 1),
             rollout_model_outputs=torch.randn(2, 5, 4, 8, 8),
         )
-        rtd = RolloutTrajectoryData(
+        rtd = _trajectory(
             rollout_log_probs=torch.tensor([-0.5, -0.6]),
             rollout_debug_tensors=dt,
         )
@@ -205,7 +215,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
             rollout_noise_std_devs=None,
             rollout_model_outputs=None,
         )
-        rtd = RolloutTrajectoryData(
+        rtd = _trajectory(
             rollout_log_probs=torch.tensor([-0.3]),
             rollout_debug_tensors=dt,
         )
@@ -217,7 +227,7 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         self.assertIsNone(dit_traj)
 
     def test_with_denoising_env(self):
-        rtd = RolloutTrajectoryData(
+        rtd = _trajectory(
             denoising_env=RolloutDenoisingEnv(
                 image_kwargs={"encoder_hidden_states_image": [torch.randn(1, 8)]},
                 pos_cond_kwargs={"encoder_hidden_states": torch.randn(1, 8)},
@@ -232,8 +242,12 @@ class TestSerializeRolloutTrajectory(unittest.TestCase):
         )
         _, _, env, dit_traj = _serialize_rollout_trajectory(
             rtd,
-            serialized_dit_timesteps=_maybe_serialize(rtd.dit_trajectory.timesteps),
-            serialized_dit_sigmas=_maybe_serialize(rtd.dit_trajectory.sigmas),
+            serialized_dit_timesteps=_maybe_serialize(
+                rtd.streams[PRIMARY_STREAM].dit_trajectory.timesteps
+            ),
+            serialized_dit_sigmas=_maybe_serialize(
+                rtd.streams[PRIMARY_STREAM].dit_trajectory.sigmas
+            ),
         )
         self.assertIsNotNone(env)
         self.assertIn("pos_cond_kwargs", env)
@@ -254,7 +268,7 @@ class TestBuildResponse(unittest.TestCase):
     def test_minimal_output(self):
         batch = OutputBatch(
             output=torch.randn(1, 3, 1, 64, 64),
-            rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_trajectory_data=_trajectory(
                 rollout_log_probs=torch.tensor([0.0]),
             ),
         )
@@ -274,7 +288,7 @@ class TestBuildResponse(unittest.TestCase):
     def test_full_response(self):
         batch = OutputBatch(
             output=torch.randn(1, 3, 1, 64, 64),
-            rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_trajectory_data=_trajectory(
                 rollout_log_probs=torch.tensor([-0.5]),
             ),
             peak_memory_mb=8192.0,
@@ -290,7 +304,7 @@ class TestBuildResponse(unittest.TestCase):
     def test_no_metrics(self):
         batch = OutputBatch(
             output=torch.randn(1, 3, 1, 64, 64),
-            rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_trajectory_data=_trajectory(
                 rollout_log_probs=torch.tensor([0.0]),
             ),
         )
@@ -301,7 +315,7 @@ class TestBuildResponse(unittest.TestCase):
     def test_zero_metrics(self):
         batch = OutputBatch(
             output=torch.randn(1, 3, 1, 64, 64),
-            rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_trajectory_data=_trajectory(
                 rollout_log_probs=torch.tensor([0.0]),
             ),
         )
@@ -313,7 +327,7 @@ class TestBuildResponse(unittest.TestCase):
         batch = OutputBatch(
             output=torch.randn(1, 3, 1, 64, 64),
             peak_memory_mb=0.0,
-            rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_trajectory_data=_trajectory(
                 rollout_log_probs=torch.tensor([0.0]),
             ),
         )
@@ -325,7 +339,7 @@ class TestBuildResponse(unittest.TestCase):
         B, T = 2, 3
         batch = OutputBatch(
             output=torch.randn(B, 1, 8, 8),
-            rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_trajectory_data=_trajectory(
                 rollout_log_probs=torch.randn(B, T),
             ),
         )
@@ -346,7 +360,7 @@ class TestBuildResponse(unittest.TestCase):
         B, T, D = 2, 4, 3
         batch = OutputBatch(
             output=torch.randn(B, 1, 8, 8),
-            rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_trajectory_data=_trajectory(
                 rollout_log_probs=torch.randn(B, T),
                 dit_trajectory=RolloutDitTrajectory(
                     latents=torch.randn(B, T + 1, D),
@@ -568,7 +582,7 @@ def _store_batch(B=2, T=2, D=4, L=5, latent_steps=(0, 1, 2)):
     K = len(latent_steps)
     batch = OutputBatch(
         output=torch.randn(B, 1, 8, 8),
-        rollout_trajectory_data=RolloutTrajectoryData(
+        rollout_trajectory_data=_trajectory(
             rollout_log_probs=torch.randn(B, T),
             rollout_debug_tensors=RolloutDebugTensors(
                 rollout_model_outputs=torch.randn(B, T, D),
@@ -640,7 +654,8 @@ class TestBuildResponseViaStore(unittest.TestCase):
         )
         self.assertTrue(
             torch.equal(
-                stored["dit_trajectory.latents.1.2"], rtd.dit_trajectory.latents[1, 2]
+                stored["dit_trajectory.latents.1.2"],
+                rtd.streams[PRIMARY_STREAM].dit_trajectory.latents[1, 2],
             )
         )
         self.assertTrue(torch.equal(stored["generated_output.1"], batch.output[1]))
@@ -684,7 +699,9 @@ class TestBuildResponseViaStore(unittest.TestCase):
 
     def test_windowed_latents_are_named_by_their_original_step(self):
         batch = _store_batch(latent_steps=(2, 3, 7))
-        latents = batch.rollout_trajectory_data.dit_trajectory.latents
+        latents = batch.rollout_trajectory_data.streams[
+            PRIMARY_STREAM
+        ].dit_trajectory.latents
         stored = {}
         resps = _build_response("r", "p", 0, True, batch, stored=stored)
         for row, resp in enumerate(resps):
@@ -863,9 +880,7 @@ class TestRolloutWithoutGeneratedOutput(unittest.TestCase):
                 prompt="x", rollout=True, rollout_return_generated_output=False
             )
         )
-        req.rollout_trajectory_data = RolloutTrajectoryData(
-            rollout_log_probs=torch.randn(2, 3)
-        )
+        req.rollout_trajectory_data = _trajectory(rollout_log_probs=torch.randn(2, 3))
         return req
 
     def test_decoders_return_the_trajectory_without_the_vae(self):
@@ -1038,7 +1053,9 @@ class TestRolloutWithoutGeneratedOutput(unittest.TestCase):
             self.assertTrue(
                 torch.equal(
                     bytes_to_tensor(resp.rollout_log_probs["data"]),
-                    batch.rollout_trajectory_data.rollout_log_probs[index],
+                    batch.rollout_trajectory_data.streams[
+                        PRIMARY_STREAM
+                    ].rollout_log_probs[index],
                 )
             )
 

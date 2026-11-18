@@ -26,6 +26,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from sglang.kernels import get_kernel
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     DataType,
     quality_allows,
@@ -78,6 +79,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
+    loop_latent_sp_fns,
     prepare_rollout_if_enabled,
     rollout_scope,
     rollout_step_kwargs,
@@ -1641,8 +1643,15 @@ class Cosmos3DenoisingStage(PipelineStage):
                 raise ValueError(
                     "Cosmos3 rollout does not support action/sound modalities."
                 )
+        shard_for_sp, gather_for_sp = loop_latent_sp_fns(server_args.pipeline_config)
         prepare_rollout_if_enabled(
-            batch=batch, pipeline_config=server_args.pipeline_config
+            batch=batch,
+            stream=PRIMARY_STREAM,
+            scheduler=batch.scheduler,
+            timesteps=batch.timesteps,
+            latents=batch.latents,
+            shard_for_sp=shard_for_sp,
+            gather_for_sp=gather_for_sp,
         )
         set_rollout_early_stop_if_enabled(batch=batch)
         timesteps = batch.timesteps
@@ -1931,7 +1940,7 @@ class Cosmos3DenoisingStage(PipelineStage):
                 t,
                 latents,
                 generator=generator,
-                **rollout_step_kwargs(batch),
+                **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
                 return_dict=False,
             )[0]
 
@@ -1984,7 +1993,7 @@ class Cosmos3DenoisingStage(PipelineStage):
 
         finalize_rollout_if_enabled(
             batch=batch,
-            latents=latents,
+            latents={PRIMARY_STREAM: latents},
             num_inference_steps=len(timesteps),
             final_timestep=timesteps.new_zeros(()),
             pipeline_config=server_args.pipeline_config,
