@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import re
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -13,12 +14,18 @@ from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 
 _VALID_ROLLOUT_SDE_TYPES = ("sde", "cps", "ode")
 
+# Key in ``Req.rollout_controllers`` of the stream the denoise loop iterates.
+PRIMARY_STREAM = "primary"
+# Extra stream names become output-store path segments, which are dot-separated.
+_STREAM_NAME = re.compile(r"[a-z][a-z0-9_]*")
+
 
 @dataclass
 class RLRolloutArgs:
     """Rollout (log-prob trajectory) options used by SamplingParams and APIs."""
 
     rollout: bool = False
+    rollout_extra_streams: tuple[str, ...] = ()
     rollout_sde_type: str = "sde"
     rollout_noise_level: float = 0.7
     rollout_log_prob_no_const: bool = False
@@ -40,11 +47,29 @@ class RLRolloutArgs:
                 f"got {self.rollout_sde_type!r}"
             )
 
+        self._validate_extra_streams()
+
         if not self.rollout_return_generated_output and not self.rollout:
             raise ValueError(
                 "rollout_return_generated_output=False requires rollout=True; "
                 "it is a /rollout/generate option"
             )
+
+    def _validate_extra_streams(self) -> None:
+        streams = self.rollout_extra_streams
+        if isinstance(streams, str):
+            raise ValueError(
+                f"rollout_extra_streams must be a list of stream names, got {streams!r}"
+            )
+        if streams and not self.rollout:
+            raise ValueError("rollout_extra_streams requires rollout=True")
+        if len(set(streams)) != len(streams):
+            raise ValueError(f"rollout_extra_streams has duplicates: {list(streams)}")
+        for name in streams:
+            if name == PRIMARY_STREAM or not (
+                isinstance(name, str) and _STREAM_NAME.fullmatch(name)
+            ):
+                raise ValueError(f"Invalid rollout extra stream name: {name!r}")
 
     @classmethod
     def validate_sampling_params(cls, params: Any) -> None:
@@ -55,6 +80,7 @@ class RLRolloutArgs:
         """
         cls(
             rollout=params.rollout,
+            rollout_extra_streams=params.rollout_extra_streams,
             rollout_sde_type=params.rollout_sde_type,
             rollout_noise_level=params.rollout_noise_level,
             rollout_log_prob_no_const=params.rollout_log_prob_no_const,
@@ -88,6 +114,12 @@ class RLRolloutArgs:
             help="Enable rollout mode and return per-step log_prob trajectory",
         )
         add_argument(
+            "--rollout-extra-streams",
+            type=str,
+            nargs="+",
+            help="Streams to roll out besides the primary one, e.g. 'audio' (LTX2Pipeline).",
+        )
+        add_argument(
             "--rollout-sde-type",
             type=str,
             choices=list(_VALID_ROLLOUT_SDE_TYPES),
@@ -116,6 +148,9 @@ class RLRolloutArgs:
     def from_dict(cls, kwargs: dict[str, Any]) -> RLRolloutArgs:
         return cls(
             rollout=bool(kwargs.get("rollout", cls.rollout)),
+            rollout_extra_streams=tuple(
+                kwargs.get("rollout_extra_streams", cls.rollout_extra_streams)
+            ),
             rollout_sde_type=str(kwargs.get("rollout_sde_type", cls.rollout_sde_type)),
             rollout_noise_level=float(
                 kwargs.get("rollout_noise_level", cls.rollout_noise_level)

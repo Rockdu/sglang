@@ -97,6 +97,13 @@ class ComposedPipelineBase(ABC):
     pipeline_name: str
     default_model_subfolder: str | None = None
 
+    # Extra streams a rollout may request; the denoising stage must prepare each.
+    supported_rollout_extra_streams: frozenset[str] = frozenset()
+
+    @classmethod
+    def validate_rollout_request(cls, batch: Req) -> None:
+        """Reject a rollout request this pipeline cannot serve."""
+
     def is_lora_effective(self):
         return False
 
