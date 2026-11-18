@@ -14,7 +14,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 from dataclasses import dataclass, field, fields
 from enum import Enum
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Any
 
 import torch
@@ -2047,6 +2047,12 @@ class DenoisingStage(PipelineStage):
         """Final latents of each of the loop's latent streams, by stream name."""
         return {PRIMARY_STREAM: ctx.latents}
 
+    def _replay_cond_kwargs(
+        self, ctx: DenoisingContext, batch: Req, *, negative: bool
+    ) -> dict[str, Any]:
+        """Conditioning the trainer's replay needs beyond ``ctx.pos/neg_cond_kwargs``."""
+        return {}
+
     @torch.no_grad()
     def _denoise(
         self,
@@ -2063,6 +2069,7 @@ class DenoisingStage(PipelineStage):
             pos_cond_kwargs=ctx.pos_cond_kwargs,
             neg_cond_kwargs=ctx.neg_cond_kwargs,
             guidance=ctx.guidance,
+            replay_cond_kwargs=partial(self._replay_cond_kwargs, ctx, batch),
         )
         timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
 

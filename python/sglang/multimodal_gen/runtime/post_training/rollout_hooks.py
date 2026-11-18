@@ -223,6 +223,7 @@ def init_rollout_env_if_enabled(
     pos_cond_kwargs: dict[str, Any],
     neg_cond_kwargs: dict[str, Any],
     guidance: torch.Tensor | None,
+    replay_cond_kwargs: Callable[..., dict[str, Any]] | None = None,
 ) -> None:
     """Snapshot the DiT conditioning that the trainer replays."""
     if not batch.rollout:
@@ -234,6 +235,12 @@ def init_rollout_env_if_enabled(
         return
 
     if collect_env:
+        if replay_cond_kwargs is not None:
+            pos_cond_kwargs = pos_cond_kwargs | replay_cond_kwargs(negative=False)
+            if batch.do_classifier_free_guidance:
+                neg_cond_kwargs = (neg_cond_kwargs or {}) | replay_cond_kwargs(
+                    negative=True
+                )
         env = RolloutDenoisingEnv(
             image_kwargs=_kwargs_to_cpu(image_kwargs),
             pos_cond_kwargs=_kwargs_to_cpu(pos_cond_kwargs),

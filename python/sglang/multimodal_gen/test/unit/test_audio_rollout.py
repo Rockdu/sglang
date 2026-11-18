@@ -1,25 +1,44 @@
 # SPDX-License-Identifier: Apache-2.0
 """Regressions specific to audio rollout wiring and request ownership."""
 
+import asyncio
+import copy
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 import pytest
 import torch
+from fastapi import HTTPException
 
+from sglang.multimodal_gen import registry
 from sglang.multimodal_gen.configs.post_training.rl_rollout import AUDIO_STREAM
+from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
+from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+    RolloutRequest,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
+    _maybe_deserialize,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
+from sglang.multimodal_gen.runtime.pipelines.ltx_2_pipeline import (
+    LTX2Pipeline,
+    LTX2TwoStagePipeline,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
+    DenoisingContext,
     DenoisingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DenoisingStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2 import (
+    denoising as ltx2_denoising,
 )
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     truncate_rollout_sigmas,
@@ -81,6 +100,51 @@ def _prepare_primary_stream(batch):
     )
 
 
+def _prepare_both_streams(batch):
+    """What the LTX-2 loop does before SP sharding; returns the audio scheduler."""
+    audio_scheduler = copy.deepcopy(batch.scheduler)
+    _prepare_primary_stream(batch)
+    set_rollout_early_stop_if_enabled(batch=batch)
+    prepare_rollout_if_enabled(
+        batch=batch,
+        stream=AUDIO_STREAM,
+        scheduler=audio_scheduler,
+        timesteps=audio_scheduler.timesteps,
+        latents=batch.audio_latents,
+        shard_for_sp=ltx2_denoising._require_replicated_audio,
+        gather_for_sp=ltx2_denoising._require_replicated_audio,
+    )
+    return audio_scheduler
+
+
+def _run_both_streams(batch, audio_scheduler):
+    for timestep in batch.timesteps:
+        batch.latents = batch.scheduler.step(
+            torch.zeros_like(batch.latents),
+            timestep,
+            batch.latents,
+            **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
+            return_dict=False,
+        )[0]
+        states = [g.get_state() for g in batch.generator]
+        batch.audio_latents = audio_scheduler.step(
+            torch.zeros_like(batch.audio_latents),
+            timestep,
+            batch.audio_latents,
+            **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
+            return_dict=False,
+        )[0]
+        for generator, state in zip(batch.generator, states):
+            torch.testing.assert_close(generator.get_state(), state, rtol=0, atol=0)
+    finalize_rollout_if_enabled(
+        batch=batch,
+        latents={PRIMARY_STREAM: batch.latents, AUDIO_STREAM: batch.audio_latents},
+        num_inference_steps=len(batch.timesteps),
+        final_timestep=torch.tensor(0.0),
+        pipeline_config=_CONFIG,
+    )
+
+
 def test_audio_rng_is_derived_from_the_seed_alone(batch):
     """An extra stream's seed depends only on the request seed and the stream name."""
     states = [g.get_state() for g in batch.generator]
@@ -93,6 +157,202 @@ def test_audio_rng_is_derived_from_the_seed_alone(batch):
     assert sum(map(len, seeds)) == len(set().union(*seeds))
     for visual, state in zip(batch.generator, states):
         torch.testing.assert_close(visual.get_state(), state, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("stop_step_index,kept_steps", [(None, [0, 2]), (0, [0, 1])])
+def test_audio_steps_finalize_and_survive_output_slicing(
+    batch, stop_step_index, kept_steps
+):
+    """Both streams run the same, possibly stopped, schedule and survive select/merge."""
+    batch.rollout_stop_step_index = stop_step_index
+    batch.rollout_return_step_indices = kept_steps
+    with rollout_scope(batch):
+        audio_scheduler = _prepare_both_streams(batch)
+        visual = batch.rollout_controllers[PRIMARY_STREAM]
+        audio = batch.rollout_controllers[AUDIO_STREAM]
+        torch.testing.assert_close(audio.sigmas, visual.sigmas, rtol=0, atol=0)
+        assert audio.sigma_max == visual.sigma_max
+        _run_both_streams(batch, audio_scheduler)
+    data = batch.rollout_trajectory_data
+    num_steps = 2 if stop_step_index is None else 1
+    for stream, latents in (
+        (data.streams[PRIMARY_STREAM], batch.latents),
+        (data.streams[AUDIO_STREAM], batch.audio_latents),
+    ):
+        assert stream.dit_trajectory.latent_step_indices.tolist() == kept_steps
+        assert stream.rollout_log_probs.shape == (2, num_steps)
+        assert torch.isfinite(stream.rollout_log_probs).all()
+        torch.testing.assert_close(stream.dit_trajectory.latents[:, -1], latents)
+    rows = [select_output_rollout_trajectory(data, i) for i in range(2)]
+    result = OutputBatch(
+        output=torch.zeros(2, 1),
+        audio=torch.arange(16).view(2, 8).float(),
+        audio_sample_rate=24000,
+        rollout_trajectory_data=concat_rollout_trajectory_data(rows),
+    )
+    responses = rollout_api._build_response("r", "p", 10, True, result)
+    for i, response in enumerate(responses):
+        audio_payload = _maybe_deserialize(response.extra_streams[AUDIO_STREAM])
+        torch.testing.assert_close(
+            audio_payload["rollout_log_probs"],
+            data.streams[AUDIO_STREAM].rollout_log_probs[i],
+        )
+        trajectory = audio_payload["dit_trajectory"]
+        torch.testing.assert_close(
+            trajectory["latents"],
+            data.streams[AUDIO_STREAM].dit_trajectory.latents[i],
+        )
+        torch.testing.assert_close(
+            trajectory["timesteps"],
+            data.streams[AUDIO_STREAM].dit_trajectory.timesteps,
+        )
+        torch.testing.assert_close(
+            trajectory["sigmas"], data.streams[AUDIO_STREAM].dit_trajectory.sigmas
+        )
+        assert trajectory["latent_step_indices"].tolist() == kept_steps
+        torch.testing.assert_close(audio_payload["generated_output"], result.audio[i])
+        assert audio_payload["sample_rate"] == 24000
+
+
+def test_sp_sharded_audio_fails_instead_of_returning_one_shard(batch):
+    """SP-sharded audio latents must fail, not come back as one rank's shard."""
+    batch.rollout_sde_type = "ode"
+    batch.rollout_log_prob_no_const = True
+    with pytest.raises(RuntimeError, match="replicated across SP ranks"):
+        with rollout_scope(batch):
+            audio_scheduler = _prepare_both_streams(batch)
+            batch.did_sp_shard_audio_latents = True
+            _run_both_streams(batch, audio_scheduler)
+    assert batch.rollout_trajectory_data is None
+
+
+@pytest.mark.parametrize(
+    "pipeline_class_name,extra_streams,pass_text_mask",
+    [("LTX2Pipeline", (AUDIO_STREAM,), True), ("LTX2TwoStagePipeline", (), False)],
+)
+def test_ltx2_replay_env_holds_text_conditioning_of_both_streams(
+    monkeypatch, batch, pipeline_class_name, extra_streams, pass_text_mask
+):
+    """The LTX-2 replay env carries the audio text context and the masks the DiT read."""
+    batch.rollout_extra_streams = extra_streams
+    batch.rollout_return_denoising_env = True
+    batch.do_classifier_free_guidance = True
+    batch.height = batch.width = 64
+    batch.num_frames = 9
+    batch.prompt_embeds = [torch.randn(2, 3, 4)]
+    batch.negative_prompt_embeds = [torch.randn(2, 3, 4)]
+    batch.audio_prompt_embeds = [torch.randn(2, 3, 2)]
+    batch.negative_audio_prompt_embeds = [torch.randn(2, 3, 2)]
+    batch.prompt_attention_mask = torch.ones(2, 3)
+    batch.negative_attention_mask = torch.zeros(2, 3)
+    generic_kwargs = {
+        "encoder_hidden_states": batch.prompt_embeds[0],
+        "encoder_attention_mask": batch.prompt_attention_mask,
+    }
+    base_ctx = DenoisingContext(
+        scheduler=batch.scheduler,
+        extra_step_kwargs={},
+        target_dtype=torch.float32,
+        autocast_enabled=False,
+        timesteps=batch.scheduler.timesteps,
+        num_inference_steps=2,
+        num_warmup_steps=0,
+        image_kwargs={},
+        pos_cond_kwargs=generic_kwargs,
+        neg_cond_kwargs=dict(generic_kwargs),
+        latents=batch.latents,
+        boundary_timestep=None,
+        z=None,
+        reserved_frames_mask=None,
+        seq_len=None,
+        guidance=None,
+        is_warmup=False,
+    )
+    monkeypatch.setattr(
+        DenoisingStage, "_prepare_denoising_loop", lambda *args: base_ctx
+    )
+    monkeypatch.setattr(ltx2_denoising, "is_ltx23_native_variant", lambda _: True)
+    monkeypatch.setattr(ltx2_denoising, "get_sp_world_size", lambda: 1)
+    server_args = SimpleNamespace(
+        pipeline_class_name=pipeline_class_name,
+        enable_cfg_parallel=False,
+        pipeline_config=SimpleNamespace(
+            vae_config=SimpleNamespace(
+                arch_config=SimpleNamespace(
+                    spatial_compression_ratio=32, temporal_compression_ratio=8
+                )
+            ),
+            can_shard_audio_latents_for_sp=lambda latents: False,
+        ),
+    )
+    stage = object.__new__(ltx2_denoising.LTX2DenoisingStage)
+    stage.server_args = server_args
+    _prepare_primary_stream(batch)
+
+    stage._run_denoising_loop = Mock(side_effect=_StopAfterEnvSnapshot)
+    with pytest.raises(_StopAfterEnvSnapshot):
+        stage._denoise(batch, server_args)
+
+    env = batch._rollout_denoising_env_state["env"]
+    expected = {
+        "pos_cond_kwargs": (
+            batch.prompt_embeds[0],
+            batch.audio_prompt_embeds[0],
+            batch.prompt_attention_mask if pass_text_mask else None,
+        ),
+        "neg_cond_kwargs": (
+            batch.negative_prompt_embeds[0],
+            batch.negative_audio_prompt_embeds[0],
+            batch.negative_attention_mask if pass_text_mask else None,
+        ),
+    }
+    for name, (text, audio_text, mask) in expected.items():
+        kwargs = getattr(env, name)
+        torch.testing.assert_close(kwargs["encoder_hidden_states"], text)
+        torch.testing.assert_close(kwargs["audio_encoder_hidden_states"], audio_text)
+        for key in ("encoder_attention_mask", "audio_encoder_attention_mask"):
+            if mask is None:
+                assert kwargs[key] is None
+            else:
+                torch.testing.assert_close(kwargs[key], mask)
+
+
+class _StopAfterEnvSnapshot(Exception):
+    pass
+
+
+def test_visual_only_ltx_rollout_keeps_the_waveform_and_no_audio_stream(batch):
+    """An unlisted audio stream has no controller but still stops with the video stream."""
+    batch.rollout_extra_streams = ()
+    batch.rollout_stop_step_index = 0
+    batch.rollout_return_step_indices = [0, 1]
+    with rollout_scope(batch):
+        audio_scheduler = _prepare_both_streams(batch)
+        assert AUDIO_STREAM not in batch.rollout_controllers
+        torch.testing.assert_close(
+            audio_scheduler.sigmas,
+            batch.rollout_controllers[PRIMARY_STREAM].sigmas,
+            rtol=0,
+            atol=0,
+        )
+        _run_both_streams(batch, audio_scheduler)
+    data = batch.rollout_trajectory_data
+    assert set(data.streams) == {PRIMARY_STREAM}
+    audio = torch.randn(2, 8)
+    result = OutputBatch(
+        output=torch.zeros(2, 3),
+        audio=audio,
+        audio_sample_rate=24000,
+        rollout_trajectory_data=data,
+    )
+    for rollout in (True, False):
+        responses = rollout_api._build_response("r", "p", 10, rollout, result)
+        for i, response in enumerate(responses):
+            audio_payload = _maybe_deserialize(response.extra_streams[AUDIO_STREAM])
+            torch.testing.assert_close(audio_payload["generated_output"], audio[i])
+            assert audio_payload["sample_rate"] == 24000
+            for key in ("rollout_log_probs", "rollout_debug_tensors", "dit_trajectory"):
+                assert audio_payload[key] is None
 
 
 def _identity_for_sp(batch, tensor):
@@ -313,6 +573,56 @@ def test_stage_cleanup_allows_retry(batch, stage_cls, loop_name):
     assert batch.rollout_controllers == {}
 
 
+@pytest.mark.parametrize(
+    "model_pipeline,override,override_pipeline,error",
+    [
+        (LTX2Pipeline, None, None, None),
+        (LTX2TwoStagePipeline, "LTX2Pipeline", LTX2Pipeline, None),
+        (
+            LTX2Pipeline,
+            "LTX2TwoStagePipeline",
+            LTX2TwoStagePipeline,
+            "does not support rollout of streams ['audio']",
+        ),
+    ],
+)
+def test_http_validates_the_served_pipeline(
+    monkeypatch, model_pipeline, override, override_pipeline, error
+):
+    """The served pipeline is the --pipeline-class-name override when set, else the model's."""
+    forward = _serve(monkeypatch, model_pipeline, override, override_pipeline)
+    request = RolloutRequest(
+        prompt="test", seed=42, rollout_extra_streams=[AUDIO_STREAM]
+    )
+    if error is None:
+        assert asyncio.run(rollout_api.rollout_generate(request)).status_code == 200
+        forward.assert_awaited_once()
+    else:
+        _assert_rejected(request, forward, match=error)
+
+
+def test_http_rejects_extra_streams_without_rollout(monkeypatch):
+    forward = _serve(monkeypatch, LTX2Pipeline, None, None)
+    request = RolloutRequest(
+        prompt="test", seed=42, rollout=False, rollout_extra_streams=[AUDIO_STREAM]
+    )
+    _assert_rejected(
+        request, forward, match="rollout_extra_streams requires rollout=True"
+    )
+
+
+@pytest.mark.parametrize("extra_streams", [(AUDIO_STREAM,), ()])
+def test_audio_rollout_requires_generated_audio(batch, extra_streams):
+    """Rolling out the audio stream needs generated audio; a video-only rollout does not."""
+    batch.generate_audio = False
+    batch.rollout_extra_streams = extra_streams
+    if extra_streams:
+        with pytest.raises(ValueError, match="generate_audio=True"):
+            LTX2Pipeline.validate_rollout_request(batch)
+    else:
+        LTX2Pipeline.validate_rollout_request(batch)
+
+
 def test_requested_stream_the_stage_never_prepared_fails_the_request(batch):
     """A listed stream must not silently vanish from the response."""
     batch.rollout_extra_streams = ("action",)
@@ -340,3 +650,42 @@ def test_extra_stream_needs_a_flow_match_euler_scheduler(batch):
             shard_for_sp=_identity_for_sp,
             gather_for_sp=_identity_for_sp,
         )
+
+
+def _assert_rejected(request, forward, *, match):
+    with pytest.raises(HTTPException) as error:
+        asyncio.run(rollout_api.rollout_generate(request))
+    assert error.value.status_code == 400
+    assert match in error.value.detail
+    forward.assert_not_awaited()
+
+
+def _serve(monkeypatch, model_pipeline, override, override_pipeline):
+    args = SimpleNamespace(
+        pipeline_class_name=override,
+        model_path="test",
+        model_id=None,
+        backend="sglang",
+        attention_backend_config={},
+        enable_trace=False,
+    )
+    monkeypatch.setattr(
+        registry,
+        "get_model_info",
+        lambda *a, **kw: SimpleNamespace(pipeline_cls=model_pipeline),
+    )
+    monkeypatch.setattr(
+        registry,
+        "get_pipeline_class",
+        lambda name: {override: override_pipeline}[name],
+    )
+    monkeypatch.setattr(rollout_api, "get_global_server_args", lambda: args)
+    monkeypatch.setattr(
+        rollout_api,
+        "build_sampling_params",
+        lambda rid, **kw: LTX23SamplingParams(**kw),
+    )
+    forward = AsyncMock(return_value=OutputBatch(output=torch.zeros(1, 1)))
+    monkeypatch.setattr(rollout_api.async_scheduler_client, "forward", forward)
+    monkeypatch.setattr(rollout_api, "_build_response", lambda *a, **kw: [])
+    return forward

@@ -1378,6 +1378,29 @@ class LTX2DenoisingStage(DenoisingStage):
             }
         return kwargs
 
+    def _replay_cond_kwargs(
+        self, ctx: LTX2DenoisingContext, batch: Req, *, negative: bool
+    ) -> dict[str, object]:
+        """Text conditioning of both streams; the DiT reads it from the batch, not ``ctx``."""
+        prompt_embeds, audio_prompt_embeds = (
+            (batch.negative_prompt_embeds, batch.negative_audio_prompt_embeds)
+            if negative
+            else (batch.prompt_embeds, batch.audio_prompt_embeds)
+        )
+        return self._build_ltx2_model_kwargs(
+            ctx,
+            {},
+            encoder_hidden_states=prompt_embeds[0],
+            audio_encoder_hidden_states=audio_prompt_embeds[0],
+            encoder_attention_mask=self._get_ltx_prompt_attention_mask(
+                batch,
+                is_ltx23_variant=(
+                    ctx.is_ltx23_variant and not ctx.use_ltx23_legacy_one_stage
+                ),
+                negative=negative,
+            ),
+        )
+
     @staticmethod
     def _ltx2_guidance_perturbation_config(
         pass_spec: LTX2GuidancePassSpec,
@@ -1986,7 +2009,11 @@ class LTX2DenoisingStage(DenoisingStage):
                     return_dict=False,
                 )[0]
                 ctx.audio_latents = ctx.audio_scheduler.step(
-                    model_audio, step.t_device, ctx.audio_latents, return_dict=False
+                    model_audio,
+                    step.t_device,
+                    ctx.audio_latents,
+                    **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
+                    return_dict=False,
                 )[0]
                 if ctx.denoise_mask is not None and ctx.clean_latent is not None:
                     ctx.latents = (
@@ -2639,6 +2666,11 @@ class LTX2DenoisingStage(DenoisingStage):
             server_args=server_args,
             is_warmup=ctx.is_warmup,
         )
+
+    def _rollout_stream_latents(
+        self, ctx: LTX2DenoisingContext
+    ) -> dict[str, torch.Tensor]:
+        return {PRIMARY_STREAM: ctx.latents, AUDIO_STREAM: ctx.audio_latents}
 
     def _post_denoising_loop(
         self,
