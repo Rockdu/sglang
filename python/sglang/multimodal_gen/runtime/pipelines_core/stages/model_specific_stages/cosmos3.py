@@ -79,7 +79,7 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
-    loop_latent_sp_fns,
+    pipeline_config_sp_fns,
     prepare_rollout_if_enabled,
     rollout_scope,
     rollout_step_kwargs,
@@ -1643,7 +1643,9 @@ class Cosmos3DenoisingStage(PipelineStage):
                 raise ValueError(
                     "Cosmos3 rollout does not support action/sound modalities."
                 )
-        shard_for_sp, gather_for_sp = loop_latent_sp_fns(server_args.pipeline_config)
+        shard_for_sp, gather_for_sp = pipeline_config_sp_fns(
+            server_args.pipeline_config
+        )
         prepare_rollout_if_enabled(
             batch=batch,
             stream=PRIMARY_STREAM,

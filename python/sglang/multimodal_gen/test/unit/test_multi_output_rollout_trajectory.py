@@ -111,18 +111,18 @@ class TestMultiOutputRolloutTrajectory(unittest.TestCase):
         }
         per_output = [_per_output_trajectory(i) for i in range(2)]
         for data in per_output:
-            stream = _primary(data)
-            stream.dit_trajectory = replace(stream.dit_trajectory, **shared)
+            stream_data = _primary(data)
+            stream_data.dit_trajectory = replace(stream_data.dit_trajectory, **shared)
 
         merged = concat_rollout_trajectory_data(per_output)
         selected = select_output_rollout_trajectory(merged, 1)
 
-        for trajectory in (
+        for dit_trajectory in (
             _primary(merged).dit_trajectory,
             _primary(selected).dit_trajectory,
         ):
             for name, value in shared.items():
-                self.assertIs(getattr(trajectory, name), value)
+                self.assertIs(getattr(dit_trajectory, name), value)
 
     def test_select_without_output_index_returns_group_trajectory(self):
         merged = concat_rollout_trajectory_data(

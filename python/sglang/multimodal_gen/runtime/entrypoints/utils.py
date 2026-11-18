@@ -1013,13 +1013,13 @@ def _try_save_video_with_audio(
 def _validate_rollout_request(req: Req, server_args: ServerArgs) -> None:
     if not req.rollout:
         return
-    requested_streams = set(req.rollout_extra_streams)
+    requested_extra_streams = set(req.rollout_extra_streams)
     pipeline_cls = get_served_pipeline_class(server_args)
     if pipeline_cls is None:
-        if requested_streams:
+        if requested_extra_streams:
             raise ValueError("Could not resolve the pipeline for extra stream rollout")
         return
-    unsupported = requested_streams - pipeline_cls.supported_rollout_extra_streams
+    unsupported = requested_extra_streams - pipeline_cls.supported_rollout_extra_streams
     if unsupported:
         raise ValueError(
             f"{pipeline_cls.__name__} does not support rollout of streams "

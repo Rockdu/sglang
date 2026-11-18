@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Regressions specific to audio rollout wiring and request ownership."""
+"""Rollout of named latent streams: the per-stream hooks, per-sample noise, LTX-2 audio wiring, and the extra_streams response."""
 
 import asyncio
 import copy
@@ -12,7 +12,10 @@ import torch
 from fastapi import HTTPException
 
 from sglang.multimodal_gen import registry
-from sglang.multimodal_gen.configs.post_training.rl_rollout import AUDIO_STREAM
+from sglang.multimodal_gen.configs.post_training.rl_rollout import (
+    AUDIO_STREAM,
+    RLRolloutArgs,
+)
 from sglang.multimodal_gen.configs.sample.ltx_2 import LTX23SamplingParams
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
@@ -49,16 +52,18 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     PRIMARY_STREAM,
-    derive_stream_generators,
+    derive_extra_stream_generators,
     finalize_rollout_if_enabled,
-    loop_latent_sp_fns,
+    pipeline_config_sp_fns,
     prepare_rollout_if_enabled,
     rollout_scope,
     rollout_step_kwargs,
     set_rollout_early_stop_if_enabled,
 )
 
-_CONFIG = SimpleNamespace(shard_latents_for_sp=lambda batch, latents: (latents, False))
+_PIPELINE_CONFIG = SimpleNamespace(
+    shard_latents_for_sp=lambda batch, latents: (latents, False)
+)
 
 
 @pytest.fixture
@@ -88,7 +93,7 @@ def batch(monkeypatch):
 
 def _prepare_primary_stream(batch):
     """What a denoising stage does for the stream its loop iterates."""
-    shard_for_sp, gather_for_sp = loop_latent_sp_fns(_CONFIG)
+    shard_for_sp, gather_for_sp = pipeline_config_sp_fns(_PIPELINE_CONFIG)
     prepare_rollout_if_enabled(
         batch=batch,
         stream=PRIMARY_STREAM,
@@ -117,7 +122,7 @@ def _prepare_both_streams(batch):
     return audio_scheduler
 
 
-def _run_both_streams(batch, audio_scheduler):
+def _step_and_finalize_both_streams(batch, audio_scheduler):
     for timestep in batch.timesteps:
         batch.latents = batch.scheduler.step(
             torch.zeros_like(batch.latents),
@@ -126,7 +131,6 @@ def _run_both_streams(batch, audio_scheduler):
             **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
             return_dict=False,
         )[0]
-        states = [g.get_state() for g in batch.generator]
         batch.audio_latents = audio_scheduler.step(
             torch.zeros_like(batch.audio_latents),
             timestep,
@@ -134,61 +138,78 @@ def _run_both_streams(batch, audio_scheduler):
             **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
             return_dict=False,
         )[0]
-        for generator, state in zip(batch.generator, states):
-            torch.testing.assert_close(generator.get_state(), state, rtol=0, atol=0)
     finalize_rollout_if_enabled(
         batch=batch,
         latents={PRIMARY_STREAM: batch.latents, AUDIO_STREAM: batch.audio_latents},
         num_inference_steps=len(batch.timesteps),
         final_timestep=torch.tensor(0.0),
-        pipeline_config=_CONFIG,
+        pipeline_config=_PIPELINE_CONFIG,
     )
 
 
-def test_audio_rng_is_derived_from_the_seed_alone(batch):
+def test_extra_stream_rng_depends_only_on_the_request_seed_and_the_stream_name(batch):
     """An extra stream's seed depends only on the request seed and the stream name."""
-    states = [g.get_state() for g in batch.generator]
-    audio = derive_stream_generators(batch.generator, stream=AUDIO_STREAM)
+    request_states = [g.get_state() for g in batch.generator]
+    audio = derive_extra_stream_generators(batch.generator, stream=AUDIO_STREAM)
     assert audio[0].initial_seed() == 635590486471046510
-    action = derive_stream_generators(batch.generator, stream="action")
-    seeds = [
-        {g.initial_seed() for g in gens} for gens in (batch.generator, audio, action)
-    ]
-    assert sum(map(len, seeds)) == len(set().union(*seeds))
-    for visual, state in zip(batch.generator, states):
-        torch.testing.assert_close(visual.get_state(), state, rtol=0, atol=0)
+    action = derive_extra_stream_generators(batch.generator, stream="action")
+    all_seeds = [g.initial_seed() for g in (*batch.generator, *audio, *action)]
+    assert len(set(all_seeds)) == len(all_seeds)
+    for request_generator, state in zip(batch.generator, request_states):
+        torch.testing.assert_close(request_generator.get_state(), state, rtol=0, atol=0)
+
+
+def test_audio_step_does_not_advance_the_request_generators(batch):
+    with rollout_scope(batch):
+        audio_scheduler = _prepare_both_streams(batch)
+        request_states = [g.get_state() for g in batch.generator]
+        audio_scheduler.step(
+            torch.zeros_like(batch.audio_latents),
+            batch.timesteps[0],
+            batch.audio_latents,
+            **rollout_step_kwargs(batch, stream=AUDIO_STREAM),
+            return_dict=False,
+        )
+        for request_generator, state in zip(batch.generator, request_states):
+            torch.testing.assert_close(
+                request_generator.get_state(), state, rtol=0, atol=0
+            )
 
 
 @pytest.mark.parametrize("stop_step_index,kept_steps", [(None, [0, 2]), (0, [0, 1])])
-def test_audio_steps_finalize_and_survive_output_slicing(
+def test_audio_rollout_reaches_the_response_through_select_and_merge(
     batch, stop_step_index, kept_steps
 ):
-    """Both streams run the same, possibly stopped, schedule and survive select/merge."""
+    """Audio runs the primary's, possibly stopped, schedule; its rollout survives per-output select and merge and is returned under extra_streams."""
     batch.rollout_stop_step_index = stop_step_index
     batch.rollout_return_step_indices = kept_steps
     with rollout_scope(batch):
         audio_scheduler = _prepare_both_streams(batch)
-        visual = batch.rollout_controllers[PRIMARY_STREAM]
-        audio = batch.rollout_controllers[AUDIO_STREAM]
-        torch.testing.assert_close(audio.sigmas, visual.sigmas, rtol=0, atol=0)
-        assert audio.sigma_max == visual.sigma_max
-        _run_both_streams(batch, audio_scheduler)
+        primary_controller = batch.rollout_controllers[PRIMARY_STREAM]
+        audio_controller = batch.rollout_controllers[AUDIO_STREAM]
+        torch.testing.assert_close(
+            audio_controller.sigmas, primary_controller.sigmas, rtol=0, atol=0
+        )
+        assert audio_controller.sigma_max == primary_controller.sigma_max
+        _step_and_finalize_both_streams(batch, audio_scheduler)
     data = batch.rollout_trajectory_data
     num_steps = 2 if stop_step_index is None else 1
-    for stream, latents in (
+    for stream_data, final_latents in (
         (data.streams[PRIMARY_STREAM], batch.latents),
         (data.streams[AUDIO_STREAM], batch.audio_latents),
     ):
-        assert stream.dit_trajectory.latent_step_indices.tolist() == kept_steps
-        assert stream.rollout_log_probs.shape == (2, num_steps)
-        assert torch.isfinite(stream.rollout_log_probs).all()
-        torch.testing.assert_close(stream.dit_trajectory.latents[:, -1], latents)
-    rows = [select_output_rollout_trajectory(data, i) for i in range(2)]
+        assert stream_data.dit_trajectory.latent_step_indices.tolist() == kept_steps
+        assert stream_data.rollout_log_probs.shape == (2, num_steps)
+        assert torch.isfinite(stream_data.rollout_log_probs).all()
+        torch.testing.assert_close(
+            stream_data.dit_trajectory.latents[:, -1], final_latents
+        )
+    per_output = [select_output_rollout_trajectory(data, i) for i in range(2)]
     result = OutputBatch(
         output=torch.zeros(2, 1),
         audio=torch.arange(16).view(2, 8).float(),
         audio_sample_rate=24000,
-        rollout_trajectory_data=concat_rollout_trajectory_data(rows),
+        rollout_trajectory_data=concat_rollout_trajectory_data(per_output),
     )
     responses = rollout_api._build_response("r", "p", 10, True, result)
     for i, response in enumerate(responses):
@@ -197,33 +218,37 @@ def test_audio_steps_finalize_and_survive_output_slicing(
             audio_payload["rollout_log_probs"],
             data.streams[AUDIO_STREAM].rollout_log_probs[i],
         )
-        trajectory = audio_payload["dit_trajectory"]
+        dit_trajectory = audio_payload["dit_trajectory"]
         torch.testing.assert_close(
-            trajectory["latents"],
+            dit_trajectory["latents"],
             data.streams[AUDIO_STREAM].dit_trajectory.latents[i],
         )
         torch.testing.assert_close(
-            trajectory["timesteps"],
+            dit_trajectory["timesteps"],
             data.streams[AUDIO_STREAM].dit_trajectory.timesteps,
         )
         torch.testing.assert_close(
-            trajectory["sigmas"], data.streams[AUDIO_STREAM].dit_trajectory.sigmas
+            dit_trajectory["sigmas"], data.streams[AUDIO_STREAM].dit_trajectory.sigmas
         )
-        assert trajectory["latent_step_indices"].tolist() == kept_steps
+        assert dit_trajectory["latent_step_indices"].tolist() == kept_steps
         torch.testing.assert_close(audio_payload["generated_output"], result.audio[i])
         assert audio_payload["sample_rate"] == 24000
 
 
-def test_sp_sharded_audio_fails_instead_of_returning_one_shard(batch):
-    """SP-sharded audio latents must fail, not come back as one rank's shard."""
+def test_sp_sharded_audio_fails_at_the_final_gather_of_an_ode_rollout(batch):
+    """An ODE rollout draws no noise, so only the gather can catch SP-sharded audio latents."""
     batch.rollout_sde_type = "ode"
     batch.rollout_log_prob_no_const = True
     with pytest.raises(RuntimeError, match="replicated across SP ranks"):
         with rollout_scope(batch):
             audio_scheduler = _prepare_both_streams(batch)
             batch.did_sp_shard_audio_latents = True
-            _run_both_streams(batch, audio_scheduler)
+            _step_and_finalize_both_streams(batch, audio_scheduler)
     assert batch.rollout_trajectory_data is None
+
+
+class _StopAfterEnvSnapshot(Exception):
+    pass
 
 
 @pytest.mark.parametrize(
@@ -317,12 +342,10 @@ def test_ltx2_replay_env_holds_text_conditioning_of_both_streams(
                 torch.testing.assert_close(kwargs[key], mask)
 
 
-class _StopAfterEnvSnapshot(Exception):
-    pass
-
-
-def test_visual_only_ltx_rollout_keeps_the_waveform_and_no_audio_stream(batch):
-    """An unlisted audio stream has no controller but still stops with the video stream."""
+def test_audio_not_requested_for_rollout_stops_with_the_primary_and_returns_only_its_waveform(
+    batch,
+):
+    """Without "audio" in rollout_extra_streams the audio stream has no controller and no rollout fields; its scheduler still stops and its waveform is returned."""
     batch.rollout_extra_streams = ()
     batch.rollout_stop_step_index = 0
     batch.rollout_return_step_indices = [0, 1]
@@ -335,7 +358,7 @@ def test_visual_only_ltx_rollout_keeps_the_waveform_and_no_audio_stream(batch):
             rtol=0,
             atol=0,
         )
-        _run_both_streams(batch, audio_scheduler)
+        _step_and_finalize_both_streams(batch, audio_scheduler)
     data = batch.rollout_trajectory_data
     assert set(data.streams) == {PRIMARY_STREAM}
     audio = torch.randn(2, 8)
@@ -359,17 +382,17 @@ def _identity_for_sp(batch, tensor):
     return tensor
 
 
-def _prepare_stream_on_its_own_grid(batch, name):
+def _prepare_stream_on_its_own_grid(batch, stream, latents):
     """A FlowMatch Euler stream with the primary's step count but another shift."""
     scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
     scheduler.set_timesteps(sigmas=[0.8, 0.4])
     uncut_sigmas = scheduler.sigmas.clone()
     prepare_rollout_if_enabled(
         batch=batch,
-        stream=name,
+        stream=stream,
         scheduler=scheduler,
         timesteps=scheduler.timesteps,
-        latents=batch.audio_latents,
+        latents=latents,
         shard_for_sp=_identity_for_sp,
         gather_for_sp=_identity_for_sp,
     )
@@ -377,29 +400,33 @@ def _prepare_stream_on_its_own_grid(batch, name):
 
 
 @pytest.mark.parametrize("stop_step_index", [None, 0])
-def test_any_named_stream_on_its_own_grid_reaches_the_response(batch, stop_step_index):
+def test_any_named_stream_with_its_own_sigmas_reaches_the_response(
+    batch, stop_step_index
+):
     """No code between the hook and the response branches on a stream's name."""
-    name = "action"
-    batch.rollout_extra_streams = (name,)
+    stream = "action"
+    batch.rollout_extra_streams = (stream,)
     batch.rollout_stop_step_index = stop_step_index
     batch.rollout_return_step_indices = None
+    action_latents = batch.audio_latents
     with rollout_scope(batch):
         _prepare_primary_stream(batch)
         set_rollout_early_stop_if_enabled(batch=batch)
-        scheduler, uncut_sigmas = _prepare_stream_on_its_own_grid(batch, name)
-        controller = batch.rollout_controllers[name]
-        expected = (
+        action_scheduler, uncut_sigmas = _prepare_stream_on_its_own_grid(
+            batch, stream, action_latents
+        )
+        controller = batch.rollout_controllers[stream]
+        expected_sigmas = (
             uncut_sigmas
             if stop_step_index is None
             else truncate_rollout_sigmas(uncut_sigmas, stop_step_index=stop_step_index)
         )
-        torch.testing.assert_close(controller.sigmas, expected, rtol=0, atol=0)
+        torch.testing.assert_close(controller.sigmas, expected_sigmas, rtol=0, atol=0)
         assert not torch.equal(
             controller.sigmas, batch.rollout_controllers[PRIMARY_STREAM].sigmas
         )
-        latents = batch.audio_latents
         # A stream on its own grid steps with its controller's timesteps.
-        for timestep, stream_timestep in zip(batch.timesteps, controller.timesteps):
+        for timestep, action_timestep in zip(batch.timesteps, controller.timesteps):
             batch.latents = batch.scheduler.step(
                 torch.zeros_like(batch.latents),
                 timestep,
@@ -407,64 +434,68 @@ def test_any_named_stream_on_its_own_grid_reaches_the_response(batch, stop_step_
                 **rollout_step_kwargs(batch, stream=PRIMARY_STREAM),
                 return_dict=False,
             )[0]
-            latents = scheduler.step(
-                torch.zeros_like(latents),
-                stream_timestep,
-                latents,
-                **rollout_step_kwargs(batch, stream=name),
+            action_latents = action_scheduler.step(
+                torch.zeros_like(action_latents),
+                action_timestep,
+                action_latents,
+                **rollout_step_kwargs(batch, stream=stream),
                 return_dict=False,
             )[0]
         finalize_rollout_if_enabled(
             batch=batch,
-            latents={PRIMARY_STREAM: batch.latents, name: latents},
+            latents={PRIMARY_STREAM: batch.latents, stream: action_latents},
             num_inference_steps=len(batch.timesteps),
             final_timestep=torch.tensor(0.0),
-            pipeline_config=_CONFIG,
+            pipeline_config=_PIPELINE_CONFIG,
         )
     data = batch.rollout_trajectory_data
-    assert set(data.streams) == {PRIMARY_STREAM, name}
-    assert torch.isfinite(data.streams[name].rollout_log_probs).all()
+    assert set(data.streams) == {PRIMARY_STREAM, stream}
+    assert torch.isfinite(data.streams[stream].rollout_log_probs).all()
     merged = concat_rollout_trajectory_data(
         [select_output_rollout_trajectory(data, i) for i in range(2)]
     )
     result = OutputBatch(output=torch.zeros(2, 1), rollout_trajectory_data=merged)
     for response in rollout_api._build_response("r", "p", 10, True, result):
-        assert set(response.extra_streams) == {name}
-        assert response.extra_streams[name]["generated_output"] is None
+        assert set(response.extra_streams) == {stream}
+        assert response.extra_streams[stream]["generated_output"] is None
     stored = {}
     rollout_api._build_response("r", "p", 10, True, result, stored=stored)
-    assert any(key.startswith(f"extra_streams.{name}.") for key in stored)
+    assert any(key.startswith(f"extra_streams.{stream}.") for key in stored)
 
 
-def test_unlisted_stream_cuts_its_own_grid_at_the_stop(batch):
-    """A stream that is not rolled out still ends on its own terminal sigma."""
+def test_stream_not_requested_for_rollout_cuts_its_own_grid_at_the_stop(batch):
+    """A stream the request does not roll out still ends on its own terminal sigma."""
     batch.rollout_extra_streams = ()
     batch.rollout_stop_step_index = 0
     _prepare_primary_stream(batch)
     set_rollout_early_stop_if_enabled(batch=batch)
-    scheduler, uncut_sigmas = _prepare_stream_on_its_own_grid(batch, "action")
+    action_latents = batch.audio_latents
+    action_scheduler, uncut_sigmas = _prepare_stream_on_its_own_grid(
+        batch, "action", action_latents
+    )
     assert "action" not in batch.rollout_controllers
     torch.testing.assert_close(
-        scheduler.sigmas,
+        action_scheduler.sigmas,
         truncate_rollout_sigmas(uncut_sigmas, stop_step_index=0),
         rtol=0,
         atol=0,
     )
-    assert len(scheduler.timesteps) == 1
+    assert len(action_scheduler.timesteps) == 1
 
 
 def test_extra_stream_with_another_step_count_is_rejected(batch):
     batch.rollout_extra_streams = ("action",)
     _prepare_primary_stream(batch)
-    scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
-    scheduler.set_timesteps(sigmas=[0.9, 0.6, 0.3])
+    action_latents = batch.audio_latents
+    action_scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
+    action_scheduler.set_timesteps(sigmas=[0.9, 0.6, 0.3])
     with pytest.raises(ValueError, match="streams step together"):
         prepare_rollout_if_enabled(
             batch=batch,
             stream="action",
-            scheduler=scheduler,
-            timesteps=scheduler.timesteps,
-            latents=batch.audio_latents,
+            scheduler=action_scheduler,
+            timesteps=action_scheduler.timesteps,
+            latents=action_latents,
             shard_for_sp=_identity_for_sp,
             gather_for_sp=_identity_for_sp,
         )
@@ -477,16 +508,24 @@ def test_extra_stream_with_another_step_count_is_rejected(batch):
             {"rollout": False, "rollout_extra_streams": ("audio",)},
             "requires rollout=True",
         ),
-        ({"rollout_extra_streams": ("audio", "audio")}, "duplicates"),
-        ({"rollout_extra_streams": (PRIMARY_STREAM,)}, "Invalid rollout extra stream"),
-        ({"rollout_extra_streams": ("a.b",)}, "Invalid rollout extra stream"),
-        ({"rollout_extra_streams": "audio"}, "must be a list"),
+        ({"rollout": True, "rollout_extra_streams": ("audio", "audio")}, "duplicates"),
+        (
+            {"rollout": True, "rollout_extra_streams": (PRIMARY_STREAM,)},
+            "Invalid rollout extra stream",
+        ),
+        (
+            {"rollout": True, "rollout_extra_streams": ("a.b",)},
+            "Invalid rollout extra stream",
+        ),
+        ({"rollout": True, "rollout_extra_streams": "audio"}, "must be a list"),
     ],
 )
-def test_extra_stream_names_are_checked_with_the_sampling_params(kwargs, error):
+def test_invalid_extra_stream_names_are_rejected_up_front(kwargs, error):
     """Stream names become store path segments, so they are checked up front."""
     with pytest.raises(ValueError, match=error):
-        SamplingParams(prompt="test", **{"rollout": True, **kwargs})
+        SamplingParams(prompt="test", **kwargs)
+    with pytest.raises(ValueError, match=error):
+        RLRolloutArgs.from_dict(kwargs).validate()
 
 
 def test_batched_noise_rows_match_single_sample_draws(batch):
@@ -543,10 +582,10 @@ def test_cuda_generators_fill_cuda_noise_in_place(batch, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "stage_cls,loop_name",
+    "stage_cls,denoise_method_name",
     [(DenoisingStage, "_denoise"), (Cosmos3DenoisingStage, "_denoise_once")],
 )
-def test_stage_cleanup_allows_retry(batch, stage_cls, loop_name):
+def test_stage_cleanup_allows_retry(batch, stage_cls, denoise_method_name):
     """A failed stage run leaves no rollout state, so a retry can prepare again."""
     stage = object.__new__(stage_cls)
     stage._offload_for_torch_compile_warmup = lambda batch: nullcontext()
@@ -554,7 +593,7 @@ def test_stage_cleanup_allows_retry(batch, stage_cls, loop_name):
     stage.transformer = Mock()
     fail = True
 
-    def loop(batch, args):
+    def denoise(batch, args):
         _prepare_primary_stream(batch)
         batch._rollout_denoising_env_state = {"env": None}
         batch.rollout_trajectory_data = object()
@@ -562,7 +601,7 @@ def test_stage_cleanup_allows_retry(batch, stage_cls, loop_name):
             raise RuntimeError("model failed")
         return batch
 
-    setattr(stage, loop_name, loop)
+    setattr(stage, denoise_method_name, denoise)
     with pytest.raises(RuntimeError, match="model failed"):
         stage.forward(batch, None)
     assert batch.rollout_controllers == {}
@@ -573,85 +612,6 @@ def test_stage_cleanup_allows_retry(batch, stage_cls, loop_name):
     assert batch.rollout_controllers == {}
 
 
-@pytest.mark.parametrize(
-    "model_pipeline,override,override_pipeline,error",
-    [
-        (LTX2Pipeline, None, None, None),
-        (LTX2TwoStagePipeline, "LTX2Pipeline", LTX2Pipeline, None),
-        (
-            LTX2Pipeline,
-            "LTX2TwoStagePipeline",
-            LTX2TwoStagePipeline,
-            "does not support rollout of streams ['audio']",
-        ),
-    ],
-)
-def test_http_validates_the_served_pipeline(
-    monkeypatch, model_pipeline, override, override_pipeline, error
-):
-    """The served pipeline is the --pipeline-class-name override when set, else the model's."""
-    forward = _serve(monkeypatch, model_pipeline, override, override_pipeline)
-    request = RolloutRequest(
-        prompt="test", seed=42, rollout_extra_streams=[AUDIO_STREAM]
-    )
-    if error is None:
-        assert asyncio.run(rollout_api.rollout_generate(request)).status_code == 200
-        forward.assert_awaited_once()
-    else:
-        _assert_rejected(request, forward, match=error)
-
-
-def test_http_rejects_extra_streams_without_rollout(monkeypatch):
-    forward = _serve(monkeypatch, LTX2Pipeline, None, None)
-    request = RolloutRequest(
-        prompt="test", seed=42, rollout=False, rollout_extra_streams=[AUDIO_STREAM]
-    )
-    _assert_rejected(
-        request, forward, match="rollout_extra_streams requires rollout=True"
-    )
-
-
-@pytest.mark.parametrize("extra_streams", [(AUDIO_STREAM,), ()])
-def test_audio_rollout_requires_generated_audio(batch, extra_streams):
-    """Rolling out the audio stream needs generated audio; a video-only rollout does not."""
-    batch.generate_audio = False
-    batch.rollout_extra_streams = extra_streams
-    if extra_streams:
-        with pytest.raises(ValueError, match="generate_audio=True"):
-            LTX2Pipeline.validate_rollout_request(batch)
-    else:
-        LTX2Pipeline.validate_rollout_request(batch)
-
-
-def test_requested_stream_the_stage_never_prepared_fails_the_request(batch):
-    """A listed stream must not silently vanish from the response."""
-    batch.rollout_extra_streams = ("action",)
-    with pytest.raises(RuntimeError, match="were not prepared"):
-        with rollout_scope(batch):
-            _prepare_primary_stream(batch)
-            finalize_rollout_if_enabled(
-                batch=batch,
-                latents={PRIMARY_STREAM: batch.latents},
-                num_inference_steps=len(batch.timesteps),
-                final_timestep=torch.tensor(0.0),
-                pipeline_config=_CONFIG,
-            )
-
-
-def test_extra_stream_needs_a_flow_match_euler_scheduler(batch):
-    _prepare_primary_stream(batch)
-    with pytest.raises(ValueError, match="FlowMatch Euler"):
-        prepare_rollout_if_enabled(
-            batch=batch,
-            stream="action",
-            scheduler=SimpleNamespace(sigmas=batch.scheduler.sigmas),
-            timesteps=batch.scheduler.timesteps,
-            latents=batch.audio_latents,
-            shard_for_sp=_identity_for_sp,
-            gather_for_sp=_identity_for_sp,
-        )
-
-
 def _assert_rejected(request, forward, *, match):
     with pytest.raises(HTTPException) as error:
         asyncio.run(rollout_api.rollout_generate(request))
@@ -660,7 +620,9 @@ def _assert_rejected(request, forward, *, match):
     forward.assert_not_awaited()
 
 
-def _serve(monkeypatch, model_pipeline, override, override_pipeline):
+def _patch_served_pipeline_and_forward(
+    monkeypatch, model_pipeline, override, override_pipeline
+):
     args = SimpleNamespace(
         pipeline_class_name=override,
         model_path="test",
@@ -689,3 +651,86 @@ def _serve(monkeypatch, model_pipeline, override, override_pipeline):
     monkeypatch.setattr(rollout_api.async_scheduler_client, "forward", forward)
     monkeypatch.setattr(rollout_api, "_build_response", lambda *a, **kw: [])
     return forward
+
+
+@pytest.mark.parametrize(
+    "model_pipeline,override,override_pipeline,error",
+    [
+        (LTX2Pipeline, None, None, None),
+        (LTX2TwoStagePipeline, "LTX2Pipeline", LTX2Pipeline, None),
+        (
+            LTX2Pipeline,
+            "LTX2TwoStagePipeline",
+            LTX2TwoStagePipeline,
+            "does not support rollout of streams ['audio']",
+        ),
+    ],
+)
+def test_http_checks_extra_streams_against_the_served_pipeline(
+    monkeypatch, model_pipeline, override, override_pipeline, error
+):
+    """The served pipeline is the --pipeline-class-name override when set, else the model's."""
+    forward = _patch_served_pipeline_and_forward(
+        monkeypatch, model_pipeline, override, override_pipeline
+    )
+    request = RolloutRequest(
+        prompt="test", seed=42, rollout_extra_streams=[AUDIO_STREAM]
+    )
+    if error is None:
+        assert asyncio.run(rollout_api.rollout_generate(request)).status_code == 200
+        forward.assert_awaited_once()
+    else:
+        _assert_rejected(request, forward, match=error)
+
+
+def test_http_rejects_extra_streams_without_rollout(monkeypatch):
+    forward = _patch_served_pipeline_and_forward(monkeypatch, LTX2Pipeline, None, None)
+    request = RolloutRequest(
+        prompt="test", seed=42, rollout=False, rollout_extra_streams=[AUDIO_STREAM]
+    )
+    _assert_rejected(
+        request, forward, match="rollout_extra_streams requires rollout=True"
+    )
+
+
+def test_audio_rollout_requires_generated_audio(batch):
+    batch.generate_audio = False
+    batch.rollout_extra_streams = (AUDIO_STREAM,)
+    with pytest.raises(ValueError, match="generate_audio=True"):
+        LTX2Pipeline.validate_rollout_request(batch)
+
+
+def test_primary_only_rollout_does_not_require_generated_audio(batch):
+    batch.generate_audio = False
+    batch.rollout_extra_streams = ()
+    LTX2Pipeline.validate_rollout_request(batch)
+
+
+def test_requested_stream_the_stage_never_prepared_fails_the_request(batch):
+    """A requested stream must not silently vanish from the response."""
+    batch.rollout_extra_streams = ("action",)
+    with pytest.raises(RuntimeError, match="were not prepared"):
+        with rollout_scope(batch):
+            _prepare_primary_stream(batch)
+            finalize_rollout_if_enabled(
+                batch=batch,
+                latents={PRIMARY_STREAM: batch.latents},
+                num_inference_steps=len(batch.timesteps),
+                final_timestep=torch.tensor(0.0),
+                pipeline_config=_PIPELINE_CONFIG,
+            )
+
+
+def test_extra_stream_needs_a_flow_match_euler_scheduler(batch):
+    _prepare_primary_stream(batch)
+    action_latents = batch.audio_latents
+    with pytest.raises(ValueError, match="FlowMatch Euler"):
+        prepare_rollout_if_enabled(
+            batch=batch,
+            stream="action",
+            scheduler=SimpleNamespace(sigmas=batch.scheduler.sigmas),
+            timesteps=batch.scheduler.timesteps,
+            latents=action_latents,
+            shard_for_sp=_identity_for_sp,
+            gather_for_sp=_identity_for_sp,
+        )

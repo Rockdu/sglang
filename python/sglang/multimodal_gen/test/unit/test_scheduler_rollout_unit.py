@@ -62,7 +62,7 @@ from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import 
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
-    loop_latent_sp_fns,
+    pipeline_config_sp_fns,
     prepare_rollout_if_enabled,
     rollout_step_kwargs,
     set_rollout_early_stop_if_enabled,
@@ -74,7 +74,7 @@ _TIMESTEPS = _SIGMAS[:-1] * 1000.0
 
 def _prepare_primary_stream(batch, pipeline_config) -> None:
     """The denoising stage's prepare of the stream its loop iterates."""
-    shard_for_sp, gather_for_sp = loop_latent_sp_fns(pipeline_config)
+    shard_for_sp, gather_for_sp = pipeline_config_sp_fns(pipeline_config)
     prepare_rollout_if_enabled(
         batch=batch,
         stream=PRIMARY_STREAM,
@@ -790,7 +790,7 @@ class TestRolloutStopStepUnit(unittest.TestCase):
         return scheduler, current_rollout_controller, step_inputs, latents
 
     @unittest.skipUnless(torch.cuda.device_count() >= 2, "two GPUs required")
-    def test_controller_grid_on_another_gpu_than_the_scheduler(self):
+    def test_transition_matches_when_the_controller_grid_is_on_another_gpu(self):
         """Under CFG parallel the scheduler's grid and the controller's sit on different GPUs."""
 
         def run(controller_device: str) -> torch.Tensor:
@@ -859,7 +859,7 @@ class TestRolloutStopStepUnit(unittest.TestCase):
         with self.assertRaises(ValueError):
             _make_rollout_controller(self._batch("cps")).stop_at(5)
 
-    def test_default_builder_iterates_the_pipelines_published_timesteps(self):
+    def test_stop_cuts_the_timesteps_the_pipeline_published(self):
         """A pipeline may publish batch.timesteps on the DiT's own scale while
         stepping the same scheduler (Krea-2 feeds raw sigmas between 0 and 1; the
         scheduler reports sigma * 1000). The stop must cut those values, not

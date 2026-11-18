@@ -148,7 +148,7 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     finalize_rollout_if_enabled,
     init_rollout_env_if_enabled,
-    loop_latent_sp_fns,
+    pipeline_config_sp_fns,
     prepare_rollout_if_enabled,
     rollout_scope,
     rollout_step_kwargs,
@@ -1239,7 +1239,9 @@ class DenoisingStage(PipelineStage):
             if uses_boundary_transformer_2
             else None
         )
-        shard_for_sp, gather_for_sp = loop_latent_sp_fns(server_args.pipeline_config)
+        shard_for_sp, gather_for_sp = pipeline_config_sp_fns(
+            server_args.pipeline_config
+        )
         prepare_rollout_if_enabled(
             batch=batch,
             stream=PRIMARY_STREAM,
@@ -2043,7 +2045,9 @@ class DenoisingStage(PipelineStage):
         with rollout_scope(batch), self._offload_for_torch_compile_warmup(batch):
             return self._denoise(batch, server_args)
 
-    def _rollout_stream_latents(self, ctx: DenoisingContext) -> dict[str, torch.Tensor]:
+    def _final_latents_by_stream(
+        self, ctx: DenoisingContext
+    ) -> dict[str, torch.Tensor]:
         """Final latents of each of the loop's latent streams, by stream name."""
         return {PRIMARY_STREAM: ctx.latents}
 
@@ -2069,14 +2073,14 @@ class DenoisingStage(PipelineStage):
             pos_cond_kwargs=ctx.pos_cond_kwargs,
             neg_cond_kwargs=ctx.neg_cond_kwargs,
             guidance=ctx.guidance,
-            replay_cond_kwargs=partial(self._replay_cond_kwargs, ctx, batch),
+            build_replay_cond_kwargs=partial(self._replay_cond_kwargs, ctx, batch),
         )
         timesteps_cpu = self._run_denoising_loop(ctx, batch, server_args)
 
         # collect rollout outputs before finalization gathers or replaces latents
         finalize_rollout_if_enabled(
             batch=batch,
-            latents=self._rollout_stream_latents(ctx),
+            latents=self._final_latents_by_stream(ctx),
             num_inference_steps=len(timesteps_cpu),
             final_timestep=ctx.timesteps.new_zeros(()),
             pipeline_config=server_args.pipeline_config,

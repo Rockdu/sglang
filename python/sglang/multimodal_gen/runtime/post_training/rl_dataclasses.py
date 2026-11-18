@@ -53,30 +53,29 @@ class RolloutTrajectoryData:
     streams: dict[str, RolloutStreamData] = field(default_factory=dict)
 
 
-def map_stream_tensors(
-    stream: RolloutStreamData | None,
+def map_per_sample_tensors(
+    stream_data: RolloutStreamData,
     fn: Callable[[torch.Tensor | None], torch.Tensor | None],
-) -> RolloutStreamData | None:
-    """Apply ``fn`` to every per-sample tensor of one stream; the schedule is shared."""
-    if stream is None:
-        return None
-    debug = stream.rollout_debug_tensors
-    trajectory = stream.dit_trajectory
+) -> RolloutStreamData:
+    """Apply ``fn`` to every per-sample tensor of one stream; its timesteps, sigmas
+    and step indices are per request and kept."""
+    debug_tensors = stream_data.rollout_debug_tensors
+    dit_trajectory = stream_data.dit_trajectory
     return RolloutStreamData(
-        rollout_log_probs=fn(stream.rollout_log_probs),
+        rollout_log_probs=fn(stream_data.rollout_log_probs),
         rollout_debug_tensors=(
             RolloutDebugTensors(
                 **{
-                    field.name: fn(getattr(debug, field.name))
-                    for field in fields(RolloutDebugTensors)
+                    tensor_field.name: fn(getattr(debug_tensors, tensor_field.name))
+                    for tensor_field in fields(RolloutDebugTensors)
                 }
             )
-            if debug is not None
+            if debug_tensors is not None
             else None
         ),
         dit_trajectory=(
-            replace(trajectory, latents=fn(trajectory.latents))
-            if trajectory is not None
+            replace(dit_trajectory, latents=fn(dit_trajectory.latents))
+            if dit_trajectory is not None
             else None
         ),
     )
@@ -89,38 +88,34 @@ def _cat_per_output(tensors: list[torch.Tensor | None]) -> torch.Tensor | None:
     return torch.cat(tensors, dim=0)
 
 
-def _concat_stream_data(
-    streams: list[RolloutStreamData | None],
-) -> RolloutStreamData | None:
-    if not streams or any(stream is None for stream in streams):
-        return None
-    debug = None
-    if all(stream.rollout_debug_tensors is not None for stream in streams):
-        debug = RolloutDebugTensors(
+def _concat_stream_data(per_output: list[RolloutStreamData]) -> RolloutStreamData:
+    debug_tensors = None
+    if all(stream_data.rollout_debug_tensors is not None for stream_data in per_output):
+        debug_tensors = RolloutDebugTensors(
             **{
-                field.name: _cat_per_output(
+                tensor_field.name: _cat_per_output(
                     [
-                        getattr(stream.rollout_debug_tensors, field.name)
-                        for stream in streams
+                        getattr(stream_data.rollout_debug_tensors, tensor_field.name)
+                        for stream_data in per_output
                     ]
                 )
-                for field in fields(RolloutDebugTensors)
+                for tensor_field in fields(RolloutDebugTensors)
             }
         )
-    trajectory = None
-    if all(stream.dit_trajectory is not None for stream in streams):
-        trajectory = replace(
-            streams[0].dit_trajectory,
+    dit_trajectory = None
+    if all(stream_data.dit_trajectory is not None for stream_data in per_output):
+        dit_trajectory = replace(
+            per_output[0].dit_trajectory,
             latents=_cat_per_output(
-                [stream.dit_trajectory.latents for stream in streams]
+                [stream_data.dit_trajectory.latents for stream_data in per_output]
             ),
         )
     return RolloutStreamData(
         rollout_log_probs=_cat_per_output(
-            [stream.rollout_log_probs for stream in streams]
+            [stream_data.rollout_log_probs for stream_data in per_output]
         ),
-        rollout_debug_tensors=debug,
-        dit_trajectory=trajectory,
+        rollout_debug_tensors=debug_tensors,
+        dit_trajectory=dit_trajectory,
     )
 
 
@@ -132,14 +127,14 @@ def concat_rollout_trajectory_data(
         return None
     if len(per_output) == 1:
         return per_output[0]
-    names = per_output[0].streams.keys()
-    if any(data.streams.keys() != names for data in per_output):
+    streams = per_output[0].streams.keys()
+    if any(data.streams.keys() != streams for data in per_output):
         raise ValueError("Outputs of one request must roll out the same streams")
     return RolloutTrajectoryData(
         denoising_env=per_output[0].denoising_env,
         streams={
-            name: _concat_stream_data([data.streams[name] for data in per_output])
-            for name in names
+            stream: _concat_stream_data([data.streams[stream] for data in per_output])
+            for stream in streams
         },
     )
 
@@ -167,7 +162,7 @@ def select_output_rollout_trajectory(
     return RolloutTrajectoryData(
         denoising_env=rollout_trajectory_data.denoising_env,
         streams={
-            name: map_stream_tensors(stream, select)
-            for name, stream in rollout_trajectory_data.streams.items()
+            stream: map_per_sample_tensors(stream_data, select)
+            for stream, stream_data in rollout_trajectory_data.streams.items()
         },
     )

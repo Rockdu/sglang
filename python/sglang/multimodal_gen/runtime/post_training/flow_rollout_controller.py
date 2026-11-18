@@ -176,10 +176,10 @@ class FlowRolloutController:
         with ``batch`` bound by ``rollout_step_kwargs``;
         ``sample`` arrives already upcast to fp32 by ``step()``.
 
-        Steps on the controller's own grid: the scheduler's ``next_sigma`` and
+        Steps on the controller's own schedule: the scheduler's ``next_sigma`` and
         ``dt`` are not used, so a requested stop sends the last step to the
         terminal sigma without reading the scheduler's grid. Draws variance
-        noise from the request generator captured at creation, so the caller's
+        noise from the generators it was created with, so the caller's
         ``generator`` argument is not used either. Records ``sample`` as the
         step's x_t before advancing it.
         """
@@ -227,8 +227,8 @@ class FlowRolloutController:
         batch: Any,
         model_output: torch.FloatTensor,
     ) -> torch.FloatTensor:
-        """Generate variance noise for rollout from the request generator; a list
-        of generators gives one per batch item."""
+        """Generate variance noise from this controller's generators; a list gives
+        one per batch item."""
         assert self.generator is not None, "Generator must be provided"
 
         device = model_output.device

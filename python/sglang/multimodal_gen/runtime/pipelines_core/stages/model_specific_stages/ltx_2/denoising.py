@@ -1389,7 +1389,7 @@ class LTX2DenoisingStage(DenoisingStage):
         )
         return self._build_ltx2_model_kwargs(
             ctx,
-            {},
+            base_model_kwargs={},
             encoder_hidden_states=prompt_embeds[0],
             audio_encoder_hidden_states=audio_prompt_embeds[0],
             encoder_attention_mask=self._get_ltx_prompt_attention_mask(
@@ -2667,7 +2667,7 @@ class LTX2DenoisingStage(DenoisingStage):
             is_warmup=ctx.is_warmup,
         )
 
-    def _rollout_stream_latents(
+    def _final_latents_by_stream(
         self, ctx: LTX2DenoisingContext
     ) -> dict[str, torch.Tensor]:
         return {PRIMARY_STREAM: ctx.latents, AUDIO_STREAM: ctx.audio_latents}
