@@ -11,6 +11,7 @@ from __future__ import annotations
 from contextlib import AbstractContextManager, nullcontext
 from typing import Any, Callable
 
+import msgspec
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
@@ -117,6 +118,31 @@ def _minimax_h3_update_target_rows_(
     torch.mul(one_minus_sigma_ratio, denoised_scratch, out=velocity)
     torch.mul(sigma_ratio, state, out=state)
     torch.add(state, velocity, out=state)
+
+
+class MiniMaxH3StepTensors(msgspec.Struct, frozen=True):
+    """Per-step fp32 operands of one modality's target-row update, indexed by step."""
+
+    sigma_t: torch.Tensor
+    sigma_ratios: torch.Tensor
+    one_minus_sigma_ratios: torch.Tensor
+
+
+def _minimax_h3_step_tensors(
+    sigmas: list[float], *, device: torch.device
+) -> MiniMaxH3StepTensors:
+    # Matches the scheduler's device-fp32 math: sigma_t is 1 - fp32(1 - sigma),
+    # from the Python-float subtraction, not fp32(sigma).
+    step_t = torch.tensor(
+        [1.0 - sigma for sigma in sigmas[:-1]], dtype=torch.float32, device=device
+    )
+    sigmas_t = torch.tensor(sigmas, dtype=torch.float32, device=device)
+    sigma_ratios = sigmas_t[1:] / sigmas_t[:-1]
+    return MiniMaxH3StepTensors(
+        sigma_t=1.0 - step_t,
+        sigma_ratios=sigma_ratios,
+        one_minus_sigma_ratios=1.0 - sigma_ratios,
+    )
 
 
 def _build_local_embedding_layout(
@@ -531,10 +557,6 @@ def minimax_h3_denoise_loop(
     audio_target_slice = positive.audio_target_slice
     video_timesteps = [1.0 - sigma for sigma in sigmas_video[:-1]]
     audio_timesteps = [1.0 - sigma for sigma in sigmas_audio[:-1]]
-    # One H2D copy per schedule, preserving the previous Python-float
-    # subtraction followed by fp32 conversion.
-    video_step_t = torch.tensor(video_timesteps, dtype=torch.float32, device=device)
-    audio_step_t = torch.tensor(audio_timesteps, dtype=torch.float32, device=device)
     timestep_plan = positive.prepare_timestep_plan(
         video_timesteps=video_timesteps,
         audio_timesteps=audio_timesteps,
@@ -546,16 +568,10 @@ def minimax_h3_denoise_loop(
     # one pass here instead of topping up step by step inside the loop.
     adaln_plan_slots = model.prepare_adaln_plans([entry[0] for entry in timestep_plan])
 
-    # match the scheduler's device-fp32 math once, then reuse one denoised
-    # scratch per modality instead of allocating intermediates every step
-    video_sigmas = torch.tensor(sigmas_video, dtype=torch.float32, device=device)
-    audio_sigmas = torch.tensor(sigmas_audio, dtype=torch.float32, device=device)
-    video_sigma_ratios = video_sigmas[1:] / video_sigmas[:-1]
-    audio_sigma_ratios = audio_sigmas[1:] / audio_sigmas[:-1]
-    video_sigma_t = 1.0 - video_step_t
-    audio_sigma_t = 1.0 - audio_step_t
-    video_one_minus_sigma_ratios = 1.0 - video_sigma_ratios
-    audio_one_minus_sigma_ratios = 1.0 - audio_sigma_ratios
+    # compute the per-step operands once, then reuse one denoised scratch per
+    # modality instead of allocating intermediates every step
+    video_step_tensors = _minimax_h3_step_tensors(sigmas_video, device=device)
+    audio_step_tensors = _minimax_h3_step_tensors(sigmas_audio, device=device)
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
     if rollout_ctx is not None:
@@ -630,10 +646,10 @@ def minimax_h3_denoise_loop(
                     _minimax_h3_update_target_rows_(
                         video_target,
                         mv_video_t,
-                        sigma_t=video_sigma_t[step],
+                        sigma_t=video_step_tensors.sigma_t[step],
                         sigma_curr=s_v,
-                        sigma_ratio=video_sigma_ratios[step],
-                        one_minus_sigma_ratio=video_one_minus_sigma_ratios[step],
+                        sigma_ratio=video_step_tensors.sigma_ratios[step],
+                        one_minus_sigma_ratio=video_step_tensors.one_minus_sigma_ratios[step],
                         denoised_scratch=video_denoised_scratch,
                     )
 
@@ -641,10 +657,10 @@ def minimax_h3_denoise_loop(
                 _minimax_h3_update_target_rows_(
                     audio_target,
                     mv_audio_t,
-                    sigma_t=audio_sigma_t[step],
+                    sigma_t=audio_step_tensors.sigma_t[step],
                     sigma_curr=s_a,
-                    sigma_ratio=audio_sigma_ratios[step],
-                    one_minus_sigma_ratio=audio_one_minus_sigma_ratios[step],
+                    sigma_ratio=audio_step_tensors.sigma_ratios[step],
+                    one_minus_sigma_ratio=audio_step_tensors.one_minus_sigma_ratios[step],
                     denoised_scratch=audio_denoised_scratch,
                 )
             if on_step is not None:
