@@ -120,6 +120,10 @@ def _minimax_h3_update_target_rows_(
     torch.add(state, velocity, out=state)
 
 
+# Advances one modality's [n, C] target rows in place: (rows, velocity, step).
+MiniMaxH3RolloutStep = Callable[[torch.Tensor, torch.Tensor, int], None]
+
+
 class MiniMaxH3StepTensors(msgspec.Struct, frozen=True):
     """Per-step fp32 operands of one modality's target-row update, indexed by step."""
 
@@ -142,6 +146,32 @@ def _minimax_h3_step_tensors(
         sigma_t=1.0 - step_t,
         sigma_ratios=sigma_ratios,
         one_minus_sigma_ratios=1.0 - sigma_ratios,
+    )
+
+
+def _minimax_h3_step_target_rows_(
+    target: torch.Tensor,
+    velocity: torch.Tensor,
+    *,
+    step: int,
+    sigmas: list[float],
+    step_tensors: MiniMaxH3StepTensors,
+    denoised_scratch: torch.Tensor,
+    rollout_step: MiniMaxH3RolloutStep | None,
+) -> None:
+    """Advance one modality's target rows in place by one step: the serving update,
+    or the rollout's transition when the request rolls this stream out."""
+    if rollout_step is not None:
+        rollout_step(target, velocity, step)
+        return
+    _minimax_h3_update_target_rows_(
+        target,
+        velocity,
+        sigma_t=step_tensors.sigma_t[step],
+        sigma_curr=sigmas[step],
+        sigma_ratio=step_tensors.sigma_ratios[step],
+        one_minus_sigma_ratio=step_tensors.one_minus_sigma_ratios[step],
+        denoised_scratch=denoised_scratch,
     )
 
 
@@ -488,7 +518,7 @@ def minimax_h3_denoise_loop(
     attn_metadata: AttentionMetadata | None = None,
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
-    rollout_ctx=None,
+    video_rollout_step: MiniMaxH3RolloutStep | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -498,7 +528,8 @@ def minimax_h3_denoise_loop(
     update signal; MiniMax H3 only supports cfg-distilled checkpoints.
     ``model_forward`` is the native-stage hook for residency/BCG runners and
     receives the zero-based loop step; the default keeps this helper
-    independently testable with a plain callable.
+    independently testable with a plain callable. ``video_rollout_step``
+    replaces the video update with the rollout's; None keeps the serving update.
     """
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
@@ -574,23 +605,9 @@ def minimax_h3_denoise_loop(
     audio_step_tensors = _minimax_h3_step_tensors(sigmas_audio, device=device)
     video_denoised_scratch = torch.empty_like(video_rows[video_target_slice])
     audio_denoised_scratch = torch.empty_like(audio_rows[audio_target_slice])
-    if rollout_ctx is not None:
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
-            minimax_h3_rollout_update_video_target,
-        )
-
-        rollout_ctx.batch._h3_rollout_sigma_max = float(max(sigmas_video))
-        video_target = video_rows[video_target_slice]
-        rollout_ctx.collector.record_initial(video_target.detach().clone())
     for step in range(num_steps):
         step_cm = step_profiler(step) if step_profiler is not None else nullcontext()
         with step_cm:
-            s_v = sigmas_video[step]
-            s_a = sigmas_audio[step]
-            s_n_v = sigmas_video[step + 1]
-            if rollout_ctx is not None:
-                rollout_ctx.batch._rollout_loop_step_index = step
-
             fk = positive.forward_kwargs(
                 video_rows=video_rows,
                 audio_rows=audio_rows,
@@ -619,49 +636,23 @@ def minimax_h3_denoise_loop(
                 mv_video_t = v_video.float()
                 mv_audio_t = v_audio[audio_target_slice].float()
 
-                video_target = video_rows[video_target_slice]
-                if rollout_ctx is not None:
-                    (
-                        updated,
-                        log_sum,
-                        log_count,
-                        rollout_ctx.noise_buffer,
-                    ) = minimax_h3_rollout_update_video_target(
-                        video_target,
-                        mv_video_t,
-                        sigma_curr=s_v,
-                        sigma_next=s_n_v,
-                        batch=rollout_ctx.batch,
-                        generator=rollout_ctx.generator,
-                        loop_step_index=step,
-                        noise_buffer=rollout_ctx.noise_buffer,
-                    )
-                    video_target.copy_(updated)
-                    rollout_ctx.collector.record_step(
-                        video_target.detach().clone(),
-                        log_sum,
-                        log_count,
-                    )
-                else:
-                    _minimax_h3_update_target_rows_(
-                        video_target,
-                        mv_video_t,
-                        sigma_t=video_step_tensors.sigma_t[step],
-                        sigma_curr=s_v,
-                        sigma_ratio=video_step_tensors.sigma_ratios[step],
-                        one_minus_sigma_ratio=video_step_tensors.one_minus_sigma_ratios[step],
-                        denoised_scratch=video_denoised_scratch,
-                    )
-
-                audio_target = audio_rows[audio_target_slice]
-                _minimax_h3_update_target_rows_(
-                    audio_target,
+                _minimax_h3_step_target_rows_(
+                    video_rows[video_target_slice],
+                    mv_video_t,
+                    step=step,
+                    sigmas=sigmas_video,
+                    step_tensors=video_step_tensors,
+                    denoised_scratch=video_denoised_scratch,
+                    rollout_step=video_rollout_step,
+                )
+                _minimax_h3_step_target_rows_(
+                    audio_rows[audio_target_slice],
                     mv_audio_t,
-                    sigma_t=audio_step_tensors.sigma_t[step],
-                    sigma_curr=s_a,
-                    sigma_ratio=audio_step_tensors.sigma_ratios[step],
-                    one_minus_sigma_ratio=audio_step_tensors.one_minus_sigma_ratios[step],
+                    step=step,
+                    sigmas=sigmas_audio,
+                    step_tensors=audio_step_tensors,
                     denoised_scratch=audio_denoised_scratch,
+                    rollout_step=None,
                 )
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)

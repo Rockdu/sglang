@@ -21,6 +21,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.base import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    register_denoising_env_args,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency import (
     LAYERWISE_OFFLOAD,
 )
@@ -33,6 +36,15 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
+# H3 pushes its packed-sequence components, not DiT forward kwargs.
+@register_denoising_env_args(
+    [
+        "encoder_hidden_states",
+        "h3_packed_layout",
+        "h3_token_tags",
+        "h3_video_target_start",
+    ]
+)
 @dataclass
 class MiniMaxH3PipelineConfig(PipelineConfig):
     """MiniMax H3 native audio-video pipeline configuration."""

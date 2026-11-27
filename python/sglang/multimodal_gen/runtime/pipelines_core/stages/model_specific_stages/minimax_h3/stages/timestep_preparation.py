@@ -69,7 +69,6 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
             )
         self._generate_sigmas_from_plan(batch, plan)
         self._apply_pdd_schedule(batch)
-        self._truncate_rollout_schedule(batch)
         self._publish_native_timestep_state(batch)
         return batch
 
@@ -130,23 +129,6 @@ class MiniMaxH3TimestepPreparationStage(PipelineStage):
                     )
             if batch.is_warmup or sigma_max != 1.0:
                 sigmas[modality] = [sigma * sigma_max for sigma in expected]
-
-    @staticmethod
-    def _truncate_rollout_schedule(batch: Req) -> None:
-        from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
-            truncate_rollout_sigmas,
-        )
-
-        stop_step_index = batch.rollout_stop_step_index
-        if not batch.rollout or stop_step_index is None:
-            return
-        # TODO(rockdu): H3's denoise loop runs its own rollout state, not a
-        # FlowRolloutController; the stage cuts both grids until it does.
-        sigmas = batch.extra[MINIMAX_H3_SIGMAS_EXTRA_KEY]
-        for modality in ("video", "audio"):
-            sigmas[modality] = truncate_rollout_sigmas(
-                sigmas[modality], stop_step_index=stop_step_index
-            )
 
     @staticmethod
     def _publish_native_timestep_state(batch: Req) -> None:

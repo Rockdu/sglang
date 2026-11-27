@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Numerical contract for request-static H3 denoise metadata."""
+"""Numerical contracts of the H3 denoise loop: request-static metadata, the
+serving target-row update, and the rollout through the shared controllers."""
 
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -10,12 +11,19 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
+from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
+from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3DenoiseBranch,
     _build_local_embedding_layout,
     _minimax_h3_update_target_rows_,
     minimax_h3_denoise_loop,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+    finalize_minimax_h3_rollout,
+    prepare_minimax_h3_rollout,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
@@ -28,6 +36,11 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
     minimax_h3_time_shift_sigmas,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import rollout_scope
+
+_SP_IDENTITY_PIPELINE_CONFIG = SimpleNamespace(
+    shard_latents_for_sp=lambda batch, latents: (latents, False)
 )
 
 
@@ -416,3 +429,160 @@ def test_grouped_outputs_share_prompt_refinement():
 
     assert model.calls == 1
     assert first.static_kwargs["prompt_embeds"] is second.static_kwargs["prompt_embeds"]
+
+
+@pytest.fixture
+def single_sp_rank(monkeypatch):
+    monkeypatch.setattr(
+        "sglang.multimodal_gen.runtime.post_training.sp_utils.get_sp_world_size",
+        lambda: 1,
+    )
+
+
+def _step_velocities(branch: MiniMaxH3DenoiseBranch, step: int):
+    """The (video target, audio) velocities of a DiT that ignores its inputs."""
+    generator = torch.Generator().manual_seed(100 + step)
+    return (
+        torch.randn(int(branch.update_mask.sum()), 96, generator=generator),
+        torch.randn(branch.audio_pos.numel(), 32, generator=generator),
+    )
+
+
+def _t2va_rollout_inputs():
+    branch = _branch("t2va")
+    # A video grid on which the float-form operands differ from the fp32 serving
+    # ones; on many grids (shift 12 among them) the two forms agree bit for bit.
+    sigmas = {
+        name: minimax_h3_time_shift_sigmas(num_steps=4, shift_scale=shift)
+        for name, shift in (("video", 2.5), ("audio", 3.0))
+    }
+    noise = torch.Generator().manual_seed(1)
+    initial_video = torch.randn(branch.img_pos.numel(), 96, generator=noise)
+    initial_audio = torch.randn(branch.audio_pos.numel(), 32, generator=noise)
+    return branch, sigmas, initial_video, initial_audio
+
+
+def _run_t2va_loop(batch: Req):
+    """The denoising stage's rollout calls around the loop, on a t2va layout."""
+    branch, sigmas, initial_video, initial_audio = _t2va_rollout_inputs()
+    with rollout_scope(batch):
+        rollout_plan = prepare_minimax_h3_rollout(
+            batch,
+            sigmas_video=sigmas["video"],
+            sigmas_audio=sigmas["audio"],
+            initial_video_rows=initial_video,
+            initial_audio_rows=initial_audio,
+            device=torch.device("cpu"),
+            pipeline_config=_SP_IDENTITY_PIPELINE_CONFIG,
+        )
+        video_rows, audio_rows = minimax_h3_denoise_loop(
+            model=SimpleNamespace(prepare_adaln_plans=lambda _: None),
+            model_forward=lambda _model, _kwargs, step: _step_velocities(branch, step),
+            positive=branch,
+            initial_video_rows=initial_video,
+            initial_audio_rows=initial_audio,
+            keyframe_cond_rows=None,
+            sigmas_video=rollout_plan.sigmas_video,
+            sigmas_audio=rollout_plan.sigmas_audio,
+            device=torch.device("cpu"),
+            video_rollout_step=rollout_plan.video_rollout_step,
+        )
+        finalize_minimax_h3_rollout(
+            batch,
+            rollout_plan=rollout_plan,
+            video_target_rows=video_rows[branch.video_target_slice],
+            pipeline_config=_SP_IDENTITY_PIPELINE_CONFIG,
+        )
+    return branch, rollout_plan, video_rows, audio_rows
+
+
+def _rollout_request(**rollout_args) -> Req:
+    batch = Req(
+        sampling_params=MiniMaxH3SamplingParams(
+            prompt="test",
+            task="t2va",
+            rollout=True,
+            rollout_return_dit_trajectory=True,
+            **rollout_args,
+        )
+    )
+    batch.generator = [torch.Generator().manual_seed(0)]
+    return batch
+
+
+def _h3_float_form_step(rows, velocity, sigma, sigma_next):
+    """The ODE step H3's video rollout has always taken: sigma and the sigma ratio
+    rounded from Python doubles to fp32."""
+    denoised = rows + torch.tensor(sigma) * velocity
+    ratio = torch.tensor(sigma_next / sigma)
+    return ratio * rows + (1.0 - ratio) * denoised
+
+
+def test_video_ode_rollout_keeps_the_h3_float_form_bits(single_sp_rank):
+    """miles_diffusion's H3 e2e standards were recorded on the float-form step; the
+    serving update and the controller's Euler step land a few ulp away from it."""
+    branch, sigmas, initial_video, _ = _t2va_rollout_inputs()
+    batch = _rollout_request(rollout_sde_type="ode", rollout_log_prob_no_const=True)
+    _, _, video, _ = _run_t2va_loop(batch)
+
+    expected = initial_video[branch.video_target_slice]
+    for step in range(len(sigmas["video"]) - 1):
+        velocity, _ = _step_velocities(branch, step)
+        expected = _h3_float_form_step(
+            expected, velocity, sigmas["video"][step], sigmas["video"][step + 1]
+        )
+    assert torch.equal(video[branch.video_target_slice], expected)
+
+
+@pytest.mark.parametrize("sde_type", ["cps", "ode"])
+def test_stopped_rollout_records_each_step_and_lands_on_x0(single_sp_rank, sde_type):
+    """A stop at step i cuts both grids and ends on x_i's x0 prediction, also on the
+    ODE path DMD2 takes, whose update reads the cut grid. The recorded x_0..x_i are
+    distinct although H3 updates its rows in place, and the loop's DiT times are
+    republished as 1 - sigma."""
+    stop_step_index = 1
+    batch = _rollout_request(
+        rollout_sde_type=sde_type,
+        rollout_noise_level=1.0,
+        rollout_log_prob_no_const=True,
+        rollout_stop_step_index=stop_step_index,
+    )
+    branch, rollout_plan, video, _ = _run_t2va_loop(batch)
+
+    streams = batch.rollout_trajectory_data.streams
+    trajectory = streams[PRIMARY_STREAM].dit_trajectory
+    assert trajectory.latents.shape[1] == stop_step_index + 2
+    for index in range(stop_step_index + 1):
+        assert not torch.equal(
+            trajectory.latents[0, index], trajectory.latents[0, index + 1]
+        )
+    x_i = trajectory.latents[0, stop_step_index]
+    velocity, _ = _step_velocities(branch, stop_step_index)
+    x0_prediction = (
+        x_i + torch.tensor(rollout_plan.sigmas_video[stop_step_index]) * velocity
+    )
+    assert torch.equal(trajectory.latents[0, -1], x0_prediction)
+    assert torch.equal(video[branch.video_target_slice], x0_prediction)
+    assert torch.equal(
+        batch.timesteps,
+        torch.tensor([1.0 - sigma for sigma in rollout_plan.sigmas_video[:-1]]),
+    )
+
+
+@pytest.mark.parametrize(
+    "rollout_args, message",
+    [
+        ({"task": "fl2va"}, "supports tasks"),
+        ({"num_outputs_per_prompt": 2}, "num_outputs_per_prompt=1"),
+        (
+            {"rollout_noise_level": 0.0, "rollout_log_prob_no_const": True},
+            "stream 'primary'.*rollout_noise_level=0",
+        ),
+        # The controller would assert at the first denoising step instead.
+        ({"rollout_sde_type": "ode"}, "rollout_log_prob_no_const=True"),
+    ],
+)
+def test_rollout_rejects_what_the_h3_rollout_cannot_run(rollout_args, message):
+    rollout_args = {"task": "t2va", **rollout_args}
+    with pytest.raises(ValueError, match=message):
+        MiniMaxH3SamplingParams(prompt="test", rollout=True, **rollout_args)

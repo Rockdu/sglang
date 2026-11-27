@@ -1,248 +1,264 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Rollout (RL) helpers for MiniMax H3 video-only denoising."""
+"""Rollout (RL) glue for the MiniMax H3 denoise loop.
+
+H3 has no scheduler: its loop updates packed video and audio target rows in
+place. Each stream still gets a shared ``FlowRolloutController``; this module
+adapts the H3 rows to it and builds the denoising env.
+"""
 
 from __future__ import annotations
 
-import math
-from dataclasses import dataclass, field
-from typing import Any
+from functools import partial
+from typing import Any, Callable
 
+import msgspec
 import torch
 
 from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
-from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
-    RolloutDenoisingEnv,
-    RolloutDitTrajectory,
-    RolloutStreamData,
-    RolloutTrajectoryData,
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
+    MiniMaxH3RolloutStep,
+    MiniMaxH3StepTensors,
+    _minimax_h3_update_target_rows_,
+)
+from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
+    truncate_rollout_sigmas,
+)
+from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    finalize_rollout_if_enabled,
+    pipeline_config_sp_fns,
+    prepare_rollout_if_enabled,
+    publish_rollout_if_enabled,
+    rollout_step_kwargs,
 )
 
-_LOG_SQRT_2PI = math.log(math.sqrt(2 * math.pi))
+
+class MiniMaxH3RolloutPlan(msgspec.Struct, frozen=True):
+    """The sigma grids a request's loop runs, cut at the rollout stop step, and
+    each stream's rollout step (None: that stream takes the serving update)."""
+
+    sigmas_video: list[float]
+    sigmas_audio: list[float]
+    video_rollout_step: MiniMaxH3RolloutStep | None = None
 
 
-def _effective_sde_type(batch, loop_step_index: int) -> str:
-    sde_type = str(getattr(batch, "rollout_sde_type", "sde"))
-    if sde_type == "ode":
-        return "ode"
-    sde_step_indices = getattr(batch, "rollout_sde_step_indices", None)
-    if sde_step_indices is not None and loop_step_index not in sde_step_indices:
-        return "ode"
-    return sde_type
+def _minimax_h3_float_step_tensors(
+    sigmas: list[float], *, device: torch.device
+) -> MiniMaxH3StepTensors:
+    """The operands of H3's video rollout ODE step: sigma and the sigma ratio
+    rounded from Python doubles, a few ulp from ``_minimax_h3_step_tensors``.
 
-
-def minimax_h3_rollout_update_video_target(
-    video_target: torch.Tensor,
-    velocity: torch.Tensor,
-    *,
-    sigma_curr: float,
-    sigma_next: float,
-    batch,
-    generator: torch.Generator,
-    loop_step_index: int,
-    noise_buffer: torch.Tensor | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Stochastic or deterministic update for video target rows during rollout.
-
-    H3 velocity ``v`` relates to flow-matching model output as ``model_output = -v``.
-    Returns ``(updated_target, log_prob_sum[B=1], log_prob_count[B=1], noise_buffer)``.
+    Kept so H3 video rollouts stay bit-identical to the trajectories the
+    miles_diffusion H3 e2e standards were recorded on.
+    TODO(rockdu): use _minimax_h3_step_tensors once those standards are re-recorded.
     """
-    sde_type = _effective_sde_type(batch, loop_step_index)
-    noise_level = float(getattr(batch, "rollout_noise_level", 0.0))
-    log_prob_no_const = bool(getattr(batch, "rollout_log_prob_no_const", False))
-
-    if sde_type == "ode" or noise_level == 0.0:
-        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
-            _minimax_h3_update_target_rows_,
-        )
-
-        out = video_target.clone()
-        sigma_t = out.new_tensor(sigma_curr)
-        ratio = out.new_tensor(sigma_next / sigma_curr if sigma_curr != 0.0 else 1.0)
-        one_minus_ratio = 1.0 - ratio
-        scratch = torch.empty_like(out)
-        _minimax_h3_update_target_rows_(
-            out,
-            velocity.float(),
-            sigma_t=sigma_t,
-            sigma_curr=sigma_curr,
-            sigma_ratio=ratio,
-            one_minus_sigma_ratio=one_minus_ratio,
-            denoised_scratch=scratch,
-        )
-        elem_count = float(out.numel())
-        log_prob_sum = torch.zeros(1, device=out.device, dtype=torch.float32)
-        log_prob_count = out.new_tensor([elem_count])
-        return out, log_prob_sum, log_prob_count, noise_buffer
-
-    model_output = (-velocity).float()
-    sample = video_target.float()
-    current_sigma = sample.new_tensor(float(sigma_curr))
-    next_sigma = sample.new_tensor(float(sigma_next))
-
-    if (
-        noise_buffer is None
-        or noise_buffer.shape != sample.shape
-        or noise_buffer.device != sample.device
-    ):
-        noise_buffer = torch.empty_like(sample)
-    variance_noise = torch.randn(
-        sample.shape,
-        generator=generator,
-        device=sample.device,
-        dtype=torch.float32,
-    )
-    noise_buffer.copy_(variance_noise)
-
-    if sde_type == "cps":
-        std_dev_t = next_sigma * math.sin(noise_level * math.pi / 2)
-        noise_std_dev = std_dev_t
-        pred_original = sample - current_sigma * model_output
-        noise_estimate = sample + model_output * (1.0 - current_sigma)
-        prev_mean = pred_original * (1.0 - next_sigma) + noise_estimate * torch.sqrt(
-            torch.clamp(next_sigma**2 - std_dev_t**2, min=1e-12)
-        )
-        prev_sample = prev_mean + variance_noise * noise_std_dev
-        log_prob_no_const_val = -((variance_noise * noise_std_dev) ** 2)
-    elif sde_type == "sde":
-        dt = next_sigma - current_sigma
-        sigma_max = float(getattr(batch, "_h3_rollout_sigma_max", 1.0))
-        std_dev_t = (
-            torch.sqrt(
-                current_sigma
-                / (
-                    1.0
-                    - torch.where(
-                        torch.isclose(current_sigma, current_sigma.new_tensor(1.0)),
-                        current_sigma.new_tensor(sigma_max),
-                        current_sigma,
-                    )
-                )
-            )
-            * noise_level
-        )
-        noise_std_dev = std_dev_t * torch.sqrt(-1.0 * dt)
-        prev_mean = (
-            sample * (1.0 + std_dev_t**2 / (2.0 * current_sigma) * dt)
-            + model_output
-            * (1.0 + std_dev_t**2 * (1.0 - current_sigma) / (2.0 * current_sigma))
-            * dt
-        )
-        prev_sample = prev_mean + variance_noise * noise_std_dev
-        log_prob_no_const_val = -((variance_noise * noise_std_dev) ** 2)
-    else:
-        raise ValueError(f"Unsupported rollout_sde_type for H3: {sde_type!r}")
-
-    if log_prob_no_const or sde_type == "ode":
-        log_prob_sum = log_prob_no_const_val.sum().unsqueeze(0)
-    else:
-        log_prob_sum = (
-            (
-                log_prob_no_const_val / (2.0 * (noise_std_dev**2))
-                - torch.log(noise_std_dev)
-                - _LOG_SQRT_2PI
-            )
-            .sum()
-            .unsqueeze(0)
-        )
-    log_prob_count = sample.new_tensor([float(sample.numel())])
-    return (
-        prev_sample.to(dtype=video_target.dtype),
-        log_prob_sum,
-        log_prob_count,
-        noise_buffer,
+    ratios = [
+        sigma_next / sigma if sigma != 0.0 else 1.0
+        for sigma, sigma_next in zip(sigmas[:-1], sigmas[1:])
+    ]
+    sigma_ratios = torch.tensor(ratios, dtype=torch.float32, device=device)
+    return MiniMaxH3StepTensors(
+        sigma_t=torch.tensor(sigmas[:-1], dtype=torch.float32, device=device),
+        sigma_ratios=sigma_ratios,
+        one_minus_sigma_ratios=1.0 - sigma_ratios,
     )
 
 
-@dataclass
-class MiniMaxH3RolloutCtx:
-    """Per-denoise-loop rollout state for H3."""
+def _minimax_h3_ode_update(
+    *,
+    model_output: torch.Tensor,
+    sample: torch.Tensor,
+    step_index: int,
+    sigmas: list[float],
+    step_tensors: MiniMaxH3StepTensors,
+) -> torch.Tensor:
+    """The H3 loop's target-row update on a copy of ``sample``, as a controller's
+    ``ode_transition``; ``model_output`` is the flow-matching ``-v``."""
+    out = sample[0].clone()
+    _minimax_h3_update_target_rows_(
+        out,
+        -model_output[0],
+        sigma_t=step_tensors.sigma_t[step_index],
+        sigma_curr=sigmas[step_index],
+        sigma_ratio=step_tensors.sigma_ratios[step_index],
+        one_minus_sigma_ratio=step_tensors.one_minus_sigma_ratios[step_index],
+        denoised_scratch=torch.empty_like(out),
+    )
+    return out[None]
 
-    batch: Any
-    generator: torch.Generator
-    sigmas_video: list[float]
-    collector: MiniMaxH3RolloutCollector
-    noise_buffer: torch.Tensor | None = None
-    denoising_env_kwargs: dict[str, Any] = field(default_factory=dict)
 
+def _rollout_step(
+    *,
+    transition: Callable[..., torch.Tensor],
+    sigmas: list[float],
+    replay_timesteps: torch.Tensor,
+    device: torch.device,
+) -> MiniMaxH3RolloutStep:
+    """Adapt one stream's ``[n, C]`` target rows to its controller's transition.
 
-@dataclass
-class MiniMaxH3RolloutCollector:
-    """Accumulates video-target trajectory and per-step log probs."""
+    The controller takes the flow-matching ``model_output = -v`` and records the
+    sample it is given without a copy, while H3 updates its rows in place.
+    """
+    sigmas_t = torch.tensor(sigmas, dtype=torch.float32, device=device)
 
-    sigmas_video: list[float]
-    return_step_indices: set[int] | None = None
-    latent_steps: list[torch.Tensor] = field(default_factory=list)
-    latent_step_indices: list[int] = field(default_factory=list)
-    log_prob_sums: list[torch.Tensor] = field(default_factory=list)
-    log_prob_counts: list[torch.Tensor] = field(default_factory=list)
-    pos_cond_kwargs: dict[str, Any] = field(default_factory=dict)
-    _next_latent_index: int = 0
-
-    def _record_latent(self, video_target: torch.Tensor) -> None:
-        index = self._next_latent_index
-        self._next_latent_index += 1
-        if (
-            self.return_step_indices is not None
-            and index not in self.return_step_indices
-        ):
-            return
-        self.latent_steps.append(video_target.detach().cpu().clone())
-        self.latent_step_indices.append(index)
-
-    def record_initial(self, video_target: torch.Tensor) -> None:
-        self._record_latent(video_target)
-
-    def record_step(
-        self,
-        video_target: torch.Tensor,
-        log_prob_sum: torch.Tensor,
-        log_prob_count: torch.Tensor,
-    ) -> None:
-        self._record_latent(video_target)
-        self.log_prob_sums.append(log_prob_sum.detach().cpu())
-        self.log_prob_counts.append(log_prob_count.detach().cpu())
-
-    def build_trajectory_data(self) -> RolloutTrajectoryData:
-        # latents: [B=1, T+1, num_video_target_rows, width]
-        stacked = torch.stack(self.latent_steps, dim=0).unsqueeze(0)
-        divisor = 1000.0
-        step_sigmas = torch.tensor(
-            [float(s) for s in self.sigmas_video[:-1]],
-            dtype=torch.float32,
+    def step(rows: torch.Tensor, velocity: torch.Tensor, step_index: int) -> None:
+        current_sigma = sigmas_t[step_index]
+        next_sigma = sigmas_t[step_index + 1]
+        prev_sample = transition(
+            model_output=(-velocity)[None],
+            sample=rows[None].clone(),
+            current_sigma=current_sigma,
+            next_sigma=next_sigma,
+            dt=next_sigma - current_sigma,
+            generator=None,
+            step_index=step_index,
+            timestep=replay_timesteps[step_index],
         )
-        timesteps = step_sigmas * divisor
-        sigmas = torch.tensor(
-            [float(s) for s in self.sigmas_video],
-            dtype=torch.float32,
+        rows.copy_(prev_sample[0])
+
+    return step
+
+
+def _replay_timesteps(sigmas: list[float]) -> torch.Tensor:
+    # miles_diffusion's H3 replay reads the trajectory timestep back as sigma.
+    return torch.tensor(sigmas[:-1], dtype=torch.float32) * 1000.0
+
+
+def _cut_at_stop_step(sigmas: list[float], stop_step_index: int | None) -> list[float]:
+    if stop_step_index is None:
+        return sigmas
+    return truncate_rollout_sigmas(sigmas, stop_step_index=stop_step_index)
+
+
+def _grid_holder(
+    sigmas: list[float], replay_timesteps: torch.Tensor
+) -> FlowMatchEulerDiscreteScheduler:
+    """A scheduler that only carries the grid for the rollout hooks; the H3 loop
+    never steps it."""
+    holder = FlowMatchEulerDiscreteScheduler()
+    holder.sigmas = torch.tensor(sigmas, dtype=torch.float32)
+    holder.timesteps = replay_timesteps
+    return holder
+
+
+def prepare_minimax_h3_rollout(
+    batch: Req,
+    *,
+    sigmas_video: list[float],
+    sigmas_audio: list[float],
+    initial_video_rows: torch.Tensor,
+    initial_audio_rows: torch.Tensor,
+    device: torch.device,
+    pipeline_config: Any,
+) -> MiniMaxH3RolloutPlan:
+    """Prepare both streams before anything reads the step count.
+
+    ``initial_*_rows`` are the target rows only, ``[n, C]``.
+    """
+    if not batch.rollout:
+        return MiniMaxH3RolloutPlan(
+            sigmas_video=sigmas_video, sigmas_audio=sigmas_audio
         )
-        log_probs = None
-        if self.log_prob_sums:
-            sums = torch.stack(self.log_prob_sums, dim=0)
-            counts = torch.stack(self.log_prob_counts, dim=0)
-            per_step = sums.squeeze(-1) / counts.squeeze(-1).clamp(min=1.0)
-            log_probs = per_step.unsqueeze(0)
-        return RolloutTrajectoryData(
-            denoising_env=RolloutDenoisingEnv(
-                pos_cond_kwargs=self.pos_cond_kwargs,
+    # The loop and the ODE updates run on the cut grids; the hooks take the
+    # uncut ones (sigma_max comes from the full grid) and cut their own.
+    cut_video = _cut_at_stop_step(sigmas_video, batch.rollout_stop_step_index)
+    cut_audio = _cut_at_stop_step(sigmas_audio, batch.rollout_stop_step_index)
+    streams = (
+        (
+            PRIMARY_STREAM,
+            sigmas_video,
+            cut_video,
+            initial_video_rows,
+            _minimax_h3_float_step_tensors(cut_video, device=device),
+        ),
+    )
+    shard_for_sp, gather_for_sp = pipeline_config_sp_fns(pipeline_config)
+    for stream, sigmas, cut_sigmas, rows, ode_step_tensors in streams:
+        replay_timesteps = _replay_timesteps(sigmas)
+        prepare_rollout_if_enabled(
+            batch=batch,
+            stream=stream,
+            scheduler=_grid_holder(sigmas, replay_timesteps),
+            timesteps=replay_timesteps,
+            latents=rows[None],
+            shard_for_sp=shard_for_sp,
+            gather_for_sp=gather_for_sp,
+            ode_transition=partial(
+                _minimax_h3_ode_update,
+                sigmas=cut_sigmas,
+                step_tensors=ode_step_tensors,
             ),
-            streams={
-                PRIMARY_STREAM: RolloutStreamData(
-                    rollout_log_probs=log_probs,
-                    dit_trajectory=RolloutDitTrajectory(
-                        latents=stacked,
-                        timesteps=timesteps,
-                        sigmas=sigmas,
-                        latent_step_indices=torch.tensor(
-                            self.latent_step_indices, dtype=torch.long
-                        ),
-                    ),
-                )
-            },
         )
+    # The hook wrote the replay timesteps there; republish H3's own DiT times.
+    batch.sigmas = list(cut_video)
+    batch.timesteps = torch.tensor(
+        [1.0 - sigma for sigma in cut_video[:-1]], dtype=torch.float32
+    )
+    return MiniMaxH3RolloutPlan(
+        sigmas_video=cut_video,
+        sigmas_audio=cut_audio,
+        video_rollout_step=_stream_rollout_step(
+            batch, PRIMARY_STREAM, cut_video, device=device
+        ),
+    )
+
+
+def _stream_rollout_step(
+    batch: Req, stream: str, sigmas: list[float], *, device: torch.device
+) -> MiniMaxH3RolloutStep | None:
+    transition = rollout_step_kwargs(batch, stream=stream).get("transition")
+    if transition is None:
+        return None
+    return _rollout_step(
+        transition=transition,
+        sigmas=sigmas,
+        replay_timesteps=_replay_timesteps(sigmas),
+        device=device,
+    )
+
+
+def finalize_minimax_h3_rollout(
+    batch: Req,
+    *,
+    rollout_plan: MiniMaxH3RolloutPlan,
+    video_target_rows: torch.Tensor,
+    pipeline_config: Any,
+) -> None:
+    for stream, sigmas, rows in (
+        (PRIMARY_STREAM, rollout_plan.sigmas_video, video_target_rows),
+    ):
+        finalize_rollout_if_enabled(
+            batch=batch,
+            stream=stream,
+            latents=rows[None],
+            num_inference_steps=len(sigmas) - 1,
+            final_timestep=torch.zeros((), dtype=torch.float32),
+        )
+    publish_rollout_if_enabled(batch=batch, pipeline_config=pipeline_config)
+
+
+def minimax_h3_denoising_env_kwargs(
+    *,
+    text_embeddings: torch.Tensor,
+    packed: dict[str, Any],
+    token_tags: torch.Tensor,
+    video_target_start: int,
+) -> dict[str, Any]:
+    """The cond branch's env, in the names miles_diffusion's H3 replay reads."""
+    return {
+        "encoder_hidden_states": text_embeddings,
+        "h3_packed_layout": packed,
+        "h3_token_tags": token_tags,
+        "h3_video_target_start": video_target_start,
+    }
 
 
 __all__ = [
-    "MiniMaxH3RolloutCollector",
-    "MiniMaxH3RolloutCtx",
-    "minimax_h3_rollout_update_video_target",
+    "MiniMaxH3RolloutPlan",
+    "finalize_minimax_h3_rollout",
+    "minimax_h3_denoising_env_kwargs",
+    "prepare_minimax_h3_rollout",
 ]

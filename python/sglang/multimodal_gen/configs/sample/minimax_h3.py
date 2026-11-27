@@ -6,10 +6,15 @@ from typing import Any, ClassVar
 
 import msgspec
 
+from sglang.multimodal_gen.configs.post_training.rl_rollout import (
+    PRIMARY_STREAM,
+    stream_sde_kernel_settings,
+)
 from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.configs.utils import optional_positive_finite_float
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
     MINIMAX_H3_REFERENCE_RESIZE_MODES,
+    MINIMAX_H3_ROLLOUT_TASKS,
 )
 
 _MINIMAX_H3_MAX_SIGNED_SEED = (1 << 63) - 1
@@ -263,11 +268,7 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 self.spectrum_params = SpectrumParams()
             apply_h3_spectrum_param_defaults(self.spectrum_params)
         if self.rollout:
-            task = str(self.task or "t2va").lower()
-            if task not in ("t2va",):
-                raise ValueError(
-                    f"MiniMax H3 rollout currently supports task=t2va only, got {task!r}"
-                )
+            self._validate_rollout()
         if self.return_trajectory_latents or self.return_trajectory_decoded:
             raise ValueError(
                 "MiniMax H3 does not support return_trajectory_latents/decoded; "
@@ -295,6 +296,35 @@ class MiniMaxH3SamplingParams(SamplingParams):
                 "reference_resize_mode must be one of {'match', 'max', 'diffusers'}, "
                 f"got {self.reference_resize_mode!r}"
             )
+
+    def _validate_rollout(self) -> None:
+        task = str(self.task or "t2va").lower()
+        if task not in MINIMAX_H3_ROLLOUT_TASKS:
+            raise ValueError(
+                f"MiniMax H3 rollout supports tasks {list(MINIMAX_H3_ROLLOUT_TASKS)}, "
+                f"got {task!r}"
+            )
+        # The rollout controller draws noise from one generator per output.
+        if self.num_outputs_per_prompt != 1:
+            raise ValueError(
+                "MiniMax H3 rollout needs num_outputs_per_prompt=1, "
+                f"got {self.num_outputs_per_prompt}"
+            )
+        for stream in (PRIMARY_STREAM, *self.rollout_extra_streams):
+            settings = stream_sde_kernel_settings(self, stream)
+            sde_type = settings["rollout_sde_type"]
+            # A zero-noise sde/cps step is a plain Euler step, not H3's update.
+            if sde_type != "ode" and settings["rollout_noise_level"] == 0:
+                raise ValueError(
+                    f"MiniMax H3 rollout stream {stream!r} uses rollout_sde_type="
+                    f"{sde_type!r} with rollout_noise_level=0; use 'ode' instead"
+                )
+            if sde_type == "ode" and not settings["rollout_log_prob_no_const"]:
+                raise ValueError(
+                    f"MiniMax H3 rollout stream {stream!r} uses rollout_sde_type='ode', "
+                    "which has no log-prob with constants; set "
+                    "rollout_log_prob_no_const=True"
+                )
 
     def build_request_extra(self, *, _seed_override: int | None = None) -> dict:
         _optional_unit_float(
