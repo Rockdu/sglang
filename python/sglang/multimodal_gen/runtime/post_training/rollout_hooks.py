@@ -146,6 +146,7 @@ def prepare_rollout_if_enabled(
     latents: torch.Tensor,
     shard_for_sp: Callable[[Any, torch.Tensor], torch.Tensor],
     gather_for_sp: Callable[[Any, torch.Tensor], torch.Tensor],
+    ode_transition: Callable[..., torch.Tensor] | None = None,
 ) -> None:
     """Prepare one latent stream of the loop: its controller if the request rolls
     it out, else its scheduler's grid cut at the stop step.
@@ -158,6 +159,9 @@ def prepare_rollout_if_enabled(
     A stop also cuts ``batch.timesteps`` when the primary stream is prepared, so
     the loop must not read ``batch.timesteps`` or derive anything from it (the step
     count for warmup, cache-dit or the progress bar) before that.
+
+    ``ode_transition`` is the model's own deterministic update the controller runs
+    on ODE steps; None keeps the flow-matching Euler update.
     """
     if not batch.rollout:
         return
@@ -199,6 +203,7 @@ def prepare_rollout_if_enabled(
         sigmas=scheduler.sigmas,
         timesteps=timesteps,
         latents_shape=tuple(latents.shape),
+        ode_transition=ode_transition,
     )
     # After the build: sigma_max comes from the uncut grid.
     if stop_step_index is not None:
