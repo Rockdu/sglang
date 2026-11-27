@@ -23,6 +23,8 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
+    MINIMAX_H3_AUDIO_ROW_WIDTH,
+    MINIMAX_H3_VIDEO_ROW_WIDTH,
     MiniMaxH3RolloutStep,
     MiniMaxH3StepTensors,
     _minimax_h3_step_tensors,
@@ -263,14 +265,41 @@ def minimax_h3_denoising_env_kwargs(
     packed: dict[str, Any],
     token_tags: torch.Tensor,
     video_target_start: int,
+    audio_target_start: int,
+    reference_visual_rows: torch.Tensor | None,
+    reference_audio_rows: torch.Tensor | None,
+    imgvid_noise_aug: float,
+    audio_noise_aug: float,
 ) -> dict[str, Any]:
-    """The cond branch's env, in the names miles_diffusion's H3 replay reads."""
-    return {
+    """The cond branch's env, in the names miles_diffusion's H3 replay reads.
+
+    ``reference_*_rows`` are the noised rows the loop pins every step. A layout
+    that pins condition rows exports both kinds, an absent kind as an empty
+    tensor: the replay writes both whenever it sees one.
+    """
+    env = {
         "encoder_hidden_states": text_embeddings,
         "h3_packed_layout": packed,
         "h3_token_tags": token_tags,
         "h3_video_target_start": video_target_start,
     }
+    if video_target_start == 0 and audio_target_start == 0:
+        return env
+    env.update(
+        h3_reference_visual=(
+            reference_visual_rows
+            if reference_visual_rows is not None
+            else torch.empty(0, MINIMAX_H3_VIDEO_ROW_WIDTH)
+        ),
+        h3_reference_audio=(
+            reference_audio_rows
+            if reference_audio_rows is not None
+            else torch.empty(0, MINIMAX_H3_AUDIO_ROW_WIDTH)
+        ),
+        h3_reference_visual_timestep=imgvid_noise_aug,
+        h3_reference_audio_timestep=audio_noise_aug,
+    )
+    return env
 
 
 __all__ = [

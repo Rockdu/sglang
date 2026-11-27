@@ -36,13 +36,18 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 logger = init_logger(__name__)
 
 
-# H3 pushes its packed-sequence components, not DiT forward kwargs.
+# H3 pushes its packed-sequence components, not DiT forward kwargs; the
+# h3_reference_* keys come only with a layout that pins condition rows.
 @register_denoising_env_args(
     [
         "encoder_hidden_states",
         "h3_packed_layout",
         "h3_token_tags",
         "h3_video_target_start",
+        "h3_reference_visual",
+        "h3_reference_audio",
+        "h3_reference_visual_timestep",
+        "h3_reference_audio_timestep",
     ]
 )
 @dataclass

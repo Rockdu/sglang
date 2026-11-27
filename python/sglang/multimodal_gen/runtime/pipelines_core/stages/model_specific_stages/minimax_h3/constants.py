@@ -26,7 +26,8 @@ MINIMAX_H3_REFERENCE_AUDIO_ROWS_EXTRA_KEY = "minimax_h3_reference_audio_rows"
 MINIMAX_H3_REFERENCE_VIDEO_ROWS_EXTRA_KEY = "minimax_h3_reference_video_rows"
 MINIMAX_H3_PREPARED_REFERENCE_VIDEO_EXTRA_KEY = "minimax_h3_prepared_reference_video"
 
-MINIMAX_H3_ROLLOUT_TASKS = ("t2va",)
+# fl2va replay is not validated in miles_diffusion yet.
+MINIMAX_H3_ROLLOUT_TASKS = ("t2va", "ref2va")
 
 MINIMAX_H3_SUPPORTED_FPS = 24
 MINIMAX_H3_MIN_DURATION_SECONDS = 4.0

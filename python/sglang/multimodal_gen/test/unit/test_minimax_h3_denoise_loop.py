@@ -11,6 +11,12 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+    MiniMaxH3PipelineConfig,
+)
+from sglang.multimodal_gen.configs.post_training.denoising_env import (
+    denoising_env_args_of,
+)
 from sglang.multimodal_gen.configs.post_training.rl_rollout import (
     AUDIO_STREAM,
     PRIMARY_STREAM,
@@ -26,6 +32,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
     finalize_minimax_h3_rollout,
+    minimax_h3_denoising_env_kwargs,
     prepare_minimax_h3_rollout,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
@@ -596,6 +603,40 @@ def test_ode_rollout_audio_is_the_serving_update(single_sp_rank):
     )
 
 
+def test_env_carries_reference_rows_only_for_a_layout_that_pins_them():
+    """miles_diffusion's H3 replay reads reference rows whenever h3_reference_visual
+    is present and then writes both kinds, so a layout with condition rows exports
+    both (an absent kind empty) and a t2va layout neither; every key must be
+    registered or the env drops it silently."""
+
+    def env(video_target_start, reference_visual_rows):
+        return minimax_h3_denoising_env_kwargs(
+            text_embeddings=torch.zeros(3, 8),
+            packed={},
+            token_tags=torch.zeros(3, dtype=torch.long),
+            video_target_start=video_target_start,
+            audio_target_start=0,
+            reference_visual_rows=reference_visual_rows,
+            reference_audio_rows=None,
+            imgvid_noise_aug=0.999,
+            audio_noise_aug=1.0,
+        )
+
+    assert set(env(0, None)) == {
+        "encoder_hidden_states",
+        "h3_packed_layout",
+        "h3_token_tags",
+        "h3_video_target_start",
+    }
+    reference_visual = torch.randn(4, 96)
+    ref2va_env = env(4, reference_visual)
+    assert ref2va_env["h3_reference_visual"] is reference_visual
+    assert ref2va_env["h3_reference_audio"].shape == (0, 32)
+    assert ref2va_env["h3_reference_visual_timestep"] == 0.999
+    assert ref2va_env["h3_reference_audio_timestep"] == 1.0
+    assert set(ref2va_env) <= denoising_env_args_of(MiniMaxH3PipelineConfig())
+
+
 @pytest.mark.parametrize(
     "rollout_args, message",
     [
@@ -625,3 +666,7 @@ def test_rollout_rejects_what_the_h3_rollout_cannot_run(rollout_args, message):
     rollout_args = {"task": "t2va", **rollout_args}
     with pytest.raises(ValueError, match=message):
         MiniMaxH3SamplingParams(prompt="test", rollout=True, **rollout_args)
+
+
+def test_rollout_accepts_ref2va():
+    MiniMaxH3SamplingParams(prompt="test", rollout=True, task="ref2va")
