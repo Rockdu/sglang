@@ -852,11 +852,13 @@ class MiniMaxH3DenoisingStage(DenoisingStage):
                         batch=batch,
                     ),
                     video_rollout_step=rollout_plan.video_rollout_step,
+                    audio_rollout_step=rollout_plan.audio_rollout_step,
                 )
                 finalize_minimax_h3_rollout(
                     batch,
                     rollout_plan=rollout_plan,
                     video_target_rows=video_rows[positive.video_target_slice],
+                    audio_target_rows=audio_rows[positive.audio_target_slice],
                     pipeline_config=server_args.pipeline_config,
                 )
         finally:

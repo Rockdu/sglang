@@ -11,7 +11,10 @@ import torch
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
 )
-from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
+from sglang.multimodal_gen.configs.post_training.rl_rollout import (
+    AUDIO_STREAM,
+    PRIMARY_STREAM,
+)
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.runtime.managers.forward_context import get_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
@@ -486,11 +489,13 @@ def _run_t2va_loop(batch: Req):
             sigmas_audio=rollout_plan.sigmas_audio,
             device=torch.device("cpu"),
             video_rollout_step=rollout_plan.video_rollout_step,
+            audio_rollout_step=rollout_plan.audio_rollout_step,
         )
         finalize_minimax_h3_rollout(
             batch,
             rollout_plan=rollout_plan,
             video_target_rows=video_rows[branch.video_target_slice],
+            audio_target_rows=audio_rows[branch.audio_target_slice],
             pipeline_config=_SP_IDENTITY_PIPELINE_CONFIG,
         )
     return branch, rollout_plan, video_rows, audio_rows
@@ -542,6 +547,7 @@ def test_stopped_rollout_records_each_step_and_lands_on_x0(single_sp_rank, sde_t
     republished as 1 - sigma."""
     stop_step_index = 1
     batch = _rollout_request(
+        rollout_extra_streams=(AUDIO_STREAM,),
         rollout_sde_type=sde_type,
         rollout_noise_level=1.0,
         rollout_log_prob_no_const=True,
@@ -552,6 +558,7 @@ def test_stopped_rollout_records_each_step_and_lands_on_x0(single_sp_rank, sde_t
     streams = batch.rollout_trajectory_data.streams
     trajectory = streams[PRIMARY_STREAM].dit_trajectory
     assert trajectory.latents.shape[1] == stop_step_index + 2
+    assert streams[AUDIO_STREAM].dit_trajectory.latents.shape[1] == stop_step_index + 2
     for index in range(stop_step_index + 1):
         assert not torch.equal(
             trajectory.latents[0, index], trajectory.latents[0, index + 1]
@@ -569,6 +576,26 @@ def test_stopped_rollout_records_each_step_and_lands_on_x0(single_sp_rank, sde_t
     )
 
 
+def test_ode_rollout_audio_is_the_serving_update(single_sp_rank):
+    """The audio controller's ODE step is the loop's serving update, so an ODE audio
+    rollout leaves the audio rows (and thus the DiT's next input) as serving would."""
+    _, _, _, serving_audio = _run_t2va_loop(
+        Req(sampling_params=MiniMaxH3SamplingParams(prompt="test"))
+    )
+    batch = _rollout_request(
+        rollout_extra_streams=(AUDIO_STREAM,),
+        rollout_sde_type="ode",
+        rollout_log_prob_no_const=True,
+    )
+    branch, _, _, audio = _run_t2va_loop(batch)
+
+    assert torch.equal(audio, serving_audio)
+    audio_stream = batch.rollout_trajectory_data.streams[AUDIO_STREAM]
+    assert torch.equal(
+        audio_stream.dit_trajectory.latents[0, -1], audio[branch.audio_target_slice]
+    )
+
+
 @pytest.mark.parametrize(
     "rollout_args, message",
     [
@@ -577,6 +604,18 @@ def test_stopped_rollout_records_each_step_and_lands_on_x0(single_sp_rank, sde_t
         (
             {"rollout_noise_level": 0.0, "rollout_log_prob_no_const": True},
             "stream 'primary'.*rollout_noise_level=0",
+        ),
+        (
+            {
+                "rollout_extra_streams": (AUDIO_STREAM,),
+                "rollout_extra_stream_sde_args": {
+                    AUDIO_STREAM: {
+                        "rollout_noise_level": 0.0,
+                        "rollout_log_prob_no_const": True,
+                    }
+                },
+            },
+            "stream 'audio'",
         ),
         # The controller would assert at the first denoising step instead.
         ({"rollout_sde_type": "ode"}, "rollout_log_prob_no_const=True"),

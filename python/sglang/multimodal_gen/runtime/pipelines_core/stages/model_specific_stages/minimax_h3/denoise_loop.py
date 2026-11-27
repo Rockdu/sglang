@@ -519,6 +519,7 @@ def minimax_h3_denoise_loop(
     on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None = None,
     step_profiler: Callable[[int], AbstractContextManager] | None = None,
     video_rollout_step: MiniMaxH3RolloutStep | None = None,
+    audio_rollout_step: MiniMaxH3RolloutStep | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Run the full denoise loop; returns final (video_rows, audio_rows).
 
@@ -528,8 +529,8 @@ def minimax_h3_denoise_loop(
     update signal; MiniMax H3 only supports cfg-distilled checkpoints.
     ``model_forward`` is the native-stage hook for residency/BCG runners and
     receives the zero-based loop step; the default keeps this helper
-    independently testable with a plain callable. ``video_rollout_step``
-    replaces the video update with the rollout's; None keeps the serving update.
+    independently testable with a plain callable. A ``*_rollout_step`` replaces
+    that modality's update with the rollout's; None keeps the serving update.
     """
     if len(sigmas_video) != len(sigmas_audio):
         raise ValueError("video/audio sigma schedules must have equal length")
@@ -652,7 +653,7 @@ def minimax_h3_denoise_loop(
                     sigmas=sigmas_audio,
                     step_tensors=audio_step_tensors,
                     denoised_scratch=audio_denoised_scratch,
-                    rollout_step=None,
+                    rollout_step=audio_rollout_step,
                 )
             if on_step is not None:
                 on_step(step, video_rows, audio_rows)

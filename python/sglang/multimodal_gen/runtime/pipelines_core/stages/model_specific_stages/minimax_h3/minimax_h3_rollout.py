@@ -14,7 +14,10 @@ from typing import Any, Callable
 import msgspec
 import torch
 
-from sglang.multimodal_gen.configs.post_training.rl_rollout import PRIMARY_STREAM
+from sglang.multimodal_gen.configs.post_training.rl_rollout import (
+    AUDIO_STREAM,
+    PRIMARY_STREAM,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -22,6 +25,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.denoise_loop import (
     MiniMaxH3RolloutStep,
     MiniMaxH3StepTensors,
+    _minimax_h3_step_tensors,
     _minimax_h3_update_target_rows_,
 )
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
@@ -43,6 +47,7 @@ class MiniMaxH3RolloutPlan(msgspec.Struct, frozen=True):
     sigmas_video: list[float]
     sigmas_audio: list[float]
     video_rollout_step: MiniMaxH3RolloutStep | None = None
+    audio_rollout_step: MiniMaxH3RolloutStep | None = None
 
 
 def _minimax_h3_float_step_tensors(
@@ -174,6 +179,13 @@ def prepare_minimax_h3_rollout(
             initial_video_rows,
             _minimax_h3_float_step_tensors(cut_video, device=device),
         ),
+        (
+            AUDIO_STREAM,
+            sigmas_audio,
+            cut_audio,
+            initial_audio_rows,
+            _minimax_h3_step_tensors(cut_audio, device=device),
+        ),
     )
     shard_for_sp, gather_for_sp = pipeline_config_sp_fns(pipeline_config)
     for stream, sigmas, cut_sigmas, rows, ode_step_tensors in streams:
@@ -203,6 +215,9 @@ def prepare_minimax_h3_rollout(
         video_rollout_step=_stream_rollout_step(
             batch, PRIMARY_STREAM, cut_video, device=device
         ),
+        audio_rollout_step=_stream_rollout_step(
+            batch, AUDIO_STREAM, cut_audio, device=device
+        ),
     )
 
 
@@ -225,10 +240,12 @@ def finalize_minimax_h3_rollout(
     *,
     rollout_plan: MiniMaxH3RolloutPlan,
     video_target_rows: torch.Tensor,
+    audio_target_rows: torch.Tensor,
     pipeline_config: Any,
 ) -> None:
     for stream, sigmas, rows in (
         (PRIMARY_STREAM, rollout_plan.sigmas_video, video_target_rows),
+        (AUDIO_STREAM, rollout_plan.sigmas_audio, audio_target_rows),
     ):
         finalize_rollout_if_enabled(
             batch=batch,

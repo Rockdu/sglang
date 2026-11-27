@@ -9,6 +9,7 @@ from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
     MiniMaxH3PipelineConfig,
 )
+from sglang.multimodal_gen.configs.post_training.rl_rollout import AUDIO_STREAM
 from sglang.multimodal_gen.configs.sample.minimax_h3 import MiniMaxH3SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.pipelines_core.composed_pipeline_base import (
@@ -42,6 +43,7 @@ class MiniMaxH3Pipeline(LoRAPipeline, ComposedPipelineBase):
     is_video_pipeline = True
     pipeline_config_cls = MiniMaxH3PipelineConfig
     sampling_params_cls = MiniMaxH3SamplingParams
+    supported_rollout_extra_streams = frozenset({AUDIO_STREAM})
     _required_config_modules = [
         "processor",
         "text_encoder",
